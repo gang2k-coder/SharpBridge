@@ -1,0 +1,160 @@
+using System.ComponentModel;
+using System.Text.Json;
+using ModelContextProtocol.Server;
+using SharpBridge.Services;
+
+namespace SharpBridge.Tools;
+
+[McpServerToolType]
+public class InspectionTools(DebugSession session)
+{
+    private readonly DebugSession _session = session;
+
+    [McpServerTool, Description("List all threads in the debugged process. " +
+        "Each thread has an ID you can use with stacktrace_get.")]
+    public string ThreadsList()
+    {
+        var threads = _session.GetThreads();
+
+        return JsonSerializer.Serialize(new
+        {
+            count = threads.Count,
+            threads = threads.Select(t => new
+            {
+                t.Id,
+                t.Name
+            })
+        });
+    }
+
+    [McpServerTool, Description("Get the call stack for a specific thread. " +
+        "Returns source file locations with line numbers. " +
+        "Use threads_list first to get thread IDs. Use variables_get with a frame ID to inspect variables.")]
+    public string StacktraceGet(
+        [Description("Thread ID from threads_list")] int threadId,
+        [Description("First frame to return (0 = top of stack)")] int startFrame = 0,
+        [Description("Maximum number of frames to return")] int? levels = null)
+    {
+        var frames = _session.GetStackTrace(threadId, startFrame, levels);
+
+        return JsonSerializer.Serialize(new
+        {
+            threadId,
+            count = frames.Count,
+            frames = frames.Select((f, i) => new
+            {
+                id = f.Id,
+                name = f.Name,
+                source = f.Source is not null ? new
+                {
+                    path = f.Source,
+                    line = f.Line,
+                    column = f.Column,
+                    endLine = f.EndLine,
+                    endColumn = f.EndColumn
+                } : null,
+                hint = i == 0
+                    ? "Top frame. Use variables_get with this frameId to inspect locals."
+                    : null
+            })
+        });
+    }
+
+    [McpServerTool, Description("Get local variables for a stack frame. " +
+        "Pass a frame ID from stacktrace_get's response. " +
+        "Some variables may be expandable — if they have a variablesReference > 0, " +
+        "use variables_expand to see their children (fields, properties, array elements).")]
+    public string VariablesGet(
+        [Description("Frame ID from stacktrace_get response")] int frameId)
+    {
+        var variables = _session.GetVariablesForFrame(frameId);
+
+        return FormatVariables(variables, frameId);
+    }
+
+    [McpServerTool, Description("Expand a variable to see its children. " +
+        "Use the variablesReference from a previous variables_get or variables_expand call. " +
+        "This shows fields, properties, array elements, or DebuggerTypeProxy views.")]
+    public string VariablesExpand(
+        [Description("Variables reference from a previous variables_get or variables_expand call")] int variablesReference)
+    {
+        var variables = _session.ExpandVariables(variablesReference);
+
+        return FormatVariables(variables, variablesReference);
+    }
+
+    [McpServerTool, Description("Evaluate a C# expression in the context of the current stack frame. " +
+        "Can access local variables, fields, properties, and call methods. " +
+        "Returns the result as a string, its type, and a variablesReference for further inspection if the result is complex.")]
+    public async Task<string> Evaluate(
+        [Description("C# expression to evaluate (e.g. 'x + 1', 'myList.Count', 'name.Length')")] string expression,
+        [Description("Frame ID from stacktrace_get. Uses current frame if omitted.")] int? frameId = null)
+    {
+        var result = await _session.EvaluateAsync(expression, frameId);
+
+        return JsonSerializer.Serialize(new
+        {
+            expression,
+            result = result.Result,
+            type = result.Type,
+            variablesReference = result.VariablesReference,
+            hint = result.VariablesReference > 0
+                ? "Result is a complex object. Use variables_expand to inspect its members."
+                : null
+        });
+    }
+
+    [McpServerTool, Description("Get details about the current exception, if the debugger stopped " +
+        "due to an unhandled or caught exception. Includes type, message, HResult, and stack trace.")]
+    public string ExceptionInfo(
+        [Description("Thread ID. Uses current thread if omitted.")] int? threadId = null)
+    {
+        var ex = _session.GetExceptionInfo(threadId);
+
+        if (ex is null)
+            return JsonSerializer.Serialize(new
+            {
+                hasException = false,
+                message = "No exception on the current thread."
+            });
+
+        return JsonSerializer.Serialize(new
+        {
+            hasException = true,
+            exceptionId = ex.ExceptionId,
+            description = ex.Description,
+            breakMode = ex.BreakMode,
+            details = new
+            {
+                message = ex.Message,
+                typeName = ex.TypeName,
+                fullTypeName = ex.FullTypeName,
+                stackTrace = ex.StackTrace,
+                formattedDescription = ex.FormattedDescription
+            }
+        });
+    }
+
+    private static string FormatVariables(IReadOnlyList<VariableInfo> variables, int source)
+    {
+        return JsonSerializer.Serialize(new
+        {
+            source,
+            count = variables.Count,
+            variables = variables.Select(v => new
+            {
+                v.Name,
+                v.Value,
+                v.Type,
+                v.VariablesReference,
+                v.EvaluateName,
+                v.IndexedVariables,
+                v.NamedVariables,
+                expandable = v.VariablesReference > 0,
+                hint = v.VariablesReference > 0
+                    ? $"Use variables_expand with variablesReference={v.VariablesReference} to see children."
+                    : null
+            })
+        });
+    }
+}
