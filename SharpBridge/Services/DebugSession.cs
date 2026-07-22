@@ -1,44 +1,37 @@
-using System.Collections.Concurrent;
 using System.Text.Json;
-using System.Text.Json.Nodes;
-using System.Threading.Channels;
+using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol;
+using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages;
+using Newtonsoft.Json.Linq;
 using SharpDbg.InMemory;
 
 namespace SharpBridge.Services;
 
 /// <summary>
-/// Wraps the DAP debug adapter (SharpDbg) and exposes a request-response API
-/// with async event delivery via Channel for MCP tool consumption.
+/// Wraps the DAP debug adapter (SharpDbg) via DebugProtocolHost.
+///
+/// Architecture:
+///   DebugProtocolHost.Run() runs its internal DAP message reader on a
+///   background thread. SendRequestSync is thread-safe and can be called
+///   from any thread. We call it directly from the MCP thread (Thread ③).
+///
+///   For async operations (continue/step/launch-stopAtEntry), we pre-register
+///   a StoppedEvent handler whose TCS is swapped before each operation.
 /// </summary>
 public class DebugSession : IDisposable
 {
     // ===================================================================
-    // Pipe handles (from SharpDbgInMemory)
+    // DAP Protocol Host
     // ===================================================================
-    private Stream? _stdinWriter;   // SharpBridge → writes DAP requests
-    private Stream? _stdoutReader;  // SharpBridge → reads DAP responses/events
-    private IDisposable? _adapter;  // cleanup for SharpDbg
+    private DebugProtocolHost? _host;
+    private IDisposable? _adapter;
 
     // ===================================================================
-    // Thread ②: DAP Reader (background task reading stdout pipe)
+    // StoppedEvent TCS — swapped before each async operation
     // ===================================================================
-    private Task? _readerTask;
-    private readonly CancellationTokenSource _readerCts = new();
-    private int _seqCounter;
-
-    // TCS: seq → response. Thread ② completes, Thread ③ awaits.
-    private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonObject>> _pendingRequests = new();
-
-    // Channel: Thread ② writes async DAP events, Thread ③ reads them at need.
-    private readonly Channel<DebugEvent> _events =
-        Channel.CreateUnbounded<DebugEvent>(new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = true
-        });
+    private TaskCompletionSource<StoppedEvent> _pendingStopTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     // ===================================================================
-    // Thread ③: Session state (owned exclusively by MCP thread — no lock)
+    // Session state
     // ===================================================================
     public enum State { NotStarted, Running, Stopped, Exited }
     public State CurrentState { get; private set; } = State.NotStarted;
@@ -61,35 +54,49 @@ public class DebugSession : IDisposable
             throw new InvalidOperationException("Session already initialized.");
 
         var (input, output, disposable) = SharpDbgInMemory.NewDebugAdapterStreams(logAction);
-        _stdinWriter = input;
-        _stdoutReader = output;
         _adapter = disposable;
 
-        // Start Thread ②: continuously read DAP messages from stdout pipe
-        _readerTask = Task.Run(() => ReaderLoop(_readerCts.Token));
+        _host = new DebugProtocolHost(input, output, registerStandardHandlers: false);
 
-        // DAP handshake
-        var caps = SendRequestSync("initialize", new Dictionary<string, object>
+        // Register events before Run()
+        _host.RegisterEventType<StoppedEvent>(OnStopped);
+        _host.RegisterEventType<ExitedEvent>(OnExited);
+        _host.RegisterEventType<TerminatedEvent>(OnTerminated);
+        _host.RegisterEventType<OutputEvent>(OnOutput);
+        _host.RegisterEventType<ContinuedEvent>(e =>
+            LogInfo($"← ContinuedEvent: thread={e.ThreadId}"));
+        _host.RegisterEventType<InitializedEvent>(e =>
+            LogInfo("← InitializedEvent"));
+
+        _host.VerifySynchronousOperationAllowed();
+
+        // Start the DAP message reader on a background thread
+        _host.Run();
+
+        // DAP handshake — call SendRequestSync directly (thread-safe)
+        _host.SendRequestSync(new InitializeRequest
         {
-            ["adapterID"] = "sharpbridge",
-            ["clientID"] = "sharpbridge-mcp",
-            ["clientName"] = "SharpBridge",
-            ["locale"] = "en",
-            ["linesStartAt1"] = true,
-            ["columnsStartAt1"] = true,
-            ["pathFormat"] = "path",
-            ["supportsVariableType"] = true,
-            ["supportsVariablePaging"] = false,
-            ["supportsRunInTerminalRequest"] = false,
-            ["supportsMemoryReferences"] = false,
-            ["supportsProgressReporting"] = false,
-            ["supportsInvalidatedEvent"] = false,
-            ["supportsMemoryEvent"] = false,
+            ClientID = "sharpbridge-mcp",
+            ClientName = "SharpBridge",
+            AdapterID = "sharpbridge",
+            Locale = "en",
+            LinesStartAt1 = true,
+            ColumnsStartAt1 = true,
+            PathFormat = InitializeArguments.PathFormatValue.Path,
+            SupportsVariableType = true,
+            SupportsVariablePaging = false,
+            SupportsRunInTerminalRequest = false,
+            SupportsMemoryReferences = false,
+            SupportsProgressReporting = false,
         });
-        _adapterId = caps?["body"]?["name"]?.GetValue<string>() ?? "sharpdbg";
 
+        _adapterId = "sharpdbg";
         LogInfo($"DAP initialized. Adapter: {_adapterId}");
     }
+
+    // ===================================================================
+    // Launch / Attach
+    // ===================================================================
 
     public async Task LaunchAsync(
         string program,
@@ -102,27 +109,79 @@ public class DebugSession : IDisposable
         if (CurrentState != State.NotStarted)
             throw new InvalidOperationException("Session not in correct state for launch.");
 
-        // Send launch request
-        var launchArgs = new Dictionary<string, object>
+        var launchArgs = new Dictionary<string, JToken>
         {
             ["program"] = program,
             ["stopAtEntry"] = stopAtEntry,
             ["console"] = "internalConsole",
         };
-        if (args is { Length: > 0 }) launchArgs["args"] = args;
+        if (args is { Length: > 0 }) launchArgs["args"] = JToken.FromObject(args);
         if (cwd is not null) launchArgs["cwd"] = cwd;
-        if (env is { Count: > 0 }) launchArgs["env"] = env;
+        if (env is { Count: > 0 }) launchArgs["env"] = JToken.FromObject(env);
 
-        SendRequestSync("launch", launchArgs);
+        _host!.SendRequestSync(new LaunchRequest
+        {
+            ConfigurationProperties = launchArgs
+        });
 
-        // ConfigurationDone triggers the actual process start
-        SendRequestSync("configurationDone");
+        // Swap in a fresh stop TCS BEFORE configurationDone —
+        // the StoppedEvent may fire as soon as the process starts.
+        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+
+        _host.SendRequestSync(new ConfigurationDoneRequest());
 
         CurrentState = State.Running;
 
         if (stopAtEntry)
         {
-            await WaitForStopAsync(ct);
+            // SharpDbg 0.1.4 does NOT send StoppedEvent after launch.
+            // Try a brief wait in case a future version adds this, then fall back.
+            try
+            {
+                await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
+                LogInfo("Launch: stopped at entry.");
+                return;
+            }
+            catch (TimeoutException) { }
+
+            LogInfo("Launch: no StoppedEvent — trying pause to force stopAtEntry.");
+            await ForceStopAfterLaunch(ct);
+        }
+    }
+
+    private async Task ForceStopAfterLaunch(CancellationToken ct)
+    {
+        var delays = new[] { 0, 200, 500 };
+        for (int i = 0; i < delays.Length; i++)
+        {
+            if (i > 0) await Task.Delay(delays[i], ct);
+
+            if (CurrentState is State.Exited or State.Stopped) return;
+
+            var pauseTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Interlocked.Exchange(ref _pendingStopTcs, pauseTcs);
+
+            _host!.SendRequestSync(new PauseRequest());
+
+            try
+            {
+                await pauseTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
+                LogInfo("Pause succeeded.");
+                return;
+            }
+            catch (TimeoutException) { }
+        }
+
+        if (CurrentState == State.Running)
+        {
+            LogInfo("Pause did not respond — synthesizing stopped state.");
+            CurrentState = State.Stopped;
+            _lastStop = new StopEvent("stopped", null, true, "entry", null, 0, 0)
+            {
+                Note = "Process is running (did not respond to pause). " +
+                       "Set breakpoints and use debug_continue to reach them."
+            };
         }
     }
 
@@ -131,15 +190,20 @@ public class DebugSession : IDisposable
         if (CurrentState != State.NotStarted)
             throw new InvalidOperationException("Session not in correct state for attach.");
 
-        SendRequestSync("attach", new Dictionary<string, object>
+        // Attach is lazy: stores PID, actual attach happens at ConfigurationDone.
+        // Breakpoints set between AttachRequest and ConfigurationDone will be
+        // applied during the attach.
+        _host!.SendRequestSync(new AttachRequest
         {
-            ["processId"] = processId
+            ConfigurationProperties = new Dictionary<string, JToken>
+            {
+                ["processId"] = processId
+            }
         });
 
-        SendRequestSync("configurationDone");
+        _host.SendRequestSync(new ConfigurationDoneRequest());
 
         // After attach, DebugActiveProcess(pid, false) suspends all threads.
-        // The process is stopped immediately — no StoppedEvent is sent for attach.
         CurrentState = State.Stopped;
         _lastStop = new StopEvent("stopped", null, true, "attach", null, 0, 0)
         {
@@ -163,11 +227,10 @@ public class DebugSession : IDisposable
     public IReadOnlyList<BreakpointEntry> SetBreakpoints(
         string filePath, params (int Line, int? Column, string? Condition, string? HitCondition)[] breakpoints)
     {
-        // Clear existing BPs for this file
         _breakpointsByFile.Remove(filePath);
 
         var entries = new List<BreakpointEntry>();
-        var dapBreakpoints = new List<Dictionary<string, object>>();
+        var sourceBreakpoints = new List<SourceBreakpoint>();
 
         foreach (var (line, col, cond, hitCond) in breakpoints)
         {
@@ -181,40 +244,32 @@ public class DebugSession : IDisposable
                 Verified: false,
                 EndLine: null,
                 EndColumn: null);
-
             entries.Add(entry);
 
-            var sourceBp = new Dictionary<string, object> { ["line"] = line };
-            if (col.HasValue) sourceBp["column"] = col.Value;
-            if (cond is not null) sourceBp["condition"] = cond;
-            if (hitCond is not null) sourceBp["hitCondition"] = hitCond;
-            dapBreakpoints.Add(sourceBp);
+            var sbp = new SourceBreakpoint { Line = line };
+            if (col.HasValue) sbp.Column = col.Value;
+            if (cond is not null) sbp.Condition = cond;
+            if (hitCond is not null) sbp.HitCondition = hitCond;
+            sourceBreakpoints.Add(sbp);
         }
 
         _breakpointsByFile[filePath] = entries;
 
-        // Send to DAP
-        var args = new Dictionary<string, object>
+        var response = _host!.SendRequestSync(new SetBreakpointsRequest
         {
-            ["source"] = new Dictionary<string, object> { ["path"] = filePath },
-            ["breakpoints"] = dapBreakpoints
-        };
+            Source = new Source { Path = filePath },
+            Breakpoints = sourceBreakpoints
+        });
 
-        var response = SendRequestSync("setBreakpoints", args);
-        var bpResults = response?["body"]?["breakpoints"]?.AsArray();
-
-        // Update verification status from response
+        var bpResults = response.Breakpoints;
         if (bpResults is not null)
         {
             for (int i = 0; i < Math.Min(entries.Count, bpResults.Count); i++)
             {
-                var result = bpResults[i];
-                if (result is JsonObject obj)
-                {
-                    entries[i].Verified = obj["verified"]?.GetValue<bool>() ?? false;
-                    entries[i].Message = obj["message"]?.GetValue<string>();
-                    if (obj["line"] is not null) entries[i] = entries[i] with { Line = obj["line"]!.GetValue<int>() };
-                }
+                entries[i].Verified = bpResults[i].Verified;
+                entries[i].Message = bpResults[i].Message;
+                if (bpResults[i].Line.HasValue)
+                    entries[i] = entries[i] with { Line = bpResults[i].Line!.Value };
             }
         }
 
@@ -229,15 +284,13 @@ public class DebugSession : IDisposable
             if (entry is not null)
             {
                 entries.Remove(entry);
-                // Re-send remaining BPs for this file
                 if (entries.Count == 0)
                 {
                     _breakpointsByFile.Remove(file);
-                    // Send empty set to clear file
-                    SendRequestSync("setBreakpoints", new Dictionary<string, object>
+                    _host!.SendRequestSync(new SetBreakpointsRequest
                     {
-                        ["source"] = new Dictionary<string, object> { ["path"] = file },
-                        ["breakpoints"] = Array.Empty<object>()
+                        Source = new Source { Path = file },
+                        Breakpoints = new List<SourceBreakpoint>()
                     });
                 }
                 else
@@ -264,12 +317,10 @@ public class DebugSession : IDisposable
         int timeoutSeconds = 30,
         CancellationToken ct = default)
     {
-        // Pre-check
         if (BreakpointCount == 0 && timeoutSeconds == 0)
         {
             throw new InvalidOperationException(
                 "No breakpoints set and timeout is disabled (0 = infinite). " +
-                "The program may run indefinitely. " +
                 "Set a breakpoint with breakpoint_set first, " +
                 "or specify a timeout value (e.g. timeout=30).");
         }
@@ -278,23 +329,24 @@ public class DebugSession : IDisposable
             throw new InvalidOperationException($"Cannot continue: debugger state is {CurrentState}.");
 
         CurrentState = State.Running;
-        SendRequest("continue", new Dictionary<string, object> { ["threadId"] = LastStop.ThreadId });
+
+        // Swap TCS BEFORE sending continue (same pattern as launch)
+        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+
+        _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
 
         try
         {
-            return await WaitForStopWithTimeoutAsync(timeoutSeconds, ct);
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+            var stopEvent = await stopTcs.Task.WaitAsync(linked.Token);
+            return BuildStopEvent(stopEvent);
         }
         catch (OperationCanceledException)
         {
-            // Force-pause the debuggee
-            SendRequest("pause", new Dictionary<string, object> { ["threadId"] = LastStop.ThreadId });
-            var stop = await WaitForStopAsync(CancellationToken.None);
-            return stop with
-            {
-                Note = ct.IsCancellationRequested
-                    ? "Cancelled by user. Program was paused."
-                    : $"Timed out after {timeoutSeconds}s. Program was paused."
-            };
+            LogInfo("Continue timed out — pausing.");
+            return await PauseAndReturn(ct);
         }
     }
 
@@ -305,18 +357,20 @@ public class DebugSession : IDisposable
             throw new InvalidOperationException($"Cannot step: debugger state is {CurrentState}.");
 
         CurrentState = State.Running;
-        var command = type switch
+        var tid = threadId ?? LastStop.ThreadId ?? 1;
+
+        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+
+        switch (type)
         {
-            "in" => "stepIn",
-            "out" => "stepOut",
-            _ => "next" // "over"
-        };
+            case "in": _host!.SendRequestSync(new StepInRequest(tid)); break;
+            case "out": _host!.SendRequestSync(new StepOutRequest(tid)); break;
+            default: _host!.SendRequestSync(new NextRequest(tid)); break;
+        }
 
-        var args = new Dictionary<string, object>();
-        if (threadId.HasValue) args["threadId"] = threadId.Value;
-        SendRequest(command, args);
-
-        return await WaitForStopAsync(ct);
+        var stopEvent = await stopTcs.Task.WaitAsync(ct);
+        return BuildStopEvent(stopEvent);
     }
 
     public async Task<StopEvent> PauseAsync(CancellationToken ct = default)
@@ -324,65 +378,71 @@ public class DebugSession : IDisposable
         if (CurrentState != State.Running)
             throw new InvalidOperationException($"Cannot pause: debugger state is {CurrentState}.");
 
-        SendRequest("pause", new Dictionary<string, object>());
-        return await WaitForStopAsync(ct);
+        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+
+        _host!.SendRequestSync(new PauseRequest());
+
+        var stopEvent = await stopTcs.Task.WaitAsync(ct);
+        return BuildStopEvent(stopEvent);
+    }
+
+    private async Task<StopEvent> PauseAndReturn(CancellationToken ct)
+    {
+        try
+        {
+            return await PauseAsync(ct);
+        }
+        catch
+        {
+            if (CurrentState == State.Running)
+            {
+                CurrentState = State.Stopped;
+                _lastStop = new StopEvent("stopped", null, true, "pause", null, 0, 0)
+                {
+                    Note = "Unable to pause. Process may be blocked in native code."
+                };
+            }
+            return LastStop;
+        }
     }
 
     // ===================================================================
-    // Inspection (only valid when STOPPED)
+    // Inspection
     // ===================================================================
 
     public List<ThreadInfo> GetThreads()
     {
         EnsureStopped();
-        var response = SendRequestSync("threads");
-        var threads = response?["body"]?["threads"]?.AsArray() ?? [];
-
-        return threads.Select(t =>
-        {
-            var obj = (JsonObject)t;
-            return new ThreadInfo(
-                obj["id"]!.GetValue<int>(),
-                obj["name"]?.GetValue<string>() ?? $"Thread {obj["id"]!.GetValue<int>()}");
-        }).ToList();
+        var response = _host!.SendRequestSync(new ThreadsRequest());
+        return response.Threads.Select(t => new ThreadInfo(t.Id, t.Name)).ToList();
     }
 
     public List<StackFrameInfo> GetStackTrace(int threadId, int startFrame = 0, int? levels = null)
     {
         EnsureStopped();
-        var args = new Dictionary<string, object>
+        var response = _host!.SendRequestSync(new StackTraceRequest
         {
-            ["threadId"] = threadId,
-            ["startFrame"] = startFrame
-        };
-        if (levels.HasValue) args["levels"] = levels.Value;
+            ThreadId = threadId,
+            StartFrame = startFrame,
+            Levels = levels
+        });
 
-        var response = SendRequestSync("stackTrace", args);
-        var frames = response?["body"]?["stackFrames"]?.AsArray() ?? [];
-
-        return frames.Select(f =>
-        {
-            var obj = (JsonObject)f;
-            var src = obj["source"] as JsonObject;
-            return new StackFrameInfo(
-                obj["id"]!.GetValue<int>(),
-                obj["name"]!.GetValue<string>(),
-                src?["path"]?.GetValue<string>(),
-                obj["line"]!.GetValue<int>(),
-                obj["column"]?.GetValue<int>() ?? 0,
-                obj["endLine"]?.GetValue<int>() ?? 0,
-                obj["endColumn"]?.GetValue<int>() ?? 0);
-        }).ToList();
+        return response.StackFrames.Select(f => new StackFrameInfo(
+            f.Id,
+            f.Name,
+            f.Source?.Path,
+            f.Line,
+            f.Column,
+            f.EndLine ?? 0,
+            f.EndColumn ?? 0)).ToList();
     }
 
     public List<VariableInfo> GetVariablesForFrame(int frameId)
     {
         EnsureStopped();
-        // First get scopes for the frame
         var scopes = GetScopes(frameId);
         if (scopes.Count == 0) return [];
-
-        // Get variables from the "Locals" scope
         var localsScope = scopes.FirstOrDefault(s => s.Name == "Locals") ?? scopes[0];
         return ExpandVariables(localsScope.VariablesReference);
     }
@@ -390,90 +450,50 @@ public class DebugSession : IDisposable
     public List<VariableInfo> ExpandVariables(int variablesReference)
     {
         EnsureStopped();
-        var response = SendRequestSync("variables", new Dictionary<string, object>
+        var response = _host!.SendRequestSync(new VariablesRequest
         {
-            ["variablesReference"] = variablesReference
+            VariablesReference = variablesReference
         });
-        var vars = response?["body"]?["variables"]?.AsArray() ?? [];
 
-        return vars.Select(v =>
-        {
-            var obj = (JsonObject)v;
-            return new VariableInfo(
-                obj["name"]!.GetValue<string>(),
-                obj["value"]!.GetValue<string>(),
-                obj["type"]?.GetValue<string>(),
-                obj["variablesReference"]?.GetValue<int>() ?? 0,
-                obj["evaluateName"]?.GetValue<string>(),
-                obj["indexedVariables"]?.GetValue<int>(),
-                obj["namedVariables"]?.GetValue<int>());
-        }).ToList();
+        return response.Variables.Select(v => new VariableInfo(
+            v.Name, v.Value, v.Type, v.VariablesReference,
+            v.EvaluateName, v.IndexedVariables, v.NamedVariables)).ToList();
     }
 
     private List<ScopeInfo> GetScopes(int frameId)
     {
-        var response = SendRequestSync("scopes", new Dictionary<string, object>
-        {
-            ["frameId"] = frameId
-        });
-        var scopes = response?["body"]?["scopes"]?.AsArray() ?? [];
-
-        return scopes.Select(s =>
-        {
-            var obj = (JsonObject)s;
-            return new ScopeInfo(
-                obj["name"]!.GetValue<string>(),
-                obj["variablesReference"]!.GetValue<int>(),
-                obj["expensive"]?.GetValue<bool>() ?? false);
-        }).ToList();
+        var response = _host!.SendRequestSync(new ScopesRequest { FrameId = frameId });
+        return response.Scopes.Select(s => new ScopeInfo(s.Name, s.VariablesReference, s.Expensive)).ToList();
     }
 
     public async Task<EvalResult> EvaluateAsync(string expression, int? frameId = null)
     {
         EnsureStopped();
-        var args = new Dictionary<string, object>
+        var response = _host!.SendRequestSync(new EvaluateRequest
         {
-            ["expression"] = expression,
-            ["context"] = "repl"
-        };
-        if (frameId.HasValue) args["frameId"] = frameId.Value;
-
-        var response = SendRequestSync("evaluate", args);
-        var body = response?["body"] as JsonObject;
-
-        return new EvalResult(
-            body?["result"]?.GetValue<string>() ?? "",
-            body?["type"]?.GetValue<string>(),
-            body?["variablesReference"]?.GetValue<int>() ?? 0);
+            Expression = expression,
+            FrameId = frameId,
+            Context = EvaluateArguments.ContextValue.Repl
+        });
+        return new EvalResult(response.Result, response.Type, response.VariablesReference);
     }
 
     public ExceptionDetail? GetExceptionInfo(int? threadId = null)
     {
         EnsureStopped();
-        var args = new Dictionary<string, object>();
-        if (threadId.HasValue) args["threadId"] = threadId.Value;
-
         try
         {
-            var response = SendRequestSync("exceptionInfo", args);
-            var body = response?["body"] as JsonObject;
-            if (body is null) return null;
-
+            var response = _host!.SendRequestSync(new ExceptionInfoRequest
+            {
+                ThreadId = threadId ?? LastStop.ThreadId ?? 1
+            });
             return new ExceptionDetail(
-                body["exceptionId"]?.GetValue<string>() ?? "",
-                body["description"]?.GetValue<string>() ?? "",
-                body["breakMode"]?.GetValue<string>() ?? "",
-                body["details"]?["message"]?.GetValue<string>(),
-                body["details"]?["typeName"]?.GetValue<string>(),
-                body["details"]?["fullTypeName"]?.GetValue<string>(),
-                body["details"]?["stackTrace"]?.GetValue<string>(),
-                body["details"]?["formattedDescription"]?.GetValue<string>());
+                response.ExceptionId, response.Description, response.BreakMode.ToString(),
+                response.Details?.Message, response.Details?.TypeName,
+                response.Details?.FullTypeName, response.Details?.StackTrace,
+                response.Details?.FormattedDescription);
         }
-        catch
-        {
-            // No exception on current thread
-            return null;
-        }
+        catch { return null; }
     }
 
     // ===================================================================
@@ -483,287 +503,83 @@ public class DebugSession : IDisposable
     public void Disconnect(bool terminateDebuggee = true)
     {
         if (CurrentState == State.NotStarted) return;
-
         try
         {
-            SendRequestSync("disconnect", new Dictionary<string, object>
-            {
-                ["terminateDebuggee"] = terminateDebuggee
-            });
+            _host!.SendRequestSync(new DisconnectRequest { TerminateDebuggee = terminateDebuggee });
         }
-        catch { /* ignore protocol errors during shutdown */ }
-
+        catch { }
         Cleanup();
     }
 
-    public void Dispose()
-    {
-        Cleanup();
-    }
+    public void Dispose() => Cleanup();
 
     private void Cleanup()
     {
         CurrentState = State.NotStarted;
-        _readerCts.Cancel();
-        _events.Writer.TryComplete();
+        _host?.Stop();
+        _host?.WaitForReader();
         _adapter?.Dispose();
-        _stdinWriter = null;
-        _stdoutReader = null;
+        _host = null;
     }
 
     // ===================================================================
-    // DAP Protocol Client (Thread ② + Thread ③ shared infrastructure)
+    // Event handlers (on host's internal reader thread)
     // ===================================================================
 
-    /// <summary>
-    /// Thread ③: Send a DAP request and return the response synchronously.
-    /// Blocks the MCP thread until Thread ② reads and matches the response.
-    /// </summary>
-    private JsonObject? SendRequestSync(string command, object? args = null)
-        => SendRequestSync(command, args, CancellationToken.None);
-
-    private JsonObject? SendRequestSync(string command, object? args, CancellationToken ct)
+    private void OnStopped(StoppedEvent e)
     {
-        var tcs = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var seq = Interlocked.Increment(ref _seqCounter);
-        _pendingRequests[seq] = tcs;
-
-        WriteDapMessage(new JsonObject
-        {
-            ["seq"] = seq,
-            ["type"] = "request",
-            ["command"] = command,
-            ["arguments"] = args is not null
-                ? JsonSerializer.SerializeToNode(args)
-                : null
-        });
-
-        LogInfo($"DAP ← [{seq}] {command}");
-
-        try
-        {
-            if (ct.CanBeCanceled)
-                tcs.Task.Wait(ct);
-            else
-            {
-                if (!tcs.Task.Wait(TimeSpan.FromSeconds(60)))
-                    throw new TimeoutException($"DAP request '{command}' timed out after 60s");
-            }
-
-            LogInfo($"DAP → [{seq}] {command} OK");
-            return tcs.Task.Result;
-        }
-        catch (AggregateException) when (tcs.Task.IsFaulted)
-        {
-            throw tcs.Task.Exception!.InnerException!;
-        }
-        finally
-        {
-            _pendingRequests.TryRemove(seq, out _);
-        }
+        CurrentState = State.Stopped;
+        _lastStop = BuildStopEvent(e);
+        var old = Interlocked.Exchange(ref _pendingStopTcs,
+            new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously));
+        old.TrySetResult(e);
+        LogInfo($"← StoppedEvent: reason={e.Reason}, thread={e.ThreadId}");
     }
 
-    /// <summary>
-    /// Thread ③: Fire-and-forget DAP request (for continue, step, pause).
-    /// </summary>
-    private void SendRequest(string command, object? args = null)
+    private void OnExited(ExitedEvent e)
     {
-        var seq = Interlocked.Increment(ref _seqCounter);
-        WriteDapMessage(new JsonObject
-        {
-            ["seq"] = seq,
-            ["type"] = "request",
-            ["command"] = command,
-            ["arguments"] = args is not null
-                ? JsonSerializer.SerializeToNode(args)
-                : null
-        });
+        CurrentState = State.Exited;
+        LogInfo($"← ExitedEvent: code={e.ExitCode}");
     }
 
-    private void WriteDapMessage(JsonObject message)
+    private void OnTerminated(TerminatedEvent e)
     {
-        var json = JsonSerializer.Serialize(message);
-        var header = $"Content-Length: {System.Text.Encoding.UTF8.GetByteCount(json)}\r\n\r\n";
-        _stdinWriter!.Write(System.Text.Encoding.UTF8.GetBytes(header + json));
-        _stdinWriter.Flush();
+        CurrentState = State.Exited;
+        LogInfo("← TerminatedEvent");
+    }
+
+    private void OnOutput(OutputEvent e)
+    {
+        _outputLog.Add(e.Output ?? "");
     }
 
     // ===================================================================
-    // Thread ②: Background reader loop
+    // Helpers
     // ===================================================================
-
-    private async Task ReaderLoop(CancellationToken ct)
-    {
-        try
-        {
-            using var reader = new StreamReader(_stdoutReader!, System.Text.Encoding.UTF8,
-                detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
-
-            while (!ct.IsCancellationRequested)
-            {
-                var contentTypeLine = await reader.ReadLineAsync(ct);
-                if (contentTypeLine == null) break; // stream closed
-
-                // Parse Content-Length header
-                if (!contentTypeLine.StartsWith("Content-Length:"))
-                {
-                    LogInfo($"Unexpected header: {contentTypeLine}");
-                    continue;
-                }
-
-                var lengthStr = contentTypeLine["Content-Length:".Length..].Trim();
-                if (!int.TryParse(lengthStr, out var contentLength))
-                {
-                    LogInfo($"Bad Content-Length: {lengthStr}");
-                    continue;
-                }
-
-                // Skip the blank line separator
-                await reader.ReadLineAsync(ct);
-
-                // Read the JSON body
-                var buffer = new char[contentLength];
-                var read = 0;
-                while (read < contentLength)
-                {
-                    var count = await reader.ReadAsync(buffer, read, contentLength - read);
-                    read += count;
-                }
-                var json = new string(buffer, 0, contentLength);
-
-                var message = JsonNode.Parse(json) as JsonObject;
-                if (message is null) continue;
-
-                var type = message["type"]?.GetValue<string>();
-                var cmd = message["command"]?.GetValue<string>() ?? "";
-                var rSeq = message["request_seq"]?.GetValue<int>() ?? 0;
-                var evtName = message["event"]?.GetValue<string>() ?? "";
-                LogInfo($"DAP pipe ← type={type}, command={cmd}, req_seq={rSeq}, event={evtName}");
-
-                if (type == "response")
-                {
-                    var seq = message["request_seq"]?.GetValue<int>() ?? 0;
-                    if (_pendingRequests.TryRemove(seq, out var tcs))
-                    {
-                        if (message["success"]?.GetValue<bool>() == false)
-                        {
-                            var errorMsg = message["message"]?.GetValue<string>() ?? "DAP request failed";
-                            tcs.TrySetException(new InvalidOperationException(
-                                $"{message["command"]?.GetValue<string>()}: {errorMsg}"));
-                        }
-                        else
-                        {
-                            tcs.TrySetResult(message);
-                        }
-                    }
-                }
-                else if (type == "event")
-                {
-                    var evt = DebugEvent.FromDap(message);
-                    _events.Writer.TryWrite(evt);
-                }
-                // else: ignore other types
-            }
-        }
-        catch (OperationCanceledException) { }
-        catch (ObjectDisposedException) { }
-        catch (IOException) { }
-        catch (Exception ex)
-        {
-            LogInfo($"ReaderLoop error: {ex}");
-        }
-        finally
-        {
-            // Signal any waiting requests that the reader is dead
-            foreach (var (_, tcs) in _pendingRequests)
-                tcs.TrySetException(new InvalidOperationException("DAP reader terminated unexpectedly."));
-            _pendingRequests.Clear();
-        }
-    }
-
-    // ===================================================================
-    // Thread ③: Event consumption helpers
-    // ===================================================================
-
-    private async Task<StopEvent> WaitForStopAsync(CancellationToken ct)
-    {
-        while (true)
-        {
-            await _events.Reader.WaitToReadAsync(ct);
-            if (!_events.Reader.TryRead(out var evt)) continue;
-
-            switch (evt.Kind)
-            {
-                case DebugEventKind.Stopped:
-                    CurrentState = State.Stopped;
-                    _lastStop = new StopEvent(
-                        "stopped", evt.ThreadId, evt.AllThreadsStopped,
-                        evt.Reason, evt.FilePath, evt.Line, evt.Column);
-                    return _lastStop;
-
-                case DebugEventKind.Exited:
-                    CurrentState = State.Exited;
-                    _lastStop = new StopEvent("exited", null, null, null, null, 0, 0)
-                    { ExitCode = evt.ExitCode };
-                    return _lastStop;
-
-                case DebugEventKind.Terminated:
-                    CurrentState = State.Exited;
-                    _lastStop = new StopEvent("terminated", null, null, null, null, 0, 0);
-                    return _lastStop;
-
-                case DebugEventKind.Output:
-                    _outputLog.Add(evt.Text ?? "");
-                    break; // keep waiting
-            }
-        }
-    }
-
-    private async Task<StopEvent> WaitForStopWithTimeoutAsync(int timeoutSeconds, CancellationToken ct)
-    {
-        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-        try
-        {
-            return await WaitForStopAsync(linked.Token);
-        }
-        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
-        {
-            throw; // re-throw, caller handles timeout
-        }
-    }
 
     public void DrainPendingEvents()
     {
-        while (_events.Reader.TryRead(out var evt))
-        {
-            switch (evt.Kind)
-            {
-                case DebugEventKind.Exited:
-                case DebugEventKind.Terminated:
-                    CurrentState = State.Exited;
-                    _lastStop = new StopEvent(
-                        evt.Kind == DebugEventKind.Exited ? "exited" : "terminated",
-                        null, null, null, null, 0, 0);
-                    break;
-                case DebugEventKind.Output:
-                    _outputLog.Add(evt.Text ?? "");
-                    break;
-                case DebugEventKind.Stopped:
-                    CurrentState = State.Stopped;
-                    _lastStop = new StopEvent("stopped", evt.ThreadId, evt.AllThreadsStopped,
-                        evt.Reason, evt.FilePath, evt.Line, evt.Column);
-                    break;
-            }
-        }
+        // With DebugProtocolHost, events are processed synchronously in callbacks.
+        // State transitions happen inline — no event channel to drain.
     }
 
     private void EnsureStopped()
     {
-        DrainPendingEvents();
         if (CurrentState != State.Stopped)
             throw new InvalidOperationException(
                 $"Debugger is not stopped (state: {CurrentState}). Use debug_state first.");
+    }
+
+    private StopEvent BuildStopEvent(StoppedEvent e)
+    {
+        return new StopEvent(
+            "stopped",
+            e.ThreadId,
+            e.AllThreadsStopped,
+            e.Reason.ToString(),
+            null,
+            e.HitBreakpointIds?.FirstOrDefault() ?? 0,
+            0);
     }
 
     // ===================================================================
@@ -807,58 +623,3 @@ public record ExceptionDetail(
     string ExceptionId, string Description, string BreakMode,
     string? Message, string? TypeName, string? FullTypeName,
     string? StackTrace, string? FormattedDescription);
-
-// ===================================================================
-// Internal: DAP event wrapper for Channel
-// ===================================================================
-
-public enum DebugEventKind { Stopped, Exited, Terminated, Output }
-
-public record DebugEvent
-{
-    public DebugEventKind Kind { get; init; }
-    public int? ThreadId { get; init; }
-    public bool? AllThreadsStopped { get; init; }
-    public string? Reason { get; init; }
-    public string? FilePath { get; init; }
-    public int Line { get; init; }
-    public int Column { get; init; }
-    public int? ExitCode { get; init; }
-    public string? Text { get; init; }
-
-    public static DebugEvent FromDap(JsonObject message)
-    {
-        var eventType = message["event"]?.GetValue<string>() ?? "";
-        var body = message["body"] as JsonObject;
-
-        return eventType switch
-        {
-            "stopped" => new DebugEvent
-            {
-                Kind = DebugEventKind.Stopped,
-                ThreadId = body?["threadId"]?.GetValue<int>(),
-                AllThreadsStopped = body?["allThreadsStopped"]?.GetValue<bool>(),
-                Reason = body?["reason"]?.GetValue<string>(),
-                FilePath = body?["source"]?["path"]?.GetValue<string>(),
-                Line = body?["line"]?.GetValue<int>() ?? 0,
-                Column = body?["column"]?.GetValue<int>() ?? 0
-            },
-            "exited" => new DebugEvent
-            {
-                Kind = DebugEventKind.Exited,
-                ExitCode = body?["exitCode"]?.GetValue<int>()
-            },
-            "terminated" => new DebugEvent { Kind = DebugEventKind.Terminated },
-            "output" => new DebugEvent
-            {
-                Kind = DebugEventKind.Output,
-                Text = body?["output"]?.GetValue<string>()
-            },
-            "thread" => new DebugEvent { Kind = DebugEventKind.Output }, // treat as info
-            "module" => new DebugEvent { Kind = DebugEventKind.Output },
-            "breakpoint" => new DebugEvent { Kind = DebugEventKind.Output },
-            "continued" => new DebugEvent { Kind = DebugEventKind.Output },
-            _ => new DebugEvent { Kind = DebugEventKind.Output, Text = $"[{eventType}]" }
-        };
-    }
-}

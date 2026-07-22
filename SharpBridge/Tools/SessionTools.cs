@@ -11,7 +11,8 @@ public class SessionTools(DebugSession session)
     private readonly DebugSession _session = session;
 
     [McpServerTool, Description("Launch a .NET program for debugging. " +
-        "The program will start suspended, allowing breakpoints to be set before execution begins.")]
+        "The debugger will attempt to stop at the program entry point. " +
+        "After launching, always call debug_state to verify the debugger state before using other tools.")]
     public async Task<string> DebugLaunch(
         [Description("Path to the .NET DLL to debug (e.g. bin/Debug/net10.0/MyApp.dll)")] string program,
         [Description("Command-line arguments for the program")] string[]? args = null,
@@ -26,14 +27,20 @@ public class SessionTools(DebugSession session)
         _session.Initialize();
         await _session.LaunchAsync(program, args, cwd, stopAtEntry, env);
 
+        var note = _session.CurrentState switch
+        {
+            DebugSession.State.Stopped => "Program is stopped. Set breakpoints and use debug_continue.",
+            DebugSession.State.Running => "Program is running. Use debug_pause to interrupt, or set breakpoints and use debug_continue.",
+            DebugSession.State.Exited => "Program has already exited. Check debug output for errors.",
+            _ => "Unknown state. Use debug_state to check."
+        };
+
         return JsonSerializer.Serialize(new
         {
             status = "launched",
             program,
             state = _session.CurrentState.ToString(),
-            note = stopAtEntry
-                ? "Program started and stopped at entry. Set breakpoints, then use debug_continue."
-                : "Program is running. Use debug_pause to interrupt."
+            note
         });
     }
 
