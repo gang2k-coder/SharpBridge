@@ -46,6 +46,9 @@ public class DebugSession : IDisposable
     private string? _adapterId;
     private List<ExceptionBreakpointsFilter>? _exceptionFilters;
     private int? _activeThreadId;
+    private readonly List<CaptureSnapshot> _captures = [];
+    private int _captureIndex;
+    private bool _shouldAutoContinue;
 
     // ===================================================================
     // Session identity
@@ -276,17 +279,25 @@ public class DebugSession : IDisposable
     {
         public bool Verified { get; set; } = Verified;
         public string? Message { get; set; }
+        public string Action { get; set; } = "break";
+        public bool Capture { get; set; }
+        public string? CaptureScope { get; set; }
+        public int CaptureDepth { get; set; }
     }
 
+    private readonly Dictionary<(string File, int Line), BreakpointEntry> _bpConfigs = [];
+
     public IReadOnlyList<BreakpointEntry> SetBreakpoints(
-        string filePath, params (int Line, int? Column, string? Condition, string? HitCondition)[] breakpoints)
+        string filePath,
+        params (int Line, int? Column, string? Condition, string? HitCondition,
+                string Action, bool Capture, string? CaptureScope, int CaptureDepth)[] breakpoints)
     {
         _breakpointsByFile.Remove(filePath);
 
         var entries = new List<BreakpointEntry>();
         var sourceBreakpoints = new List<SourceBreakpoint>();
 
-        foreach (var (line, col, cond, hitCond) in breakpoints)
+        foreach (var (line, col, cond, hitCond, action, capture, captureScope, captureDepth) in breakpoints)
         {
             var entry = new BreakpointEntry(
                 Id: _nextBreakpointId++,
@@ -297,8 +308,15 @@ public class DebugSession : IDisposable
                 HitCondition: hitCond,
                 Verified: false,
                 EndLine: null,
-                EndColumn: null);
+                EndColumn: null)
+            {
+                Action = action,
+                Capture = capture,
+                CaptureScope = captureScope,
+                CaptureDepth = captureDepth
+            };
             entries.Add(entry);
+            if (capture) _bpConfigs[(Path.GetFullPath(filePath), line)] = entry;
 
             var sbp = new SourceBreakpoint { Line = line };
             if (col.HasValue) sbp.Column = col.Value;
@@ -350,7 +368,8 @@ public class DebugSession : IDisposable
                 else
                 {
                     SetBreakpoints(file, entries.Select(e =>
-                        (e.Line, e.Column, e.Condition, e.HitCondition)).ToArray());
+                        (e.Line, e.Column, e.Condition, e.HitCondition,
+                         "break", false, (string?)null, 0)).ToArray());
                 }
                 return true;
             }
@@ -362,6 +381,35 @@ public class DebugSession : IDisposable
         => _breakpointsByFile.Values.SelectMany(v => v).OrderBy(e => e.Id).ToList();
 
     public int BreakpointCount => _breakpointsByFile.Values.Sum(v => v.Count);
+
+    // ===================================================================
+    // Capture System
+    // ===================================================================
+
+    public CaptureSnapshot CaptureState(string scope = "all", int depth = 0)
+    {
+        EnsureStopped();
+        var snapshot = new CaptureSnapshot(
+            Index: ++_captureIndex,
+            Reason: _lastStop!.Reason,
+            ThreadId: _lastStop.ThreadId,
+            FilePath: _lastStop.FilePath,
+            Line: _lastStop.Line,
+            Variables: GetVariablesForFrame(
+                GetStackTrace(_activeThreadId ?? 1).First().Id,
+                scope, depth),
+            Timestamp: DateTime.UtcNow);
+        _captures.Add(snapshot);
+        return snapshot;
+    }
+
+    public IReadOnlyList<CaptureSnapshot> GetCaptures() => _captures;
+
+    public void ClearCaptures()
+    {
+        _captures.Clear();
+        _captureIndex = 0;
+    }
 
     // ===================================================================
     // Exception Breakpoints
@@ -398,26 +446,44 @@ public class DebugSession : IDisposable
         if (CurrentState != State.Stopped)
             throw new InvalidOperationException($"Cannot continue: debugger state is {CurrentState}.");
 
-        CurrentState = State.Running;
+        using var totalCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, totalCts.Token);
 
-        // Swap TCS BEFORE sending continue (same pattern as launch)
-        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
-        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
-
-        _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
-
-        try
+        StoppedEvent? stopEvent = null;
+        do
         {
-            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-            var stopEvent = await stopTcs.Task.WaitAsync(linked.Token);
-            return BuildStopEvent(stopEvent);
-        }
-        catch (OperationCanceledException)
-        {
-            LogInfo("Continue timed out — pausing.");
-            return await PauseAndReturn(ct);
-        }
+            CurrentState = State.Running;
+
+            var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+
+            _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
+
+            try
+            {
+                stopEvent = await stopTcs.Task.WaitAsync(linked.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                if (CurrentState == State.Exited)
+                    return LastStop;
+                LogInfo("Continue timed out — pausing.");
+                return await PauseAndReturn(ct);
+            }
+
+            // On MCP thread — safe to query debugger to determine go/break + capture
+            if (CurrentState == State.Stopped && _shouldAutoContinue)
+            {
+                var (isGo, shouldCapture, scope, depth) = ResolveBreakpointAction();
+                if (shouldCapture)
+                    CaptureState(scope, depth);
+                _shouldAutoContinue = isGo;
+            }
+        } while (_shouldAutoContinue && CurrentState == State.Stopped);
+
+        if (CurrentState == State.Exited)
+            return LastStop;
+        return BuildStopEvent(stopEvent);
     }
 
     public async Task<StopEvent> StepAsync(
@@ -665,19 +731,44 @@ public class DebugSession : IDisposable
         CurrentState = State.Stopped;
         _lastStop = BuildStopEvent(e);
         _activeThreadId = e.ThreadId;
+
+        // Flag for auto-continue: ContinueAndWaitAsync will decide on MCP thread
+        _shouldAutoContinue = e.Reason == StoppedEvent.ReasonValue.Breakpoint;
+
         var old = Interlocked.Exchange(ref _pendingStopTcs,
             new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously));
         old.TrySetResult(e);
-        LogInfo($"← StoppedEvent: reason={e.Reason}, thread={e.ThreadId}");
+        LogInfo($"← StoppedEvent: reason={e.Reason}, thread={e.ThreadId}" +
+            (_shouldAutoContinue ? " (auto-continue)" : ""));
+    }
+
+    private (bool IsGo, bool ShouldCapture, string Scope, int Depth) ResolveBreakpointAction()
+    {
+        if (_activeThreadId is null) return (false, false, "all", 0);
+        try
+        {
+            var frames = GetStackTrace(_activeThreadId.Value, 0, 1);
+            if (frames.Count > 0 && frames[0].Source is not null)
+            {
+                if (frames[0].Source is not null
+                    && _bpConfigs.TryGetValue((Path.GetFullPath(frames[0].Source!), frames[0].Line), out var bpCfg))
+                    return (bpCfg.Action == "go", bpCfg.Capture,
+                        bpCfg.CaptureScope ?? "all", bpCfg.CaptureDepth);
+            }
+        }
+        catch { /* ignore lookup errors on MCP thread */ }
+        return (false, false, "all", 0);
     }
 
     private void OnExited(ExitedEvent e)
     {
         CurrentState = State.Exited;
+        _shouldAutoContinue = false;
         _lastStop = new StopEvent("exited", null, null, "exited", null, 0, 0)
         {
             ExitCode = e.ExitCode
         };
+        CompletePendingStopTcs();
         LogInfo($"← ExitedEvent: code={e.ExitCode}");
         Cleanup();
     }
@@ -685,8 +776,18 @@ public class DebugSession : IDisposable
     private void OnTerminated(TerminatedEvent e)
     {
         CurrentState = State.Exited;
+        _shouldAutoContinue = false;
+        CompletePendingStopTcs();
         LogInfo("← TerminatedEvent");
         Cleanup();
+    }
+
+    private void CompletePendingStopTcs()
+    {
+        var old = Interlocked.Exchange(ref _pendingStopTcs,
+            new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously));
+        old.TrySetResult(
+            new StoppedEvent(reason: StoppedEvent.ReasonValue.Breakpoint));
     }
 
     private void OnOutput(OutputEvent e)
@@ -767,3 +868,12 @@ public record ExceptionDetail(
     string ExceptionId, string Description, string BreakMode,
     string? Message, string? TypeName, string? FullTypeName,
     string? StackTrace, string? FormattedDescription);
+
+public record CaptureSnapshot(
+    int Index,
+    string? Reason,
+    int? ThreadId,
+    string? FilePath,
+    int Line,
+    IReadOnlyList<VariableInfo> Variables,
+    DateTime Timestamp);

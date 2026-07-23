@@ -11,7 +11,7 @@ public class BreakpointTools(DebugSessionManager manager)
     private readonly DebugSessionManager _manager = manager;
 
     [McpServerTool, Description("Set a breakpoint at a specific file and line. " +
-        "Supports conditional breakpoints and hit count conditions. " +
+        "Supports conditional breakpoints, hit count conditions, auto-capture, and go/break action. " +
         "Returns the breakpoint ID for later removal.")]
     public string BreakpointSet(
         [Description("Path to the source file (absolute or relative to the debugged program)")] string filePath,
@@ -19,11 +19,16 @@ public class BreakpointTools(DebugSessionManager manager)
         [Description("Optional column number (1-based)")] int? column = null,
         [Description("Optional C# expression that must be true for the breakpoint to trigger")] string? condition = null,
         [Description("Optional hit count condition (e.g. '>=5', '==3', '%2')")] string? hitCondition = null,
+        [Description("'break' = stop and wait (default), 'go' = auto-continue after capture")] string action = "break",
+        [Description("Enable auto-capture of variables when this breakpoint hits")] bool capture = false,
+        [Description("Capture scope: 'locals', 'arguments', or 'all' (default)")] string captureScope = "all",
+        [Description("Variable expansion depth for captures (0=summary, 1+=expand)")] int captureDepth = 0,
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
         var session = _manager.Resolve(sessionId);
 
-        var entries = session.SetBreakpoints(filePath, (line, column, condition, hitCondition));
+        var entries = session.SetBreakpoints(filePath,
+            (line, column, condition, hitCondition, action, capture, captureScope, captureDepth));
         var entry = entries.FirstOrDefault()!;
 
         return JsonSerializer.Serialize(new
@@ -36,8 +41,12 @@ public class BreakpointTools(DebugSessionManager manager)
             message = entry.Message ?? (entry.Verified ? "Breakpoint is set and will be hit." : "Breakpoint could not be verified. It may not be in executable code."),
             condition = entry.Condition,
             hitCondition = entry.HitCondition,
+            action = entry.Action,
+            capture = entry.Capture,
+            captureScope = entry.CaptureScope,
+            captureDepth = entry.CaptureDepth,
             hint = entry.Verified
-                ? null
+                ? (entry.Action == "go" ? "Go-action: will auto-continue after hitting." : null)
                 : "The breakpoint may be on a line that doesn't map to any IL instruction (e.g. a blank line or comment). Check the source line number."
         });
     }

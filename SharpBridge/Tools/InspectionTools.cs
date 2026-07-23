@@ -205,6 +205,57 @@ public class InspectionTools(DebugSessionManager manager)
         throw new ArgumentException($"Unknown action '{action}'. Use 'list' or 'set'.");
     }
 
+    [McpServerTool, Description("Manually capture variables at the current stop point. Must be in Stopped state.")]
+    public string CaptureState(
+        [Description("Which scope: 'locals', 'arguments', or 'all' (default)")] string scope = "all",
+        [Description("Variable expansion depth (0=summary)")] int depth = 0,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
+    {
+        var session = _manager.Resolve(sessionId);
+        var snapshot = session.CaptureState(scope, depth);
+
+        return JsonSerializer.Serialize(new
+        {
+            index = snapshot.Index,
+            reason = snapshot.Reason,
+            threadId = snapshot.ThreadId,
+            source = snapshot.FilePath is not null ? new { path = snapshot.FilePath, line = snapshot.Line } : null,
+            timestamp = snapshot.Timestamp,
+            variables = snapshot.Variables.Select(FormatVariable)
+        });
+    }
+
+    [McpServerTool, Description("Get all accumulated capture snapshots.")]
+    public string GetCaptures(
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
+    {
+        var session = _manager.Resolve(sessionId);
+        var captures = session.GetCaptures();
+
+        return JsonSerializer.Serialize(new
+        {
+            count = captures.Count,
+            captures = captures.Select(c => new
+            {
+                index = c.Index,
+                reason = c.Reason,
+                source = c.FilePath is not null ? new { path = c.FilePath, line = c.Line } : null,
+                timestamp = c.Timestamp,
+                variables = c.Variables.Select(FormatVariable)
+            })
+        });
+    }
+
+    [McpServerTool, Description("Clear all accumulated capture snapshots.")]
+    public string ClearCaptures(
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
+    {
+        var session = _manager.Resolve(sessionId);
+        session.ClearCaptures();
+
+        return JsonSerializer.Serialize(new { status = "cleared" });
+    }
+
     private static string FormatVariables(IReadOnlyList<VariableInfo> variables, int source)
     {
         return JsonSerializer.Serialize(new
