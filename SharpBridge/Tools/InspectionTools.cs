@@ -6,15 +6,17 @@ using SharpBridge.Services;
 namespace SharpBridge.Tools;
 
 [McpServerToolType]
-public class InspectionTools(DebugSession session)
+public class InspectionTools(DebugSessionManager manager)
 {
-    private readonly DebugSession _session = session;
+    private readonly DebugSessionManager _manager = manager;
 
     [McpServerTool, Description("List all threads in the debugged process. " +
         "Each thread has an ID you can use with stacktrace_get.")]
-    public string ThreadsList()
+    public string ThreadsList(
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
-        var threads = _session.GetThreads();
+        var session = _manager.Resolve(sessionId);
+        var threads = session.GetThreads();
 
         return JsonSerializer.Serialize(new
         {
@@ -33,9 +35,11 @@ public class InspectionTools(DebugSession session)
     public string StacktraceGet(
         [Description("Thread ID from threads_list")] int threadId,
         [Description("First frame to return (0 = top of stack)")] int startFrame = 0,
-        [Description("Maximum number of frames to return")] int? levels = null)
+        [Description("Maximum number of frames to return")] int? levels = null,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
-        var frames = _session.GetStackTrace(threadId, startFrame, levels);
+        var session = _manager.Resolve(sessionId);
+        var frames = session.GetStackTrace(threadId, startFrame, levels);
 
         return JsonSerializer.Serialize(new
         {
@@ -65,9 +69,11 @@ public class InspectionTools(DebugSession session)
         "Some variables may be expandable — if they have a variablesReference > 0, " +
         "use variables_expand to see their children (fields, properties, array elements).")]
     public string VariablesGet(
-        [Description("Frame ID from stacktrace_get response")] int frameId)
+        [Description("Frame ID from stacktrace_get response")] int frameId,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
-        var variables = _session.GetVariablesForFrame(frameId);
+        var session = _manager.Resolve(sessionId);
+        var variables = session.GetVariablesForFrame(frameId);
 
         return FormatVariables(variables, frameId);
     }
@@ -76,9 +82,11 @@ public class InspectionTools(DebugSession session)
         "Use the variablesReference from a previous variables_get or variables_expand call. " +
         "This shows fields, properties, array elements, or DebuggerTypeProxy views.")]
     public string VariablesExpand(
-        [Description("Variables reference from a previous variables_get or variables_expand call")] int variablesReference)
+        [Description("Variables reference from a previous variables_get or variables_expand call")] int variablesReference,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
-        var variables = _session.ExpandVariables(variablesReference);
+        var session = _manager.Resolve(sessionId);
+        var variables = session.ExpandVariables(variablesReference);
 
         return FormatVariables(variables, variablesReference);
     }
@@ -88,9 +96,11 @@ public class InspectionTools(DebugSession session)
         "Returns the result as a string, its type, and a variablesReference for further inspection if the result is complex.")]
     public async Task<string> Evaluate(
         [Description("C# expression to evaluate (e.g. 'x + 1', 'myList.Count', 'name.Length')")] string expression,
-        [Description("Frame ID from stacktrace_get. Uses current frame if omitted.")] int? frameId = null)
+        [Description("Frame ID from stacktrace_get. Uses current frame if omitted.")] int? frameId = null,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
-        var result = await _session.EvaluateAsync(expression, frameId);
+        var session = _manager.Resolve(sessionId);
+        var result = await session.EvaluateAsync(expression, frameId);
 
         return JsonSerializer.Serialize(new
         {
@@ -107,9 +117,11 @@ public class InspectionTools(DebugSession session)
     [McpServerTool, Description("Get details about the current exception, if the debugger stopped " +
         "due to an unhandled or caught exception. Includes type, message, HResult, and stack trace.")]
     public string ExceptionInfo(
-        [Description("Thread ID. Uses current thread if omitted.")] int? threadId = null)
+        [Description("Thread ID. Uses current thread if omitted.")] int? threadId = null,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
-        var ex = _session.GetExceptionInfo(threadId);
+        var session = _manager.Resolve(sessionId);
+        var ex = session.GetExceptionInfo(threadId);
 
         if (ex is null)
             return JsonSerializer.Serialize(new

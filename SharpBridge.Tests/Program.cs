@@ -49,7 +49,6 @@ try
 {
     // === Step 1: Attach ===
     Console.WriteLine("1. Attaching to debuggee...");
-    session.Initialize(logAction: m => { /* SharpDbg logs */ });
     await session.AttachAsync(pid);
     Console.WriteLine($"   State: {session.CurrentState}");
     if (session.CurrentState != DebugSession.State.Stopped)

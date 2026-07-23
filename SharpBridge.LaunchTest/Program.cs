@@ -34,7 +34,6 @@ try
 {
     // === Step 1: Launch ===
     Console.WriteLine("1. Launching debuggee via DAP (stopAtEntry=true)...");
-    session.Initialize(logAction: m => Console.WriteLine($"  SHARPDBG: {m}"));
 
     using var launchCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
     try

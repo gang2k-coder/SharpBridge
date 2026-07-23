@@ -6,9 +6,9 @@ using SharpBridge.Services;
 namespace SharpBridge.Tools;
 
 [McpServerToolType]
-public class BreakpointTools(DebugSession session)
+public class BreakpointTools(DebugSessionManager manager)
 {
-    private readonly DebugSession _session = session;
+    private readonly DebugSessionManager _manager = manager;
 
     [McpServerTool, Description("Set a breakpoint at a specific file and line. " +
         "Supports conditional breakpoints and hit count conditions. " +
@@ -18,12 +18,12 @@ public class BreakpointTools(DebugSession session)
         [Description("Line number (1-based)")] int line,
         [Description("Optional column number (1-based)")] int? column = null,
         [Description("Optional C# expression that must be true for the breakpoint to trigger")] string? condition = null,
-        [Description("Optional hit count condition (e.g. '>=5', '==3', '%2')")] string? hitCondition = null)
+        [Description("Optional hit count condition (e.g. '>=5', '==3', '%2')")] string? hitCondition = null,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
-        if (_session.CurrentState == DebugSession.State.NotStarted)
-            throw new InvalidOperationException("No debug session. Use debug_launch or debug_attach first.");
+        var session = _manager.Resolve(sessionId);
 
-        var entries = _session.SetBreakpoints(filePath, (line, column, condition, hitCondition));
+        var entries = session.SetBreakpoints(filePath, (line, column, condition, hitCondition));
         var entry = entries.FirstOrDefault()!;
 
         return JsonSerializer.Serialize(new
@@ -44,9 +44,11 @@ public class BreakpointTools(DebugSession session)
 
     [McpServerTool, Description("Remove a breakpoint by its ID (returned from breakpoint_set).")]
     public string BreakpointRemove(
-        [Description("The breakpoint ID to remove")] int id)
+        [Description("The breakpoint ID to remove")] int id,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
-        var removed = _session.RemoveBreakpoint(id);
+        var session = _manager.Resolve(sessionId);
+        var removed = session.RemoveBreakpoint(id);
 
         return JsonSerializer.Serialize(new
         {
@@ -57,9 +59,11 @@ public class BreakpointTools(DebugSession session)
     }
 
     [McpServerTool, Description("List all currently set breakpoints with their status.")]
-    public string BreakpointList()
+    public string BreakpointList(
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
-        var bps = _session.GetAllBreakpoints();
+        var session = _manager.Resolve(sessionId);
+        var bps = session.GetAllBreakpoints();
 
         return JsonSerializer.Serialize(new
         {

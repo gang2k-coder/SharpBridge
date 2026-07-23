@@ -14,8 +14,8 @@ var builder = Host.CreateApplicationBuilder(args);
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Warning);
 
-// Register DebugSession as singleton — one debug session per server lifetime
-builder.Services.AddSingleton<DebugSession>();
+// Register DebugSessionManager as singleton — manages all debug sessions
+builder.Services.AddSingleton<DebugSessionManager>();
 
 // Build MCP server with tools and STDIO transport
 builder.Services.AddMcpServer(options =>

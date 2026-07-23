@@ -1,4 +1,4 @@
-using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol;
 using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages;
 using Newtonsoft.Json.Linq;
@@ -8,6 +8,7 @@ namespace SharpBridge.Services;
 
 /// <summary>
 /// Wraps the DAP debug adapter (SharpDbg) via DebugProtocolHost.
+/// One instance per debugged process.
 ///
 /// Architecture:
 ///   DebugProtocolHost.Run() runs its internal DAP message reader on a
@@ -45,15 +46,47 @@ public class DebugSession : IDisposable
     private string? _adapterId;
 
     // ===================================================================
-    // Initialization
+    // Session identity
+    // ===================================================================
+    public int? ProcessId { get; private set; }
+    public string? ProcessName { get; private set; }
+    public bool IsAttached { get; private set; }
+
+    // ===================================================================
+    // Lifecycle callbacks
+    // ===================================================================
+    private readonly Action<int>? _onDisposed;
+    private readonly Action<int, Exception>? _onError;
+    private bool _cleanedUp;
+
+    private static readonly Regex PidLogRegex = new(
+        @"Process created suspended with PID:\s*(\d+)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    // ===================================================================
+    // Construction (initialization is implicit)
     // ===================================================================
 
-    public void Initialize(Action<string>? logAction = null)
+    public DebugSession(
+        Action<int>? onDisposed = null,
+        Action<int, Exception>? onError = null)
     {
-        if (CurrentState != State.NotStarted)
-            throw new InvalidOperationException("Session already initialized.");
+        _onDisposed = onDisposed;
+        _onError = onError;
 
-        var (input, output, disposable) = SharpDbgInMemory.NewDebugAdapterStreams(logAction);
+        // Build a logAction that captures PID from SharpDbg output
+        var (input, output, disposable) = SharpDbgInMemory.NewDebugAdapterStreams(msg =>
+        {
+            // Try to extract PID from SharpDbg log output
+            if (ProcessId is null)
+            {
+                var m = PidLogRegex.Match(msg);
+                if (m.Success && int.TryParse(m.Groups[1].Value, out var pid))
+                    ProcessId = pid;
+            }
+            // Forward to OnLog for external consumers
+            OnLog?.Invoke(msg);
+        });
         _adapter = disposable;
 
         _host = new DebugProtocolHost(input, output, registerStandardHandlers: false);
@@ -109,6 +142,8 @@ public class DebugSession : IDisposable
         if (CurrentState != State.NotStarted)
             throw new InvalidOperationException("Session not in correct state for launch.");
 
+        ProcessName = Path.GetFileNameWithoutExtension(program);
+
         var launchArgs = new Dictionary<string, JToken>
         {
             ["program"] = program,
@@ -141,6 +176,7 @@ public class DebugSession : IDisposable
             {
                 await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
                 LogInfo("Launch: stopped at entry.");
+                IsAttached = true;
                 return;
             }
             catch (TimeoutException) { }
@@ -148,6 +184,8 @@ public class DebugSession : IDisposable
             LogInfo("Launch: no StoppedEvent — trying pause to force stopAtEntry.");
             await ForceStopAfterLaunch(ct);
         }
+
+        IsAttached = true;
     }
 
     private async Task ForceStopAfterLaunch(CancellationToken ct)
@@ -190,6 +228,17 @@ public class DebugSession : IDisposable
         if (CurrentState != State.NotStarted)
             throw new InvalidOperationException("Session not in correct state for attach.");
 
+        ProcessId = processId;
+        try
+        {
+            var proc = System.Diagnostics.Process.GetProcessById(processId);
+            ProcessName = proc.ProcessName;
+        }
+        catch
+        {
+            ProcessName = $"PID:{processId}";
+        }
+
         // Attach is lazy: stores PID, actual attach happens at ConfigurationDone.
         // Breakpoints set between AttachRequest and ConfigurationDone will be
         // applied during the attach.
@@ -205,6 +254,7 @@ public class DebugSession : IDisposable
 
         // After attach, DebugActiveProcess(pid, false) suspends all threads.
         CurrentState = State.Stopped;
+        IsAttached = true;
         _lastStop = new StopEvent("stopped", null, true, "attach", null, 0, 0)
         {
             Note = "Attached to process. All threads suspended. Set breakpoints and use debug_continue."
@@ -515,11 +565,17 @@ public class DebugSession : IDisposable
 
     private void Cleanup()
     {
+        if (_cleanedUp) return;
+        _cleanedUp = true;
+
         CurrentState = State.NotStarted;
         _host?.Stop();
         _host?.WaitForReader();
         _adapter?.Dispose();
         _host = null;
+
+        if (ProcessId.HasValue)
+            _onDisposed?.Invoke(ProcessId.Value);
     }
 
     // ===================================================================
@@ -539,13 +595,19 @@ public class DebugSession : IDisposable
     private void OnExited(ExitedEvent e)
     {
         CurrentState = State.Exited;
+        _lastStop = new StopEvent("exited", null, null, "exited", null, 0, 0)
+        {
+            ExitCode = e.ExitCode
+        };
         LogInfo($"← ExitedEvent: code={e.ExitCode}");
+        Cleanup();
     }
 
     private void OnTerminated(TerminatedEvent e)
     {
         CurrentState = State.Exited;
         LogInfo("← TerminatedEvent");
+        Cleanup();
     }
 
     private void OnOutput(OutputEvent e)

@@ -6,18 +6,20 @@ using SharpBridge.Services;
 namespace SharpBridge.Tools;
 
 [McpServerToolType]
-public class ExecutionTools(DebugSession session)
+public class ExecutionTools(DebugSessionManager manager)
 {
-    private readonly DebugSession _session = session;
+    private readonly DebugSessionManager _manager = manager;
 
     [McpServerTool, Description("Continue program execution. The program will run until " +
         "a breakpoint is hit, an exception occurs, the program exits, or the timeout elapses. " +
         "On timeout, the program is automatically paused so state can be inspected.")]
     public async Task<string> DebugContinue(
         [Description("Maximum seconds to wait before auto-pausing (default: 30). " +
-            "Set to 0 for no timeout (NOT recommended if no breakpoints are set!)")] int timeout = 30)
+            "Set to 0 for no timeout (NOT recommended if no breakpoints are set!)")] int timeout = 30,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
-        var stop = await _session.ContinueAndWaitAsync(timeout);
+        var session = _manager.Resolve(sessionId);
+        var stop = await session.ContinueAndWaitAsync(timeout);
 
         return FormatStopEvent(stop);
     }
@@ -26,21 +28,25 @@ public class ExecutionTools(DebugSession session)
         "'in' (step into method calls), or 'out' (run until current method returns).")]
     public async Task<string> DebugStep(
         [Description("Step type: 'over', 'in', or 'out'")] string type = "over",
-        [Description("Thread ID (uses current thread if omitted)")] int? threadId = null)
+        [Description("Thread ID (uses current thread if omitted)")] int? threadId = null,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
         if (type is not "in" and not "out" and not "over")
             throw new ArgumentException("type must be 'in', 'out', or 'over'");
 
-        var stop = await _session.StepAsync(type, threadId);
+        var session = _manager.Resolve(sessionId);
+        var stop = await session.StepAsync(type, threadId);
 
         return FormatStopEvent(stop);
     }
 
     [McpServerTool, Description("Pause a running program immediately. " +
         "Useful when the program is running for too long or to interrupt execution.")]
-    public async Task<string> DebugPause()
+    public async Task<string> DebugPause(
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
-        var stop = await _session.PauseAsync();
+        var session = _manager.Resolve(sessionId);
+        var stop = await session.PauseAsync();
 
         return FormatStopEvent(stop);
     }
@@ -65,7 +71,6 @@ public class ExecutionTools(DebugSession session)
             {
                 "stopped" => "Program stopped. Use inspection tools to examine state.",
                 "exited" => "Program exited. Use debug_disconnect to clean up.",
-                "terminated" => "Program was terminated. Use debug_disconnect to clean up.",
                 _ => ""
             }
         });
