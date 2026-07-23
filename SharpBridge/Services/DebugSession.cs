@@ -488,13 +488,70 @@ public class DebugSession : IDisposable
             f.EndColumn ?? 0)).ToList();
     }
 
-    public List<VariableInfo> GetVariablesForFrame(int frameId)
+    public List<VariableInfo> GetVariablesForFrame(
+        int frameId,
+        string scope = "all",
+        int depth = 0,
+        IReadOnlySet<string>? expand = null)
     {
         EnsureStopped();
         var scopes = GetScopes(frameId);
         if (scopes.Count == 0) return [];
-        var localsScope = scopes.FirstOrDefault(s => s.Name == "Locals") ?? scopes[0];
-        return ExpandVariables(localsScope.VariablesReference);
+
+        List<ScopeInfo> selected = scope switch
+        {
+            "locals" => scopes.Where(s => s.Name == "Locals").ToList(),
+            "arguments" => scopes.Where(s => s.Name == "Arguments").ToList(),
+            "all" => scopes.Where(s => s.Name is "Locals" or "Arguments").ToList(),
+            _ => throw new ArgumentException(
+                $"Unknown scope '{scope}'. Use 'locals', 'arguments', or 'all'.")
+        };
+
+        if (selected.Count == 0)
+            selected.Add(scopes[0]); // fallback
+
+        var allVariables = new List<VariableInfo>();
+        foreach (var s in selected)
+        {
+            var vars = ExpandVariables(s.VariablesReference);
+            allVariables.AddRange(vars);
+        }
+
+        if (depth > 0)
+        {
+            for (int i = 0; i < allVariables.Count; i++)
+            {
+                var v = allVariables[i];
+                if (v.VariablesReference > 0 &&
+                    (expand is null || expand.Count == 0 || expand.Contains(v.Name)))
+                {
+                    var children = ExpandVariablesRecursive(v.VariablesReference, depth - 1, expand);
+                    allVariables[i] = v with { Children = children };
+                }
+            }
+        }
+
+        return allVariables;
+    }
+
+    private List<VariableInfo> ExpandVariablesRecursive(
+        int variablesReference, int remainingDepth, IReadOnlySet<string>? expand)
+    {
+        var children = ExpandVariables(variablesReference);
+        if (remainingDepth <= 0) return children;
+
+        for (int i = 0; i < children.Count; i++)
+        {
+            var c = children[i];
+            if (c.VariablesReference > 0 &&
+                (expand is null || expand.Count == 0 || expand.Contains(c.Name)))
+            {
+                var grandChildren = ExpandVariablesRecursive(
+                    c.VariablesReference, remainingDepth - 1, expand);
+                children[i] = c with { Children = grandChildren };
+            }
+        }
+        return children;
     }
 
     public List<VariableInfo> ExpandVariables(int variablesReference)
@@ -679,7 +736,10 @@ public record StackFrameInfo(
 public record ScopeInfo(string Name, int VariablesReference, bool Expensive);
 public record VariableInfo(
     string Name, string Value, string? Type, int VariablesReference,
-    string? EvaluateName, int? IndexedVariables, int? NamedVariables);
+    string? EvaluateName, int? IndexedVariables, int? NamedVariables)
+{
+    public List<VariableInfo>? Children { get; init; }
+}
 public record EvalResult(string Result, string? Type, int VariablesReference);
 public record ExceptionDetail(
     string ExceptionId, string Description, string BreakMode,

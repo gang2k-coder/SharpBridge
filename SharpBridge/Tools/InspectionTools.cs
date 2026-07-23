@@ -64,16 +64,20 @@ public class InspectionTools(DebugSessionManager manager)
         });
     }
 
-    [McpServerTool, Description("Get local variables for a stack frame. " +
-        "Pass a frame ID from stacktrace_get's response. " +
-        "Some variables may be expandable — if they have a variablesReference > 0, " +
-        "use variables_expand to see their children (fields, properties, array elements).")]
+    [McpServerTool, Description("Get variables for a stack frame. " +
+        "Set depth=1 to auto-expand children (list elements, object fields) — saves round-trips. " +
+        "Use 'expand' to limit expansion to specific variable names, avoiding token waste. " +
+        "Use variables_expand for deeper drill-down on individual references.")]
     public string VariablesGet(
         [Description("Frame ID from stacktrace_get response")] int frameId,
+        [Description("Which scope to get: 'locals', 'arguments', or 'all' (default)")] string scope = "all",
+        [Description("Auto-expand depth: 0=summary only, 1=show children, 2+=recurse")] int depth = 0,
+        [Description("Only expand variables with these names (null/empty = expand all at depth)")] string[]? expand = null,
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
         var session = _manager.Resolve(sessionId);
-        var variables = session.GetVariablesForFrame(frameId);
+        var expandSet = expand is { Length: > 0 } ? new HashSet<string>(expand) : null;
+        var variables = session.GetVariablesForFrame(frameId, scope, depth, expandSet);
 
         return FormatVariables(variables, frameId);
     }
@@ -153,20 +157,26 @@ public class InspectionTools(DebugSessionManager manager)
         {
             source,
             count = variables.Count,
-            variables = variables.Select(v => new
-            {
-                v.Name,
-                v.Value,
-                v.Type,
-                v.VariablesReference,
-                v.EvaluateName,
-                v.IndexedVariables,
-                v.NamedVariables,
-                expandable = v.VariablesReference > 0,
-                hint = v.VariablesReference > 0
-                    ? $"Use variables_expand with variablesReference={v.VariablesReference} to see children."
-                    : null
-            })
+            variables = variables.Select(FormatVariable)
         });
+    }
+
+    private static object FormatVariable(VariableInfo v)
+    {
+        return new
+        {
+            v.Name,
+            v.Value,
+            v.Type,
+            v.VariablesReference,
+            v.EvaluateName,
+            v.IndexedVariables,
+            v.NamedVariables,
+            expandable = v.VariablesReference > 0,
+            hint = v.VariablesReference > 0 && v.Children is null
+                ? $"Use variables_expand with variablesReference={v.VariablesReference} to see children."
+                : null,
+            children = v.Children?.Select(FormatVariable)
+        };
     }
 }
