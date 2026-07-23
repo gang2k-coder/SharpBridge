@@ -24,7 +24,9 @@ public class InspectionTools(DebugSessionManager manager)
             threads = threads.Select(t => new
             {
                 t.Id,
-                t.Name
+                t.Name,
+                t.IsActive,
+                hint = t.IsActive ? "This thread triggered the current stop." : null
             })
         });
     }

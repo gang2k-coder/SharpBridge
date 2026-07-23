@@ -45,6 +45,7 @@ public class DebugSession : IDisposable
     private int _nextBreakpointId = 1;
     private string? _adapterId;
     private List<ExceptionBreakpointsFilter>? _exceptionFilters;
+    private int? _activeThreadId;
 
     // ===================================================================
     // Session identity
@@ -484,7 +485,8 @@ public class DebugSession : IDisposable
     {
         EnsureStopped();
         var response = _host!.SendRequestSync(new ThreadsRequest());
-        return response.Threads.Select(t => new ThreadInfo(t.Id, t.Name)).ToList();
+        return response.Threads.Select(t => new ThreadInfo(
+            t.Id, t.Name, t.Id == _activeThreadId)).ToList();
     }
 
     public List<StackFrameInfo> GetStackTrace(int threadId, int startFrame = 0, int? levels = null)
@@ -662,6 +664,7 @@ public class DebugSession : IDisposable
     {
         CurrentState = State.Stopped;
         _lastStop = BuildStopEvent(e);
+        _activeThreadId = e.ThreadId;
         var old = Interlocked.Exchange(ref _pendingStopTcs,
             new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously));
         old.TrySetResult(e);
@@ -748,7 +751,7 @@ public record StopEvent(
     public string? Note { get; init; }
 }
 
-public record ThreadInfo(int Id, string Name);
+public record ThreadInfo(int Id, string Name, bool IsActive);
 public record StackFrameInfo(
     int Id, string Name, string? Source,
     int Line, int Column, int EndLine, int EndColumn);
