@@ -100,6 +100,12 @@ Each `DebugSession` runs a `DebugProtocolHost` on a background thread that reads
 
 - **Exception filter support incomplete**: SharpDbg advertises `"all"` and `"user-unhandled"` exception breakpoint filters but hardcodes `breakOnAllExceptions = true` regardless of filter selection. Both filters currently behave identically (break on every exception). Per-exception-type configuration (`ExceptionOptions`) is not supported by SharpDbg. `exception_breakpoints` works correctly for stopping on exceptions, but fine-grained filtering requires future SharpDbg improvements.
 
+- **Function breakpoints not yet implemented by SharpDbg**: `HandleSetFunctionBreakpointsRequest` returns an empty response with the comment "not yet fully implemented." Cannot break on function names until SharpDbg adds this.
+
+- **Goto/GotoTargets not yet implemented by SharpDbg**: `HandleGotoRequest` and `HandleGotoTargetsRequest` handlers exist in SharpDbg but their functionality is unclear. Not exposed via SharpBridge.
+
+- **Memory read/write, disassembly**: SharpDbg does not implement `ReadMemoryRequest`, `WriteMemoryRequest`, or `DisassembleRequest`. These require SharpDbg changes.
+
 ## License
 
 MIT
