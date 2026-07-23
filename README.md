@@ -16,8 +16,9 @@ SharpBridge translates MCP tool calls into DAP debug commands, giving AI coding 
 - **Launch** .NET programs with debugging, or **attach** to running processes (by PID or process name)
 - **Smart attach**: auto-detect single vs. multiple process instances by name
 - **Session management**: `debug_select` to switch default session, `debug_list` to see all active sessions
-- **18 MCP tools**: session management, breakpoints, execution control, and state inspection
+- **19 MCP tools**: session management, breakpoints, exception breakpoints, execution control, and state inspection
 - **Smart inspect**: `variables_get` supports scope selection (locals/arguments/all), auto-expand depth, and targeted expansion by name — one call replaces multiple round-trips
+- **Exception breakpoints**: `exception_breakpoints` lists available filters and configures which exceptions cause breaks. Exception stops provide full details (type, message, stack trace, HResult) via `exception_info`
 - **Single STDIO transport** — zero-config MCP integration
 
 ## Quick Start
@@ -96,6 +97,8 @@ Each `DebugSession` runs a `DebugProtocolHost` on a background thread that reads
 ## Known Issues
 
 - **Launch PID extraction**: PID is extracted from SharpDbg log output via regex (`Process created suspended with PID: (\d+)`). This depends on SharpDbg's log format, which is not a stable API. If SharpDbg changes its log format, launch will fail with "Could not determine PID." Long-term fix: use DAP `ProcessEvent` if SharpDbg adds PID support, or manage process creation ourselves.
+
+- **Exception filter support incomplete**: SharpDbg advertises `"all"` and `"user-unhandled"` exception breakpoint filters but hardcodes `breakOnAllExceptions = true` regardless of filter selection. Both filters currently behave identically (break on every exception). Per-exception-type configuration (`ExceptionOptions`) is not supported by SharpDbg. `exception_breakpoints` works correctly for stopping on exceptions, but fine-grained filtering requires future SharpDbg improvements.
 
 ## License
 

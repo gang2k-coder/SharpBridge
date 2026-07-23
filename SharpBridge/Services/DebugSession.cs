@@ -44,6 +44,7 @@ public class DebugSession : IDisposable
     private readonly Dictionary<string, List<BreakpointEntry>> _breakpointsByFile = new();
     private int _nextBreakpointId = 1;
     private string? _adapterId;
+    private List<ExceptionBreakpointsFilter>? _exceptionFilters;
 
     // ===================================================================
     // Session identity
@@ -107,7 +108,7 @@ public class DebugSession : IDisposable
         _host.Run();
 
         // DAP handshake — call SendRequestSync directly (thread-safe)
-        _host.SendRequestSync(new InitializeRequest
+        var initResponse = _host.SendRequestSync(new InitializeRequest
         {
             ClientID = "sharpbridge-mcp",
             ClientName = "SharpBridge",
@@ -122,6 +123,8 @@ public class DebugSession : IDisposable
             SupportsMemoryReferences = false,
             SupportsProgressReporting = false,
         });
+
+        _exceptionFilters = initResponse.ExceptionBreakpointFilters;
 
         _adapterId = "sharpdbg";
         LogInfo($"DAP initialized. Adapter: {_adapterId}");
@@ -358,6 +361,22 @@ public class DebugSession : IDisposable
         => _breakpointsByFile.Values.SelectMany(v => v).OrderBy(e => e.Id).ToList();
 
     public int BreakpointCount => _breakpointsByFile.Values.Sum(v => v.Count);
+
+    // ===================================================================
+    // Exception Breakpoints
+    // ===================================================================
+
+    public IReadOnlyList<ExceptionBreakpointsFilter>? GetExceptionBreakpointFilters()
+        => _exceptionFilters;
+
+    public void SetExceptionBreakpoints(string[] filters)
+    {
+        _host!.SendRequestSync(new SetExceptionBreakpointsRequest
+        {
+            Filters = filters.ToList()
+        });
+        LogInfo($"Exception breakpoints set: [{string.Join(", ", filters)}]");
+    }
 
     // ===================================================================
     // Execution Control

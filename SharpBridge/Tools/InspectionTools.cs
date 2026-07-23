@@ -151,6 +151,58 @@ public class InspectionTools(DebugSessionManager manager)
         });
     }
 
+    [McpServerTool, Description("Configure which exceptions cause the debugger to break. " +
+        "Use action='list' to see available exception filters from the debug adapter. " +
+        "Use action='set' with a list of filter IDs to enable them (empty array = break on no exceptions).")]
+    public string ExceptionBreakpoints(
+        [Description("'list' to see available filters, 'set' to configure")] string action = "list",
+        [Description("Filter IDs to enable (e.g. ['all', 'user-unhandled']). Only for action='set'.")] string[]? filters = null,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
+    {
+        var session = _manager.Resolve(sessionId);
+
+        if (action == "list")
+        {
+            var availableFilters = session.GetExceptionBreakpointFilters();
+            if (availableFilters is null || availableFilters.Count == 0)
+                return JsonSerializer.Serialize(new
+                {
+                    count = 0,
+                    message = "No exception breakpoint filters available from the debug adapter."
+                });
+
+            return JsonSerializer.Serialize(new
+            {
+                count = availableFilters.Count,
+                filters = availableFilters.Select(f => new
+                {
+                    id = f.Filter,
+                    label = f.Label,
+                    description = f.Description,
+                    defaultEnabled = f.Default
+                }),
+                hint = "Use exception_breakpoints(action='set', filters=['...']) to enable the desired filters."
+            });
+        }
+
+        if (action == "set")
+        {
+            var enabledFilters = filters ?? [];
+            session.SetExceptionBreakpoints(enabledFilters);
+
+            return JsonSerializer.Serialize(new
+            {
+                status = "configured",
+                enabledFilters = enabledFilters,
+                note = enabledFilters.Length == 0
+                    ? "Exception breakpoints disabled. The debugger will NOT stop on exceptions."
+                    : $"Exception breakpoints enabled: [{string.Join(", ", enabledFilters)}]. The debugger will stop on matching exceptions."
+            });
+        }
+
+        throw new ArgumentException($"Unknown action '{action}'. Use 'list' or 'set'.");
+    }
+
     private static string FormatVariables(IReadOnlyList<VariableInfo> variables, int source)
     {
         return JsonSerializer.Serialize(new

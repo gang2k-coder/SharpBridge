@@ -2,6 +2,9 @@
 
 using System.Diagnostics;
 
+// Check for --throw mode
+bool throwMode = args.Length > 0 && args[0] == "--throw";
+
 // Show PID for attach and pause to give time to connect
 Console.WriteLine($"PID: {Environment.ProcessId}");
 Console.WriteLine("Press ENTER to start...");
@@ -23,6 +26,13 @@ for (int i = 0; i < numbers.Count; i++)
     int current = numbers[i];
     int doubled = DoubleValue(current); // Step into this method
     Console.WriteLine($"  [{i}] {current} * 2 = {doubled}, counter = {counter}");
+
+    // In --throw mode, throw during the 3rd iteration
+    if (throwMode && i == 2)
+    {
+        Console.WriteLine("About to throw test exception...");
+        throw new InvalidOperationException("Test exception from debuggee");
+    }
 }
 
 Console.WriteLine($"\nFinal counter: {counter}");
