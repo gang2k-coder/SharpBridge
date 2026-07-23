@@ -225,7 +225,9 @@ public class InspectionTools(DebugSessionManager manager)
         });
     }
 
-    [McpServerTool, Description("Get all accumulated capture snapshots.")]
+    [McpServerTool, Description("Get all accumulated capture snapshots from auto-capture breakpoints " +
+        "and manual capture_state calls. Each snapshot contains captured variables, source location, " +
+        "and a timestamp. Use after debug_continue with go-action capture breakpoints.")]
     public string GetCaptures(
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
@@ -246,7 +248,8 @@ public class InspectionTools(DebugSessionManager manager)
         });
     }
 
-    [McpServerTool, Description("Clear all accumulated capture snapshots.")]
+    [McpServerTool, Description("Clear all accumulated capture snapshots. Call before starting " +
+        "a new debug_continue with go-action breakpoints to reset the capture history.")]
     public string ClearCaptures(
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {

@@ -67,7 +67,7 @@ public class BreakpointTools(DebugSessionManager manager)
         });
     }
 
-    [McpServerTool, Description("List all currently set breakpoints with their status.")]
+    [McpServerTool, Description("List all currently set breakpoints with their status, conditions, and capture configuration.")]
     public string BreakpointList(
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
@@ -86,7 +86,14 @@ public class BreakpointTools(DebugSessionManager manager)
                 bp.Verified,
                 bp.Message,
                 bp.Condition,
-                bp.HitCondition
+                bp.HitCondition,
+                bp.Action,
+                bp.Capture,
+                bp.CaptureScope,
+                bp.CaptureDepth,
+                hint = bp.Action == "go"
+                    ? "Go-action: auto-continues after hitting (with capture if enabled)"
+                    : null
             })
         });
     }

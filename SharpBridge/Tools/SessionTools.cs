@@ -83,7 +83,9 @@ public class SessionTools(DebugSessionManager manager)
         });
     }
 
-    [McpServerTool, Description("Get the current debugger state for a session.")]
+    [McpServerTool, Description("Get the current debugger state for a session. " +
+        "Shows state (Running/Stopped/Exited), breakpoint count, and contextual hints. " +
+        "Always call this first if a previous operation returned an error or the state is unclear.")]
     public string DebugState(
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {

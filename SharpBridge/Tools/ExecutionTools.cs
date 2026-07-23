@@ -10,8 +10,10 @@ public class ExecutionTools(DebugSessionManager manager)
 {
     private readonly DebugSessionManager _manager = manager;
 
-    [McpServerTool, Description("Continue program execution. The program will run until " +
-        "a breakpoint is hit, an exception occurs, the program exits, or the timeout elapses. " +
+    [McpServerTool, Description("Continue program execution. Runs until a breakpoint, " +
+        "exception, or exit. If go-action (auto-capture) breakpoints are set, they will " +
+        "fire silently and auto-continue — use get_captures afterwards to retrieve snapshots. " +
+        "When a break-action breakpoint or non-breakpoint stop occurs, returns the stop event. " +
         "On timeout, the program is automatically paused so state can be inspected.")]
     public async Task<string> DebugContinue(
         [Description("Maximum seconds to wait before auto-pausing (default: 30). " +
