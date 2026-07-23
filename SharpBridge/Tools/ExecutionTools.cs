@@ -30,7 +30,7 @@ public class ExecutionTools(DebugSessionManager manager)
         "'in' (step into method calls), or 'out' (run until current method returns).")]
     public async Task<string> DebugStep(
         [Description("Step type: 'over', 'in', or 'out'")] string type = "over",
-        [Description("Thread ID (uses current thread if omitted)")] int? threadId = null,
+        [Description("Thread ID from threads_list. Defaults to the thread that triggered the current stop.")] int? threadId = null,
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
         if (type is not "in" and not "out" and not "over")
@@ -43,7 +43,8 @@ public class ExecutionTools(DebugSessionManager manager)
     }
 
     [McpServerTool, Description("Pause a running program immediately. " +
-        "Useful when the program is running for too long or to interrupt execution.")]
+        "Requires the program to be in Running state (check with debug_state first). " +
+        "Useful when execution runs too long or to interrupt.")]
     public async Task<string> DebugPause(
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {

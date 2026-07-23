@@ -65,14 +65,17 @@ public class SessionTools(DebugSessionManager manager)
             status = result.AlreadyAttached ? "already_attached" : "attached",
             processId = result.ProcessId,
             processName = result.ProcessName,
-            state = result.State
+            state = result.State,
+            note = result.AlreadyAttached
+                ? "Already attached to this process. Use debug_select or specify sessionId to operate on it."
+                : "Attached. All threads suspended. Set breakpoints and use debug_continue."
         });
     }
 
     [McpServerTool, Description("Disconnect the debugger from a session and optionally terminate the debuggee.")]
     public string DebugDisconnect(
         [Description("Whether to terminate the debugged process (default: true)")] bool terminateDebuggee = true,
-        [Description("Process ID to disconnect. Uses the currently selected session if omitted.")] int? sessionId = null)
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
         _manager.DisconnectSession(sessionId, terminateDebuggee);
 

@@ -102,7 +102,7 @@ public class InspectionTools(DebugSessionManager manager)
         "Returns the result as a string, its type, and a variablesReference for further inspection if the result is complex.")]
     public async Task<string> Evaluate(
         [Description("C# expression to evaluate (e.g. 'x + 1', 'myList.Count', 'name.Length')")] string expression,
-        [Description("Frame ID from stacktrace_get. Uses current frame if omitted.")] int? frameId = null,
+        [Description("Frame ID from stacktrace_get. Defaults to the topmost frame (frame 0).")] int? frameId = null,
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
         var session = _manager.Resolve(sessionId);
@@ -121,7 +121,7 @@ public class InspectionTools(DebugSessionManager manager)
     }
 
     [McpServerTool, Description("Get details about the current exception, if the debugger stopped " +
-        "due to an unhandled or caught exception. Includes type, message, HResult, and stack trace.")]
+        "due to an unhandled or caught exception. Returns type, message, stack trace, and formatted description.")]
     public string ExceptionInfo(
         [Description("Thread ID. Uses current thread if omitted.")] int? threadId = null,
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
@@ -208,7 +208,7 @@ public class InspectionTools(DebugSessionManager manager)
     [McpServerTool, Description("Manually capture variables at the current stop point. Must be in Stopped state.")]
     public string CaptureState(
         [Description("Which scope: 'locals', 'arguments', or 'all' (default)")] string scope = "all",
-        [Description("Variable expansion depth (0=summary)")] int depth = 0,
+        [Description("Variable expansion depth: 0=summary only, 1=show children, 2+=recurse")] int depth = 0,
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
         var session = _manager.Resolve(sessionId);
@@ -237,6 +237,9 @@ public class InspectionTools(DebugSessionManager manager)
         return JsonSerializer.Serialize(new
         {
             count = captures.Count,
+            message = captures.Count == 0
+                ? "No captures recorded. Use capture_state to take snapshots, or set breakpoints with capture=true and action='go'."
+                : null,
             captures = captures.Select(c => new
             {
                 index = c.Index,

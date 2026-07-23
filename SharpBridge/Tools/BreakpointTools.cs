@@ -21,8 +21,8 @@ public class BreakpointTools(DebugSessionManager manager)
         [Description("Optional hit count condition (e.g. '>=5', '==3', '%2')")] string? hitCondition = null,
         [Description("'break' = stop and wait (default), 'go' = auto-continue after capture")] string action = "break",
         [Description("Enable auto-capture of variables when this breakpoint hits")] bool capture = false,
-        [Description("Capture scope: 'locals', 'arguments', or 'all' (default)")] string captureScope = "all",
-        [Description("Variable expansion depth for captures (0=summary, 1+=expand)")] int captureDepth = 0,
+        [Description("Capture scope (only when capture=true): 'locals', 'arguments', or 'all' (default)")] string captureScope = "all",
+        [Description("Capture expansion depth (only when capture=true): 0=summary, 1+=expand children")] int captureDepth = 0,
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
         var session = _manager.Resolve(sessionId);
