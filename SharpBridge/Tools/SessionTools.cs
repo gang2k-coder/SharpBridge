@@ -42,8 +42,8 @@ public class SessionTools(DebugSessionManager manager)
     }
 
     [McpServerTool, Description("Attach the debugger to a running .NET process by PID or name. " +
-        "Provide either processId or processName. If providing a name and multiple processes match, " +
-        "you'll get a list of matching PIDs to choose from.")]
+        "Provide either processId or processName. If multiple processes match the given name, " +
+        "the call fails with a list of matching PIDs — pick one and retry with processId.")]
     public async Task<string> DebugAttach(
         [Description("Process ID of the running .NET process")] int? processId = null,
         [Description("Process name (e.g. 'TestDebuggee'). Only used if processId is not provided.")] string? processName = null)

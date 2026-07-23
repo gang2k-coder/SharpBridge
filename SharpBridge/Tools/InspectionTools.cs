@@ -11,7 +11,9 @@ public class InspectionTools(DebugSessionManager manager)
     private readonly DebugSessionManager _manager = manager;
 
     [McpServerTool, Description("List all threads in the debugged process. " +
-        "Each thread has an ID you can use with stacktrace_get.")]
+        "Requires the debugger to be in Stopped state. " +
+        "Each thread has an ID you can use with stacktrace_get. " +
+        "The thread that triggered the current stop is marked with isActive=true.")]
     public string ThreadsList(
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
@@ -225,9 +227,10 @@ public class InspectionTools(DebugSessionManager manager)
         });
     }
 
-    [McpServerTool, Description("Get all accumulated capture snapshots from auto-capture breakpoints " +
-        "and manual capture_state calls. Each snapshot contains captured variables, source location, " +
-        "and a timestamp. Use after debug_continue with go-action capture breakpoints.")]
+    [McpServerTool, Description("Get all accumulated capture snapshots. " +
+        "Snapshots come from: (1) breakpoints with capture=true and action='go' that fire during debug_continue, " +
+        "and (2) manual capture_state calls. Each snapshot contains captured variables, source location, " +
+        "timestamp, and an incrementing index. Use after debug_continue with go-action capture breakpoints.")]
     public string GetCaptures(
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
