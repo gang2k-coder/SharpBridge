@@ -8,7 +8,7 @@ An MCP (Model Context Protocol) server that enables AI agents to debug .NET prog
 AI Agent (Claude/Copilot/...)  ←→  MCP  ←→  SharpBridge  ←→  DAP  ←→  SharpDbg  ←→  Your .NET App(s)
 ```
 
-SharpBridge translates MCP tool calls into DAP debug commands, giving AI coding agents the ability to set breakpoints, step through code, inspect variables, and evaluate expressions at runtime.
+SharpBridge translates MCP tool calls into DAP debug commands, giving AI coding agents the ability to set breakpoints, step through code, inspect variables, and evaluate expressions at runtime. Under the hood it uses [SharpDbg](https://github.com/MattParkerDev/SharpDbg), a .NET debug adapter built on ICorDebug — the same COM-based debugging API that Visual Studio uses.
 
 ## Features
 
