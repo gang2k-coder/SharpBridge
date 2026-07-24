@@ -449,7 +449,33 @@ public class DebugSession : IDisposable
         using var totalCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, totalCts.Token);
 
-        StoppedEvent? stopEvent = null;
+        // Simple path: no capture breakpoints → skip auto-continue loop
+        if (_bpConfigs.Count == 0)
+        {
+            CurrentState = State.Running;
+
+            var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+
+            _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
+
+            try
+            {
+                var stopEvent = await stopTcs.Task.WaitAsync(linked.Token);
+                if (CurrentState == State.Exited) return LastStop;
+                return BuildStopEvent(stopEvent);
+            }
+            catch (OperationCanceledException)
+            {
+                if (CurrentState == State.Exited)
+                    return LastStop;
+                LogInfo("Continue timed out — pausing.");
+                return await PauseAndReturn(ct);
+            }
+        }
+
+        // Go-action loop: has capture breakpoints
+        StoppedEvent? loopStopEvent = null;
         do
         {
             CurrentState = State.Running;
@@ -461,7 +487,7 @@ public class DebugSession : IDisposable
 
             try
             {
-                stopEvent = await stopTcs.Task.WaitAsync(linked.Token);
+                loopStopEvent = await stopTcs.Task.WaitAsync(linked.Token);
             }
             catch (OperationCanceledException)
             {
@@ -471,7 +497,7 @@ public class DebugSession : IDisposable
                 return await PauseAndReturn(ct);
             }
 
-            // On MCP thread — safe to query debugger to determine go/break + capture
+            // On MCP thread — safe to query debugger
             if (CurrentState == State.Stopped && _shouldAutoContinue)
             {
                 var (isGo, shouldCapture, scope, depth) = ResolveBreakpointAction();
@@ -483,7 +509,7 @@ public class DebugSession : IDisposable
 
         if (CurrentState == State.Exited)
             return LastStop;
-        return BuildStopEvent(stopEvent);
+        return BuildStopEvent(loopStopEvent);
     }
 
     public async Task<StopEvent> StepAsync(
@@ -732,8 +758,9 @@ public class DebugSession : IDisposable
         _lastStop = BuildStopEvent(e);
         _activeThreadId = e.ThreadId;
 
-        // Flag for auto-continue: ContinueAndWaitAsync will decide on MCP thread
-        _shouldAutoContinue = e.Reason == StoppedEvent.ReasonValue.Breakpoint;
+        // Only auto-continue when capture breakpoints exist (go-action loop)
+        _shouldAutoContinue = e.Reason == StoppedEvent.ReasonValue.Breakpoint
+            && _bpConfigs.Count > 0;
 
         var old = Interlocked.Exchange(ref _pendingStopTcs,
             new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously));
