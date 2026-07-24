@@ -100,6 +100,51 @@ try
     Assert(counterVal == "0", $"Expected counter=0, got {counterVal}");
     Console.WriteLine($"   counter={counterVal} ✅");
 
+    // Test 5: Breakpoint list + remove
+    tests++; passed++;
+    Console.WriteLine("5. Breakpoint list/remove...");
+    var bpListJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
+    Assert(bpListJson.RootElement.GetProperty("count").GetInt32() == 1, "Expected 1 BP");
+    var bpId = bpListJson.RootElement.GetProperty("breakpoints")[0].GetProperty("Id").GetInt32();
+    var rmJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_remove", new Dictionary<string, object?> { ["id"] = bpId })));
+    Assert(rmJson.RootElement.GetProperty("removed").GetBoolean(), "Remove failed");
+    Console.WriteLine("   ✅");
+
+    // Test 6: Exception breakpoints
+    tests++; passed++;
+    Console.WriteLine("6. Exception breakpoints...");
+    var exJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("exception_breakpoints", new Dictionary<string, object?> { ["action"] = "list" })));
+    Assert(exJson.RootElement.GetProperty("count").GetInt32() == 2, "Expected 2 filters");
+    await client.CallToolAsync("exception_breakpoints",
+        new Dictionary<string, object?> { ["action"] = "set", ["filters"] = new[] { "all" } });
+    Console.WriteLine("   ✅");
+
+    // Test 7: Capture state + get_captures + clear_captures
+    tests++; passed++;
+    Console.WriteLine("7. Capture state...");
+    var capJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("capture_state", new Dictionary<string, object?>())));
+    Assert(capJson.RootElement.GetProperty("index").GetInt32() > 0, "No capture index");
+    var capsJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures", new Dictionary<string, object?>())));
+    Assert(capsJson.RootElement.GetProperty("count").GetInt32() == 1, "Expected 1 capture");
+    await client.CallToolAsync("clear_captures", new Dictionary<string, object?>());
+    var clearedJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures", new Dictionary<string, object?>())));
+    Assert(clearedJson.RootElement.GetProperty("count").GetInt32() == 0, "Clear failed");
+    Console.WriteLine("   ✅");
+
+    // Test 8: Debug state
+    tests++; passed++;
+    Console.WriteLine("8. Debug state...");
+    var stateJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_state", new Dictionary<string, object?>())));
+    Assert(stateJson.RootElement.GetProperty("state").GetString() == "Stopped", "Not Stopped");
+    Console.WriteLine("   ✅");
+
     // Cleanup
     await client.CallToolAsync("debug_disconnect", new Dictionary<string, object?> { ["terminateDebuggee"] = true });
     Console.WriteLine($"\n=== {passed}/{tests} PASSED ===");

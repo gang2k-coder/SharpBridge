@@ -9,6 +9,11 @@ using SharpBridge.Services;
 Console.WriteLine("=== SharpBridge Attach Test ===");
 Console.WriteLine();
 
+void Assert(bool condition, string msg)
+{
+    if (!condition) throw new Exception($"Assertion failed: {msg}");
+}
+
 var repoRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../.."));
 var debuggeeDll = Path.Combine(repoRoot, "TestDebuggee/bin/Debug/net10.0/TestDebuggee.dll");
 var sourceFile = Path.Combine(repoRoot, "TestDebuggee/Program.cs");
@@ -127,6 +132,15 @@ try
     Console.WriteLine("   ✅ PASS");
     Console.WriteLine();
 
+    // === Step 7b: Variables expand ===
+    Console.WriteLine("7b. Expanding variables ('numbers' list)...");
+    var numbersVar = variables.First(v => v.Name == "numbers");
+    Assert(numbersVar.VariablesReference > 0, "numbers should be expandable");
+    var expanded = session.ExpandVariables(numbersVar.VariablesReference);
+    Assert(expanded.Count >= 5, $"Expected >=5 children, got {expanded.Count}");
+    Console.WriteLine($"   {expanded.Count} elements ✅ PASS");
+    Console.WriteLine();
+
     // === Step 8: Step over ===
     Console.WriteLine("8. Stepping over...");
     stop = await session.StepAsync("over", mainThreadId);
@@ -134,8 +148,56 @@ try
     Console.WriteLine($"   ✅ PASS");
     Console.WriteLine();
 
-    // === Step 9: Disconnect ===
-    Console.WriteLine("9. Disconnecting...");
+    // === Step 9: Breakpoint list ===
+    Console.WriteLine("9. Listing breakpoints...");
+    var bpList = session.GetAllBreakpoints();
+    Console.WriteLine($"   count={bpList.Count}, action={bpList[0].Action}");
+    Assert(bpList.Count == 1, $"Expected 1 breakpoint, got {bpList.Count}");
+    Console.WriteLine("   ✅ PASS");
+    Console.WriteLine();
+
+    // === Step 10: Exception breakpoints ===
+    Console.WriteLine("10. Exception breakpoints...");
+    var exFilters = session.GetExceptionBreakpointFilters();
+    Assert(exFilters is not null && exFilters.Count == 2, "Expected 2 exception filters");
+    Console.WriteLine($"   filters: {exFilters![0].Filter}, {exFilters[1].Filter}");
+    session.SetExceptionBreakpoints(["all"]);
+    Console.WriteLine("   ✅ PASS");
+    Console.WriteLine();
+
+    // === Step 11: Capture state ===
+    Console.WriteLine("11. Capture state...");
+    var snap = session.CaptureState();
+    Assert(snap.Index > 0, "Missing capture index");
+    Assert(snap.Variables.Count > 0, "No variables in capture");
+    Console.WriteLine($"   index={snap.Index}, vars={snap.Variables.Count} ✅ PASS");
+    Console.WriteLine();
+
+    // === Step 11: Get + clear captures ===
+    Console.WriteLine("12. Get captures...");
+    var caps = session.GetCaptures();
+    Assert(caps.Count == 1, $"Expected 1 capture, got {caps.Count}");
+    session.ClearCaptures();
+    caps = session.GetCaptures();
+    Assert(caps.Count == 0, $"Expected 0 after clear, got {caps.Count}");
+    Console.WriteLine("   ✅ PASS");
+    Console.WriteLine();
+
+    // === Step 12: Get + clear captures ===
+    Console.WriteLine("12. Get captures...");
+    Assert(session.CurrentState == DebugSession.State.Stopped, "Expected Stopped");
+    Console.WriteLine($"   state={session.CurrentState} ✅ PASS");
+    Console.WriteLine();
+
+    // === Step 15: Remove breakpoint ===
+    Console.WriteLine("15. Removing breakpoint...");
+    Assert(session.RemoveBreakpoint(bps[0].Id), "Remove failed");
+    Assert(session.GetAllBreakpoints().Count == 0, "BP not removed");
+    Console.WriteLine("   ✅ PASS");
+    Console.WriteLine();
+
+    // === Step 16: Disconnect ===
+    Console.WriteLine("16. Disconnecting...");
     session.Disconnect(terminateDebuggee: true);
     Console.WriteLine($"   State: {session.CurrentState}");
     Console.WriteLine("   ✅ PASS");
