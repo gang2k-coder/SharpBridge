@@ -228,9 +228,9 @@ public class InspectionTools(DebugSessionManager manager)
     }
 
     [McpServerTool, Description("Get all accumulated capture snapshots. " +
-        "Snapshots come from: (1) breakpoints with capture=true and action='go' that fire during debug_continue, " +
+        "Snapshots come from: (1) breakpoints with action='capture' that fire during debug_continue, " +
         "and (2) manual capture_state calls. Each snapshot contains captured variables, source location, " +
-        "timestamp, and an incrementing index. Use after debug_continue with go-action capture breakpoints.")]
+        "timestamp, and an incrementing index. Use after debug_continue with capture-action breakpoints.")]
     public string GetCaptures(
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {
@@ -241,7 +241,7 @@ public class InspectionTools(DebugSessionManager manager)
         {
             count = captures.Count,
             message = captures.Count == 0
-                ? "No captures recorded. Use capture_state to take snapshots, or set breakpoints with capture=true and action='go'."
+                ? "No captures recorded. Use capture_state to take snapshots, or set breakpoints with action='capture'."
                 : null,
             captures = captures.Select(c => new
             {
@@ -255,7 +255,7 @@ public class InspectionTools(DebugSessionManager manager)
     }
 
     [McpServerTool, Description("Clear all accumulated capture snapshots. Call before starting " +
-        "a new debug_continue with go-action breakpoints to reset the capture history.")]
+        "a new debug_continue with capture-action breakpoints to reset the capture history.")]
     public string ClearCaptures(
         [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
     {

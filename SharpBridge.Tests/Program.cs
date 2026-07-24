@@ -60,7 +60,7 @@ try
     Console.WriteLine("2. Setting breakpoint on line 22 (counter++)...");
     var bps = session.SetBreakpoints(sourceFile,
         (Line: 22, Column: null, Condition: null, HitCondition: null,
-         Action: "break", Capture: false, CaptureScope: null, CaptureDepth: 0));
+         Action: "break", CaptureScope: null, CaptureDepth: 0));
     var bp = bps[0];
     Console.WriteLine($"   ID={bp.Id}, Verified={bp.Verified}, Line={bp.Line}");
     if (!bp.Verified) Console.WriteLine($"   Message: {bp.Message}");

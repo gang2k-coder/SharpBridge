@@ -280,7 +280,6 @@ public class DebugSession : IDisposable
         public bool Verified { get; set; } = Verified;
         public string? Message { get; set; }
         public string Action { get; set; } = "break";
-        public bool Capture { get; set; }
         public string? CaptureScope { get; set; }
         public int CaptureDepth { get; set; }
     }
@@ -290,14 +289,14 @@ public class DebugSession : IDisposable
     public IReadOnlyList<BreakpointEntry> SetBreakpoints(
         string filePath,
         params (int Line, int? Column, string? Condition, string? HitCondition,
-                string Action, bool Capture, string? CaptureScope, int CaptureDepth)[] breakpoints)
+                string Action, string? CaptureScope, int CaptureDepth)[] breakpoints)
     {
         _breakpointsByFile.Remove(filePath);
 
         var entries = new List<BreakpointEntry>();
         var sourceBreakpoints = new List<SourceBreakpoint>();
 
-        foreach (var (line, col, cond, hitCond, action, capture, captureScope, captureDepth) in breakpoints)
+        foreach (var (line, col, cond, hitCond, action, captureScope, captureDepth) in breakpoints)
         {
             var entry = new BreakpointEntry(
                 Id: _nextBreakpointId++,
@@ -311,12 +310,11 @@ public class DebugSession : IDisposable
                 EndColumn: null)
             {
                 Action = action,
-                Capture = capture,
                 CaptureScope = captureScope,
                 CaptureDepth = captureDepth
             };
             entries.Add(entry);
-            if (capture) _bpConfigs[(Path.GetFullPath(filePath), line)] = entry;
+            if (action == "capture") _bpConfigs[(Path.GetFullPath(filePath), line)] = entry;
 
             var sbp = new SourceBreakpoint { Line = line };
             if (col.HasValue) sbp.Column = col.Value;
@@ -369,7 +367,7 @@ public class DebugSession : IDisposable
                 {
                     SetBreakpoints(file, entries.Select(e =>
                         (e.Line, e.Column, e.Condition, e.HitCondition,
-                         "break", false, (string?)null, 0)).ToArray());
+                         e.Action, e.CaptureScope, e.CaptureDepth)).ToArray());
                 }
                 return true;
             }
@@ -793,7 +791,7 @@ public class DebugSession : IDisposable
             {
                 if (frames[0].Source is not null
                     && _bpConfigs.TryGetValue((Path.GetFullPath(frames[0].Source!), frames[0].Line), out var bpCfg))
-                    return (bpCfg.Action == "go", bpCfg.Capture,
+                    return (bpCfg.Action == "capture", bpCfg.Action == "capture",
                         bpCfg.CaptureScope ?? "all", bpCfg.CaptureDepth);
             }
         }

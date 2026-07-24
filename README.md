@@ -19,7 +19,7 @@ SharpBridge translates MCP tool calls into DAP debug commands, giving AI coding 
 - **22 MCP tools**: session management, breakpoints (with auto-capture), exception breakpoints, execution control, state inspection, and capture snapshots
 - **Smart inspect**: `variables_get` supports scope selection (locals/arguments/all), auto-expand depth, and targeted expansion by name — one call replaces multiple round-trips
 - **Exception breakpoints**: `exception_breakpoints` lists available filters and configures which exceptions cause breaks
-- **Auto-capture**: breakpoints with `capture=true` + `action="go"` auto-capture variables and continue, accumulating snapshots. `capture_state` / `get_captures` / `clear_captures` manage state snapshots
+- **Auto-capture**: breakpoints with `action="capture"` auto-capture variables and continue (per `captureScope`/`captureDepth`), accumulating snapshots. `capture_state` / `get_captures` / `clear_captures` manage state snapshots
 - **Single STDIO transport** — zero-config MCP integration
 
 ## Quick Start
