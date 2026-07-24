@@ -35,7 +35,17 @@ SharpBridge translates MCP tool calls into DAP debug commands, giving AI coding 
 dotnet tool install -g SharpBridge
 ```
 
-The `sharpbridge` command is now available globally.
+Then add this to your MCP config (see [client-specific paths below](#configure-your-mcp-client)):
+
+```json
+{
+  "mcpServers": {
+    "sharpbridge": {
+      "command": "sharpbridge"
+    }
+  }
+}
+```
 
 ### Option 2: Build from source
 
@@ -45,7 +55,18 @@ cd SharpBridge
 dotnet build
 ```
 
-When built from source, use `dotnet run --project /path/to/SharpBridge/SharpBridge` as the command.
+When built from source, use this MCP config instead:
+
+```json
+{
+  "mcpServers": {
+    "sharpbridge": {
+      "command": "dotnet",
+      "args": ["run", "--project", "/path/to/SharpBridge/SharpBridge"]
+    }
+  }
+}
+```
 
 ### Configure your MCP client
 
@@ -118,12 +139,6 @@ Create `.vscode/mcp.json` in your workspace:
 }
 ```
 </details>
-
-> **Built from source?** Replace `"command": "sharpbridge"` with:
-> ```json
-> "command": "dotnet",
-> "args": ["run", "--project", "/path/to/SharpBridge/SharpBridge"]
-> ```
 
 ### Verify installation
 
