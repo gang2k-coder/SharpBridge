@@ -24,13 +24,20 @@ SharpBridge translates MCP tool calls into DAP debug commands, giving AI coding 
 
 ## Quick Start
 
-### Install as .NET tool
+### Prerequisites
+
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (for building/running .NET apps to debug)
+- A supported AI coding agent (Claude Desktop, Claude Code, Cursor, GitHub Copilot, etc.)
+
+### Option 1: Install from NuGet (recommended)
 
 ```bash
 dotnet tool install -g SharpBridge
 ```
 
-### Or build from source
+The `sharpbridge` command is now available globally.
+
+### Option 2: Build from source
 
 ```bash
 git clone https://github.com/gang2k-coder/SharpBridge.git
@@ -38,9 +45,50 @@ cd SharpBridge
 dotnet build
 ```
 
-### Register with an MCP client
+When built from source, use `dotnet run --project /path/to/SharpBridge/SharpBridge` as the command.
 
-**Claude Code** (`.mcp.json` in your project root):
+### Configure your MCP client
+
+Add SharpBridge to your MCP client's configuration file:
+
+<details>
+<summary><b>Claude Code</b></summary>
+
+Create or edit `.mcp.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "sharpbridge": {
+      "command": "sharpbridge"
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Claude Desktop</b></summary>
+
+Edit `claude_desktop_config.json`:
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "sharpbridge": {
+      "command": "sharpbridge"
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Cursor</b></summary>
+
+Edit `~/.cursor/mcp.json`:
 
 ```json
 {
@@ -52,19 +100,13 @@ dotnet build
 }
 ```
 
-**Claude Desktop** (`claude_desktop_config.json`):
+Restart Cursor after saving.
+</details>
 
-```json
-{
-  "mcpServers": {
-    "sharpbridge": {
-      "command": "sharpbridge"
-    }
-  }
-}
-```
+<details>
+<summary><b>VS Code / GitHub Copilot</b></summary>
 
-**VS Code / GitHub Copilot** (`.vscode/mcp.json`):
+Create `.vscode/mcp.json` in your workspace:
 
 ```json
 {
@@ -75,8 +117,33 @@ dotnet build
   }
 }
 ```
+</details>
 
-If built from source, replace `"sharpbridge"` with `"dotnet"` and add `"args": ["run", "--project", "/path/to/SharpBridge/SharpBridge"]`.
+> **Built from source?** Replace `"command": "sharpbridge"` with:
+> ```json
+> "command": "dotnet",
+> "args": ["run", "--project", "/path/to/SharpBridge/SharpBridge"]
+> ```
+
+### Verify installation
+
+Start a debuggee (any .NET app), then ask your AI agent:
+
+> Attach to process XYZ and set a breakpoint at Program.cs:10
+
+If the agent can list tools (`debug_attach`, `breakpoint_set`, etc.) via SharpBridge, you're set up.
+
+### Basic workflow
+
+Typical debugging session with your AI agent:
+
+```
+1. debug_launch (or debug_attach) — start debugging
+2. breakpoint_set — set breakpoints on interesting lines
+3. debug_continue  — run until a breakpoint hits
+4. variables_get   — inspect program state
+5. debug_step      — step through code line by line
+6. debug_disconnect — clean up when done
 ```
 
 ## Project Structure
