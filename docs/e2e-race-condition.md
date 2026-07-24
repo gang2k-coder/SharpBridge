@@ -1,3 +1,5 @@
+> **Status: FIXED** (commit fd17ca3). Root cause: `ContinueAndWaitAsync` sent a redundant `ContinueRequest` after attach because SharpDbg's `ConfigurationDone` already auto-continued the process. ICorDebug rejected it with `CORDBG_E_SUPERFLOUS_CONTINUE`. Fix: skip the initial `ContinueRequest` when `_lastStop.Reason == "attach"`.
+
 ```mermaid
 sequenceDiagram
     participant Client as E2E Test Client (进程 A)
