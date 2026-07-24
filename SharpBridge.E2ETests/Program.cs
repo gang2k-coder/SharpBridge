@@ -52,14 +52,14 @@ try
         return ((TextContentBlock)r.Content[0]).Text;
     }
 
-    // === Test 1: List tools ===
+    // Test 1: List tools
     tests++; passed++;
     Console.WriteLine("1. List tools...");
     var tools = await client.ListToolsAsync();
     Assert(tools.Count >= 20, $"Expected >=20 tools, got {tools.Count}");
     Console.WriteLine($"   {tools.Count} tools ✅");
 
-    // === Test 2: Attach ===
+    // Test 2: Attach
     tests++; passed++;
     Console.WriteLine("2. Attach...");
     var attachJson = JsonDocument.Parse(GetText(
@@ -69,10 +69,11 @@ try
     await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = attachedPid });
     Console.WriteLine($"   PID {attachedPid} ✅");
 
-    // === Test 3: Breakpoint + Continue ===
+    // Test 3: Breakpoint + Continue
     tests++; passed++;
     Console.WriteLine("3. Breakpoint + continue...");
-    var sourceFile = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../TestDebuggee/Program.cs"));
+    var sourceFile = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+        "../../../../TestDebuggee/Program.cs"));
     await client.CallToolAsync("breakpoint_set",
         new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 23 });
     await debuggee.StandardInput.WriteLineAsync();
@@ -80,40 +81,15 @@ try
         await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
     Assert(contJson.RootElement.GetProperty("status").GetString() == "stopped", "Not stopped");
     var threadId = contJson.RootElement.GetProperty("threadId").GetInt32();
-    Console.WriteLine($"   threadId={threadId} ✅");
+    Assert(!debuggee.HasExited, "Debuggee exited during continue");
+    Console.WriteLine($"   threadId={threadId}, alive ✅");
 
-    // === Test 4: State check (syncs DAP) ===
+    // Test 4: Stack + Variables
     tests++; passed++;
-    Console.WriteLine("4. State check...");
-    var stateText = GetText(await client.CallToolAsync("debug_state", new Dictionary<string, object?>()));
-    Console.WriteLine($"   {JsonDocument.Parse(stateText).RootElement.GetProperty("state").GetString()} ✅");
-
-    // === Test 5: Stack + Variables (with retry/fallback) ===
-    tests++; passed++;
-    Console.WriteLine("5. Stack + variables...");
-    JsonDocument? stackJson = null;
-    int currentThreadId = threadId;
-    for (int retry = 0; retry < 3; retry++)
-    {
-        try
-        {
-            stackJson = JsonDocument.Parse(GetText(
-                await client.CallToolAsync("stacktrace_get", new Dictionary<string, object?> { ["threadId"] = currentThreadId })));
-            if (stackJson.RootElement.GetProperty("count").GetInt32() > 0) break;
-        }
-        catch { /* retry */ }
-        // Fallback: get thread ID from threads_list
-        try
-        {
-            var threadsText = GetText(await client.CallToolAsync("threads_list", new Dictionary<string, object?>()));
-            var threadsJson = JsonDocument.Parse(threadsText);
-            if (threadsJson.RootElement.GetProperty("count").GetInt32() > 0)
-                currentThreadId = threadsJson.RootElement.GetProperty("threads")[0].GetProperty("Id").GetInt32();
-        }
-        catch { }
-        await Task.Delay(300);
-    }
-    Assert(stackJson!.RootElement.GetProperty("count").GetInt32() > 0, "No frames after retries");
+    Console.WriteLine("4. Stack + variables...");
+    var stackJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("stacktrace_get", new Dictionary<string, object?> { ["threadId"] = threadId })));
+    Assert(stackJson.RootElement.GetProperty("count").GetInt32() > 0, "No frames");
     var frameId = stackJson.RootElement.GetProperty("frames")[0].GetProperty("id").GetInt32();
 
     var varsJson = JsonDocument.Parse(GetText(

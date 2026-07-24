@@ -446,18 +446,29 @@ public class DebugSession : IDisposable
         if (CurrentState != State.Stopped)
             throw new InvalidOperationException($"Cannot continue: debugger state is {CurrentState}.");
 
+        // After attach/launch, SharpDbg's auto-Create/ConfigurationDone has already
+        // continued the process. Don't send a redundant ContinueRequest.
+        bool needsContinue = _lastStop?.Reason is not "attach";
+
         using var totalCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, totalCts.Token);
 
         // Simple path: no capture breakpoints → skip auto-continue loop
         if (_bpConfigs.Count == 0)
         {
-            CurrentState = State.Running;
-
             var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
             Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
 
-            _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
+            if (needsContinue)
+            {
+                CurrentState = State.Running;
+                _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
+            }
+            else
+            {
+                // Process already running (post-attach). State says "Stopped" but it's not.
+                // Don't change state — keep it as-is until OnStopped fires.
+            }
 
             try
             {
@@ -478,12 +489,15 @@ public class DebugSession : IDisposable
         StoppedEvent? loopStopEvent = null;
         do
         {
-            CurrentState = State.Running;
-
             var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
             Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
 
-            _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
+            if (needsContinue)
+            {
+                CurrentState = State.Running;
+                _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
+            }
+            needsContinue = true; // After first iteration, always send Continue
 
             try
             {
