@@ -51,6 +51,58 @@ public class BreakpointTools(DebugSessionManager manager)
         });
     }
 
+    [McpServerTool, Description(
+        "Set a function breakpoint that breaks when a specific method is entered. " +
+        "Supports multiple naming patterns for precise method targeting:\n" +
+        "- 'Namespace.Class.Method' — fully qualified name (exact or suffix match)\n" +
+        "- 'Class.Method' — short name (matches any namespace)\n" +
+        "- 'Method' — method name only (matches any type)\n" +
+        "- 'Method(int, string)' — with parameter types for overload disambiguation\n" +
+        "- 'GenericClass<T>.Method' — generic type with arity\n" +
+        "- 'GenericClass<T>.Method<T>(T, int)' — full generic method with parameters\n" +
+        "C# type aliases (int, string, bool, long, etc.) are automatically resolved to CLR types.\n" +
+        "When multiple methods match (overloads, multiple modules), all are bound simultaneously.\n" +
+        "Returns the breakpoint ID for later removal with breakpoint_remove.")]
+    public string FunctionBreakpointSet(
+        [Description("Function name pattern. Examples:\n" +
+            "- 'Calculator.Multiply' — simple class.method\n" +
+            "- 'Multiply' — method name only (suffix match)\n" +
+            "- 'Greeter.GetGreeting(string)' — single-param overload\n" +
+            "- 'Greeter.GetGreeting(string, string)' — two-param overload\n" +
+            "- 'MyApp.GenericProcessor<T>.Process(T)' — generic method with parameter")] string functionName,
+        [Description("Optional C# expression that must be true for the breakpoint to trigger")] string? condition = null,
+        [Description("Optional hit count condition (e.g. '>=5', '==3', '%2')")] string? hitCondition = null,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
+    {
+        var session = _manager.Resolve(sessionId);
+
+        // DAP replaces all function breakpoints each call — preserve existing ones
+        var all = session.GetAllBreakpoints()
+            .Where(bp => bp.FunctionName is not null)
+            .Select(bp => (bp.FunctionName!, bp.Condition, bp.HitCondition,
+                           bp.Action, bp.CaptureScope, bp.CaptureDepth))
+            .ToList();
+        all.Add((functionName, condition, hitCondition, "break", null, 0));
+
+        var entries = session.SetFunctionBreakpoints(all.ToArray());
+        var entry = entries.Last(); // the one just added
+
+        return JsonSerializer.Serialize(new
+        {
+            id = entry.Id,
+            functionName = entry.FunctionName,
+            verified = entry.Verified,
+            message = entry.Message ?? (entry.Verified
+                ? "Function breakpoint is set and will be hit when the method is called."
+                : "Function breakpoint could not be resolved. It may match a method in a module that hasn't loaded yet."),
+            condition = entry.Condition,
+            hitCondition = entry.HitCondition,
+            hint = entry.Verified
+                ? "The breakpoint will fire whenever any matching method is called."
+                : "It will bind automatically when the matching module loads."
+        });
+    }
+
     [McpServerTool, Description("Remove a breakpoint by its ID (returned from breakpoint_set).")]
     public string BreakpointRemove(
         [Description("The breakpoint ID to remove")] int id,
@@ -83,6 +135,7 @@ public class BreakpointTools(DebugSessionManager manager)
                 bp.FilePath,
                 bp.Line,
                 bp.Column,
+                bp.FunctionName,
                 bp.Verified,
                 bp.Message,
                 bp.Condition,

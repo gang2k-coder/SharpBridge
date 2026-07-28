@@ -110,6 +110,53 @@ try
     var rmJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("breakpoint_remove", new Dictionary<string, object?> { ["id"] = bpId })));
     Assert(rmJson.RootElement.GetProperty("removed").GetBoolean(), "Remove failed");
+    // Verify source breakpoint is truly gone
+    var afterRmJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
+    Assert(afterRmJson.RootElement.GetProperty("count").GetInt32() == 0, "Source BP not removed");
+    Console.WriteLine("   ✅");
+
+    // Test 5b: Function breakpoint — short name via MCP
+    tests++; passed++;
+    Console.WriteLine("5b. Function breakpoint (Calculator.Multiply)...");
+    var fnBpJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("function_breakpoint_set",
+            new Dictionary<string, object?> { ["functionName"] = "Calculator.Multiply" })));
+    Assert(fnBpJson.RootElement.GetProperty("verified").GetBoolean(), "Should be verified");
+    var fnBpId = fnBpJson.RootElement.GetProperty("id").GetInt32();
+    Assert(fnBpJson.RootElement.GetProperty("functionName").GetString() == "Calculator.Multiply", "Name mismatch");
+    // Continue to hit it
+    var fnContJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
+    var fnContStatus = fnContJson.RootElement.GetProperty("status").GetString();
+    Assert(fnContStatus == "stopped", $"Not stopped (status={fnContStatus})");
+    // Verify it's in the breakpoint list — find by functionName, not index
+    var fnListJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
+    Assert(fnListJson.RootElement.GetProperty("count").GetInt32() >= 1, "No bps in list");
+    var fnBpInList = fnListJson.RootElement.GetProperty("breakpoints").EnumerateArray()
+        .FirstOrDefault(bp => bp.TryGetProperty("FunctionName", out var fn) && fn.GetString() == "Calculator.Multiply");
+    Assert(fnBpInList.ValueKind != JsonValueKind.Undefined, "Function breakpoint not found in list");
+    // Remove
+    await client.CallToolAsync("breakpoint_remove", new Dictionary<string, object?> { ["id"] = fnBpId });
+    // Verify removed
+    var afterFnRmJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
+    Assert(afterFnRmJson.RootElement.GetProperty("count").GetInt32() == 0, "Fn BP not removed");
+    Console.WriteLine("   ✅");
+
+    // Test 5c: Function breakpoint — parameter matching via MCP
+    tests++; passed++;
+    Console.WriteLine("5c. Function breakpoint (Greeter.GetGreeting(string))...");
+    var fn2Json = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("function_breakpoint_set",
+            new Dictionary<string, object?> { ["functionName"] = "Greeter.GetGreeting(string)" })));
+    Assert(fn2Json.RootElement.GetProperty("verified").GetBoolean(), "Should be verified");
+    var fn2Id = fn2Json.RootElement.GetProperty("id").GetInt32();
+    var fn2ContJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
+    Assert(fn2ContJson.RootElement.GetProperty("status").GetString() == "stopped", "Not stopped");
+    await client.CallToolAsync("breakpoint_remove", new Dictionary<string, object?> { ["id"] = fn2Id });
     Console.WriteLine("   ✅");
 
     // Test 6: Exception breakpoints
@@ -152,7 +199,8 @@ try
 catch (Exception ex)
 {
     Console.WriteLine($"\n❌ {ex.GetType().Name}: {ex.Message}");
-    if (ex.InnerException is not null) Console.WriteLine($"   Inner: {ex.InnerException.Message}");
+    if (ex.InnerException is not null) Console.WriteLine($"   Inner: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
+    Console.WriteLine(ex.StackTrace);
 }
 finally
 {

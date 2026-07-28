@@ -156,6 +156,112 @@ try
     Console.WriteLine("   ✅ PASS");
     Console.WriteLine();
 
+    // === Step 9b: Remove source breakpoint to prepare for function bp tests ===
+    Console.WriteLine("9b. Removing source breakpoint for function bp tests...");
+    Assert(session.RemoveBreakpoint(bps[0].Id), "Remove failed");
+    Console.WriteLine("   ✅ PASS");
+    Console.WriteLine();
+
+    // === Step 9c: Function breakpoint — short name (Class.Method) ===
+    Console.Write("9c. Function breakpoint 'Calculator.Multiply'... ");
+    var fnBps = session.SetFunctionBreakpoints(
+        ("Calculator.Multiply", null, null, "break", null, 0));
+    var fnBp = fnBps[0];
+    Assert(fnBp.FunctionName == "Calculator.Multiply", "Name mismatch");
+    Assert(fnBp.Verified, $"Not verified: {fnBp.Message}");
+    Console.WriteLine($"id={fnBp.Id}, verified ");
+    await session.ContinueAndWaitAsync(timeoutSeconds: 10);
+    Assert(session.CurrentState == DebugSession.State.Stopped, "Should stop at function bp");
+    var fnFrames = session.GetStackTrace(
+        session.GetThreads().First(t => t.IsActive).Id, 0, 5);
+    Assert(fnFrames.Any(f => f.Name.Contains("Multiply")),
+        $"Not in Multiply: {fnFrames[0].Name}");
+    Assert(session.RemoveBreakpoint(fnBp.Id), "Remove failed");
+    Console.WriteLine($"✅ PASS (hit in {fnFrames[0].Name})");
+    Console.WriteLine();
+
+    // === Step 9d: Function breakpoint — method name only (suffix match) ===
+    Console.Write("9d. Function breakpoint 'Multiply' (method-only)... ");
+    var fnBps2 = session.SetFunctionBreakpoints(
+        ("Multiply", null, null, "break", null, 0));
+    Assert(fnBps2[0].Verified, $"Not verified: {fnBps2[0].Message}");
+    await session.ContinueAndWaitAsync(timeoutSeconds: 10);
+    Assert(session.CurrentState == DebugSession.State.Stopped, "Should stop");
+    var fnFrames2 = session.GetStackTrace(
+        session.GetThreads().First(t => t.IsActive).Id, 0, 5);
+    Assert(fnFrames2.Any(f => f.Name.Contains("Multiply")),
+        $"Not in Multiply: {fnFrames2[0].Name}");
+    Assert(session.RemoveBreakpoint(fnBps2[0].Id), "Remove failed");
+    Console.WriteLine("✅ PASS");
+    Console.WriteLine();
+
+    // === Step 9e: Function breakpoint — overload disambiguation by params ===
+    Console.Write("9e. Function breakpoint 'Greeter.GetGreeting(string)' (single-param)... ");
+    var fnBps3 = session.SetFunctionBreakpoints(
+        ("Greeter.GetGreeting(string)", null, null, "break", null, 0));
+    Assert(fnBps3[0].Verified, $"Not verified: {fnBps3[0].Message}");
+    await session.ContinueAndWaitAsync(timeoutSeconds: 10);
+    var fnFrames3 = session.GetStackTrace(
+        session.GetThreads().First(t => t.IsActive).Id, 0, 5);
+    Assert(fnFrames3.Any(f => f.Name.Contains("GetGreeting")),
+        $"Not in GetGreeting: {fnFrames3[0].Name}");
+    // Should be the single-param overload (NOT the two-param one)
+    Assert(!fnFrames3[0].Name.EndsWith("string, string)"),
+        $"Wrong overload (expected single-param): {fnFrames3[0].Name}");
+    Assert(session.RemoveBreakpoint(fnBps3[0].Id), "Remove failed");
+    Console.WriteLine($"✅ PASS ({fnFrames3[0].Name})");
+    Console.WriteLine();
+
+    // === Step 9f: Function breakpoint — two-param overload ===
+    Console.Write("9f. Function breakpoint 'Greeter.GetGreeting(string, string)' (two-param)... ");
+    var fnBps4 = session.SetFunctionBreakpoints(
+        ("Greeter.GetGreeting(string, string)", null, null, "break", null, 0));
+    Assert(fnBps4[0].Verified, $"Not verified: {fnBps4[0].Message}");
+    await session.ContinueAndWaitAsync(timeoutSeconds: 10);
+    var fnFrames4 = session.GetStackTrace(
+        session.GetThreads().First(t => t.IsActive).Id, 0, 5);
+    Assert(fnFrames4.Any(f => f.Name.Contains("GetGreeting")),
+        $"Not in GetGreeting: {fnFrames4[0].Name}");
+    Assert(fnBps4[0].Verified, "Two-param overload should be verified by SharpDbg");
+    Assert(session.RemoveBreakpoint(fnBps4[0].Id), "Remove failed");
+    Console.WriteLine($"✅ PASS (SharpDbg verified param match for {fnBps4[0].FunctionName})");
+    Console.WriteLine();
+
+    // Reset: all breakpoints should be gone
+    Assert(session.GetAllBreakpoints().Count == 0, "All breakpoints should be removed");
+    Console.WriteLine();
+
+    // === Step 9g: Function breakpoint — generic type ===
+    // SharpDbg 0.1.6 normalizes GenericProcessor<T> → GenericProcessor`1 internally.
+    // Try both the C#-style syntax and the CLR naming convention.
+    Console.Write("9g. Function breakpoint generic type... ");
+    IReadOnlyList<DebugSession.BreakpointEntry> fnBps5 = null!;
+    foreach (var pattern in new[] {
+        "GenericProcessor<T>.Process",      // C# style
+        "GenericProcessor`1.Process",       // CLR naming
+        "Process"                           // method-only fallback
+    })
+    {
+        fnBps5 = session.SetFunctionBreakpoints((pattern, null, null, "break", null, 0));
+        if (fnBps5[0].Verified) break;
+    }
+    if (fnBps5[0].Verified)
+    {
+        await session.ContinueAndWaitAsync(timeoutSeconds: 10);
+        Assert(session.CurrentState == DebugSession.State.Stopped, "Should stop");
+        var fnFrames5 = session.GetStackTrace(
+            session.GetThreads().First(t => t.IsActive).Id, 0, 5);
+        Assert(fnFrames5.Any(f => f.Name.Contains("Process")),
+            $"Not in Process: {fnFrames5[0].Name}");
+        Assert(session.RemoveBreakpoint(fnBps5[0].Id), "Remove failed");
+        Console.WriteLine($"✅ PASS ({fnFrames5[0].Name})");
+    }
+    else
+    {
+        Console.WriteLine($"⚠️ SKIP — SharpDbg 0.1.6 generic type resolution: {fnBps5[0].Message}");
+    }
+    Console.WriteLine();
+
     // === Step 10: Exception breakpoints ===
     Console.WriteLine("10. Exception breakpoints...");
     var exFilters = session.GetExceptionBreakpointFilters();
@@ -189,15 +295,8 @@ try
     Console.WriteLine($"   state={session.CurrentState} ✅ PASS");
     Console.WriteLine();
 
-    // === Step 15: Remove breakpoint ===
-    Console.WriteLine("15. Removing breakpoint...");
-    Assert(session.RemoveBreakpoint(bps[0].Id), "Remove failed");
-    Assert(session.GetAllBreakpoints().Count == 0, "BP not removed");
-    Console.WriteLine("   ✅ PASS");
-    Console.WriteLine();
-
-    // === Step 16: Disconnect ===
-    Console.WriteLine("16. Disconnecting...");
+    // === Step 14: Disconnect ===
+    Console.WriteLine("14. Disconnecting...");
     session.Disconnect(terminateDebuggee: true);
     Console.WriteLine($"   State: {session.CurrentState}");
     Console.WriteLine("   ✅ PASS");

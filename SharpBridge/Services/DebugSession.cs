@@ -42,6 +42,7 @@ public class DebugSession : IDisposable
         ?? throw new InvalidOperationException("No stop event. Debugger may not be stopped.");
     private readonly List<string> _outputLog = new();
     private readonly Dictionary<string, List<BreakpointEntry>> _breakpointsByFile = new();
+    private readonly List<BreakpointEntry> _functionBreakpoints = [];
     private int _nextBreakpointId = 1;
     private string? _adapterId;
     private List<ExceptionBreakpointsFilter>? _exceptionFilters;
@@ -282,6 +283,7 @@ public class DebugSession : IDisposable
         public string Action { get; set; } = "break";
         public string? CaptureScope { get; set; }
         public int CaptureDepth { get; set; }
+        public string? FunctionName { get; set; }
     }
 
     private readonly Dictionary<(string File, int Line), BreakpointEntry> _bpConfigs = [];
@@ -346,6 +348,62 @@ public class DebugSession : IDisposable
         return entries;
     }
 
+    /// <summary>
+    /// Set function breakpoints. DAP SetFunctionBreakpoints REPLACES ALL function breakpoints.
+    /// </summary>
+    public IReadOnlyList<BreakpointEntry> SetFunctionBreakpoints(
+        params (string Name, string? Condition, string? HitCondition,
+                string Action, string? CaptureScope, int CaptureDepth)[] breakpoints)
+    {
+        _functionBreakpoints.Clear();
+
+        var entries = new List<BreakpointEntry>();
+        var fnBreakpoints = new List<FunctionBreakpoint>();
+
+        foreach (var (name, cond, hitCond, action, captureScope, captureDepth) in breakpoints)
+        {
+            var entry = new BreakpointEntry(
+                Id: _nextBreakpointId++,
+                FilePath: "", Line: 0, Column: null,
+                Condition: cond, HitCondition: hitCond,
+                Verified: false, EndLine: null, EndColumn: null)
+            {
+                FunctionName = name,
+                Action = action,
+                CaptureScope = captureScope,
+                CaptureDepth = captureDepth
+            };
+            entries.Add(entry);
+
+            var fbp = new FunctionBreakpoint { Name = name };
+            if (cond is not null) fbp.Condition = cond;
+            if (hitCond is not null) fbp.HitCondition = hitCond;
+            fnBreakpoints.Add(fbp);
+        }
+
+        _functionBreakpoints.AddRange(entries);
+
+        if (_host is not null)
+        {
+            var response = _host.SendRequestSync(new SetFunctionBreakpointsRequest
+            {
+                Breakpoints = fnBreakpoints
+            });
+
+            var bpResults = response.Breakpoints;
+            if (bpResults is not null)
+            {
+                for (int i = 0; i < Math.Min(entries.Count, bpResults.Count); i++)
+                {
+                    entries[i].Verified = bpResults[i].Verified;
+                    entries[i].Message = bpResults[i].Message;
+                }
+            }
+        }
+
+        return entries;
+    }
+
     public bool RemoveBreakpoint(int id)
     {
         foreach (var (file, entries) in _breakpointsByFile)
@@ -372,13 +430,29 @@ public class DebugSession : IDisposable
                 return true;
             }
         }
+
+        // Check function breakpoints
+        var fnEntry = _functionBreakpoints.FirstOrDefault(e => e.Id == id);
+        if (fnEntry is not null)
+        {
+            _functionBreakpoints.Remove(fnEntry);
+            // Re-send remaining function breakpoints (DAP replaces-all semantics)
+            var remaining = _functionBreakpoints
+                .Select(e => new FunctionBreakpoint { Name = e.FunctionName!, Condition = e.Condition, HitCondition = e.HitCondition })
+                .ToList();
+            _host!.SendRequestSync(new SetFunctionBreakpointsRequest { Breakpoints = remaining });
+            return true;
+        }
+
         return false;
     }
 
     public IReadOnlyList<BreakpointEntry> GetAllBreakpoints()
-        => _breakpointsByFile.Values.SelectMany(v => v).OrderBy(e => e.Id).ToList();
+        => _breakpointsByFile.Values.SelectMany(v => v)
+            .Concat(_functionBreakpoints)
+            .OrderBy(e => e.Id).ToList();
 
-    public int BreakpointCount => _breakpointsByFile.Values.Sum(v => v.Count);
+    public int BreakpointCount => _breakpointsByFile.Values.Sum(v => v.Count) + _functionBreakpoints.Count;
 
     // ===================================================================
     // Capture System
@@ -479,7 +553,8 @@ public class DebugSession : IDisposable
                 if (CurrentState == State.Exited)
                     return LastStop;
                 LogInfo("Continue timed out — pausing.");
-                return await PauseAndReturn(ct);
+                var result = await PauseAndReturn(ct);
+                return result with { Note = (result.Note is not null ? result.Note + " " : "") + "(timed out waiting for breakpoint)" };
             }
         }
 
@@ -506,7 +581,8 @@ public class DebugSession : IDisposable
                 if (CurrentState == State.Exited)
                     return LastStop;
                 LogInfo("Continue timed out — pausing.");
-                return await PauseAndReturn(ct);
+                var result = await PauseAndReturn(ct);
+                return result with { Note = (result.Note is not null ? result.Note + " " : "") + "(timed out waiting for breakpoint)" };
             }
 
             // On MCP thread — safe to query debugger

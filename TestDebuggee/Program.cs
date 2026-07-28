@@ -25,7 +25,12 @@ for (int i = 0; i < numbers.Count; i++)
     counter++;
     int current = numbers[i];
     int doubled = DoubleValue(current); // Step into this method
-    Console.WriteLine($"  [{i}] {current} * 2 = {doubled}, counter = {counter}");
+    int multiplied = Calculator.Multiply(current, 2);
+    int added = Calculator.Add(current, 2);
+    string greeting1 = Greeter.GetGreeting(message);
+    string greeting2 = Greeter.GetGreeting("Gavin", "Liu");
+    string processed = GenericProcessor<int>.Process(current);
+    Console.WriteLine($"  [{i}] {current} * 2 = {doubled}, * 2 = {multiplied}, + 2 = {added}, counter = {counter}");
 
     // In --throw mode, throw during the 3rd iteration
     if (throwMode && i == 2)
@@ -43,4 +48,42 @@ static int DoubleValue(int x)
 {
     int result = x * 2;
     return result; // Step into here to inspect 'result'
+}
+
+// === Function breakpoint test targets ===
+
+class Calculator
+{
+    public static int Multiply(int x, int y)
+    {
+        return x * y;
+    }
+
+    public static int Add(int a, int b)
+    {
+        return a + b;
+    }
+}
+
+class Greeter
+{
+    public static string GetGreeting(string name)
+    {
+        return $"Hello, {name}!";
+    }
+
+    // Overload — disambiguated by parameter count + types
+    public static string GetGreeting(string firstName, string lastName)
+    {
+        return $"Hello, {firstName} {lastName}!";
+    }
+}
+
+// For generic method + arity tests
+class GenericProcessor<T>
+{
+    public static string Process(T item)
+    {
+        return $"Processed: {item}";
+    }
 }

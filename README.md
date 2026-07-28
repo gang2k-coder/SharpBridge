@@ -16,7 +16,7 @@ SharpBridge translates MCP tool calls into DAP debug commands, giving AI coding 
 - **Launch** .NET programs with debugging, or **attach** to running processes (by PID or process name)
 - **Smart attach**: auto-detect single vs. multiple process instances by name
 - **Session management**: `debug_select` to switch default session, `debug_list` to see all active sessions
-- **22 MCP tools**: session management, breakpoints (with auto-capture), exception breakpoints, execution control, state inspection, and capture snapshots
+- **23 MCP tools**: session management, breakpoints (source + function, with auto-capture), exception breakpoints, execution control, state inspection, and capture snapshots
 - **Smart inspect**: `variables_get` supports scope selection (locals/arguments/all), auto-expand depth, and targeted expansion by name — one call replaces multiple round-trips
 - **Exception breakpoints**: `exception_breakpoints` lists available filters and configures which exceptions cause breaks
 - **Auto-capture**: breakpoints with `action="capture"` auto-capture variables and continue (per `captureScope`/`captureDepth`), accumulating snapshots. `capture_state` / `get_captures` / `clear_captures` manage state snapshots
@@ -173,7 +173,7 @@ SharpBridge/
 │   │   └── DebugSessionManager.cs    # Multi-session manager + process lookup
 │   └── Tools/
 │       ├── SessionTools.cs           # debug_launch, attach, disconnect, state, select, list
-│       ├── BreakpointTools.cs        # breakpoint_set, remove, list
+│       ├── BreakpointTools.cs        # breakpoint_set, function_breakpoint_set, remove, list
 │       ├── ExecutionTools.cs         # debug_continue, step, pause
 │       └── InspectionTools.cs        # threads, stacktrace, variables (scope+depth+expand), evaluate, exception
 ├── SharpBridge.Tests/                # Integration test (attach)
@@ -219,8 +219,6 @@ Each `DebugSession` runs a `DebugProtocolHost` on a background thread that reads
 - **Launch PID extraction**: PID is extracted from SharpDbg log output via regex (`Process created suspended with PID: (\d+)`). This depends on SharpDbg's log format, which is not a stable API. If SharpDbg changes its log format, launch will fail with "Could not determine PID." Long-term fix: use DAP `ProcessEvent` if SharpDbg adds PID support, or manage process creation ourselves.
 
 - **Exception filter support incomplete**: SharpDbg advertises `"all"` and `"user-unhandled"` exception breakpoint filters but hardcodes `breakOnAllExceptions = true` regardless of filter selection. Both filters currently behave identically (break on every exception). Per-exception-type configuration (`ExceptionOptions`) is not supported by SharpDbg. `exception_breakpoints` works correctly for stopping on exceptions, but fine-grained filtering requires future SharpDbg improvements.
-
-- **Function breakpoints not yet implemented by SharpDbg**: `HandleSetFunctionBreakpointsRequest` returns an empty response with the comment "not yet fully implemented." Cannot break on function names until SharpDbg adds this.
 
 - **Goto/GotoTargets not yet implemented by SharpDbg**: `HandleGotoRequest` and `HandleGotoTargetsRequest` handlers exist in SharpDbg but their functionality is unclear. Not exposed via SharpBridge.
 
