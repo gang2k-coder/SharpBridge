@@ -20,6 +20,44 @@ namespace SharpBridge.Services;
 /// </summary>
 public class DebugSession : IDisposable
 {
+    public enum DebugSessionState
+    {
+        Detached,
+        Attaching,
+        Stopped,
+        Running,
+        Disconnecting,
+        Exited,
+        Faulted
+    };
+
+    private DebugSessionState _state;
+
+    private void TransitionTo(DebugSessionState newState)
+    {
+        if (!CanTransition(_state, newState))
+        {
+            throw new InvalidOperationException(
+                $"{_state} -> {newState}");
+        }
+
+        _state = newState;
+    }
+
+    private static bool CanTransition(DebugSessionState from, DebugSessionState to)
+    {
+        return (from, to) switch
+        {
+            (Detached, Attaching) => true,
+            (Attaching, Stopped) => true,
+            (Stopped, Running) => true,
+            (Running, Stopped) => true,
+            (_, Faulted) => true,
+            (_, Exited) => true,
+            _ => false
+        };
+    }
+    
     // ===================================================================
     // DAP Protocol Host
     // ===================================================================
