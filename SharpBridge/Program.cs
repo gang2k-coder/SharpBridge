@@ -12,7 +12,7 @@ var builder = Host.CreateApplicationBuilder(args);
 
 // Suppress MCP SDK logs from stdout (stdout is the JSON-RPC channel!)
 builder.Logging.ClearProviders();
-builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Warning);
+builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Warning); //TODO: should change to Level Trace? Prevent all log to stdout. 
 
 // Register DebugSessionManager as singleton — manages all debug sessions
 builder.Services.AddSingleton<DebugSessionManager>();
@@ -23,7 +23,7 @@ builder.Services.AddMcpServer(options =>
     options.ServerInfo = new()
     {
         Name = "SharpBridge",
-        Version = "0.1.0"
+        Version = "0.1.0"  //TODO: should change to version sync with project version. 
     };
     options.ServerInstructions = """
         SharpBridge is a .NET debugger MCP server. It can launch, attach to,
