@@ -55,7 +55,7 @@ public class DebugSession : IDisposable
     private int? _activeThreadId;
     private readonly List<CaptureSnapshot> _captures = [];
     private int _captureIndex;
-    private bool _shouldAutoContinue;
+    private bool _pendingCaptureCheck;
 
     // ===================================================================
     // Session identity
@@ -516,87 +516,65 @@ public class DebugSession : IDisposable
         if (_stateMachine.Current != SessionState.Stopped && _stateMachine.Current != SessionState.Attaching)
             throw new InvalidOperationException($"Cannot continue: debugger state is {_stateMachine.Current}.");
 
-        bool isAttaching = _stateMachine.Current == SessionState.Attaching;
+        // Send the right command to get the process running
+        if (_stateMachine.Current == SessionState.Attaching)
+        {
+            _host!.SendRequestSync(new ConfigurationDoneRequest());
+            if (ProcessId.HasValue)
+            {
+                try { new DiagnosticsClient(ProcessId.Value).ResumeRuntime(); }
+                catch (ServerNotAvailableException) { }
+            }
+        }
+        else
+        {
+            _host!.SendRequestSync(new ContinueRequest { ThreadId = _lastStop?.ThreadId ?? 0 });
+        }
+        _stateMachine.TransitionTo(SessionState.Running);
 
+        // Wait for OnStopped to wake us. Capture BPs loop transparently on MCP thread.
         using var totalCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, totalCts.Token);
 
-        // Simple path: no capture breakpoints → skip auto-continue loop
-        if (_bpConfigs.Count == 0)
+        while (true)
         {
-            var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
-            Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+            var tcs = Volatile.Read(ref _pendingStopTcs);
 
-            if (isAttaching)
+            StoppedEvent stopEvent;
+            try
             {
-                _host!.SendRequestSync(new ConfigurationDoneRequest());
-                // Attach mode: SharpDbg PerformAttach only attaches, doesn't resume.
-                // If the process was started with DOTNET_DefaultDiagnosticPortSuspend=1,
-                // we must manually resume the runtime. Otherwise it's a no-op.
-                if (ProcessId.HasValue)
+                stopEvent = await tcs.Task.WaitAsync(linked.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                if (_stateMachine.Current == SessionState.Exited)
+                    return LastStop;
+                return new StopEvent("running", null, null, "timeout", null, 0, 0)
                 {
-                    try { new DiagnosticsClient(ProcessId.Value).ResumeRuntime(); }
-                    catch (ServerNotAvailableException) { /* runtime not suspended via diagnostics */ }
+                    Note = "Process is still running. Use debug_pause to interrupt."
+                };
+            }
+
+            if (_stateMachine.Current == SessionState.Exited)
+                return LastStop;
+
+            // Check if this was a capture-action BP (safe to call on MCP thread)
+            if (_pendingCaptureCheck)
+            {
+                _pendingCaptureCheck = false;
+                var (isCapture, shouldCapture, scope, depth) = ResolveBreakpointAction();
+                if (shouldCapture)
+                {
+                    CaptureState(scope, depth);
+                    _host!.SendRequestSync(new ContinueRequest { ThreadId = _activeThreadId ?? 0 });
+                    _stateMachine.TransitionTo(SessionState.Running);
+                    _logger.LogInformation("Continue: auto-continue (capture)");
+                    continue; // loop back, OnStopped already set up fresh TCS
                 }
             }
-            else
-            {
-                _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
-            }
-            _stateMachine.TransitionTo(SessionState.Running);
 
-            try
-            {
-                var stopEvent = await stopTcs.Task.WaitAsync(linked.Token);
-                if (_stateMachine.Current == SessionState.Exited) return LastStop;
-                return BuildStopEvent(stopEvent);
-            }
-            catch (OperationCanceledException)
-            {
-                if (_stateMachine.Current == SessionState.Exited)
-                    return LastStop;
-                _logger.LogInformation("Continue timed out — pausing.");
-                var result = await PauseAndReturn(ct);
-                return result with { Note = (result.Note is not null ? result.Note + " " : "") + "(timed out waiting for breakpoint)" };
-            }
+            return BuildStopEvent(stopEvent);
         }
-
-        // Go-action loop: has capture breakpoints
-        StoppedEvent? loopStopEvent = null;
-        do
-        {
-            var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
-            Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
-
-            _stateMachine.TransitionTo(SessionState.Running);
-            _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
-
-            try
-            {
-                loopStopEvent = await stopTcs.Task.WaitAsync(linked.Token);
-            }
-            catch (OperationCanceledException)
-            {
-                if (_stateMachine.Current == SessionState.Exited)
-                    return LastStop;
-                _logger.LogInformation("Continue timed out — pausing.");
-                var result = await PauseAndReturn(ct);
-                return result with { Note = (result.Note is not null ? result.Note + " " : "") + "(timed out waiting for breakpoint)" };
-            }
-
-            // On MCP thread — safe to query debugger
-            if (_stateMachine.Current == SessionState.Stopped && _shouldAutoContinue)
-            {
-                var (isGo, shouldCapture, scope, depth) = ResolveBreakpointAction();
-                if (shouldCapture)
-                    CaptureState(scope, depth);
-                _shouldAutoContinue = isGo;
-            }
-        } while (_shouldAutoContinue && _stateMachine.Current == SessionState.Stopped);
-
-        if (_stateMachine.Current == SessionState.Exited)
-            return LastStop;
-        return BuildStopEvent(loopStopEvent);
     }
 
     public async Task<StopEvent> StepAsync(
@@ -606,7 +584,7 @@ public class DebugSession : IDisposable
             throw new InvalidOperationException($"Cannot step: debugger state is {_stateMachine.Current}.");
 
         _stateMachine.TransitionTo(SessionState.Running);
-        var tid = threadId ?? LastStop.ThreadId ?? 1;
+        var tid = threadId ?? _lastStop?.ThreadId ?? 1;
 
         var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
@@ -634,26 +612,6 @@ public class DebugSession : IDisposable
 
         var stopEvent = await stopTcs.Task.WaitAsync(ct);
         return BuildStopEvent(stopEvent);
-    }
-
-    private async Task<StopEvent> PauseAndReturn(CancellationToken ct)
-    {
-        try
-        {
-            return await PauseAsync(ct);
-        }
-        catch
-        {
-            if (_stateMachine.Current == SessionState.Running)
-            {
-                _stateMachine.TransitionTo(SessionState.Stopped);
-                _lastStop = new StopEvent("stopped", null, true, "pause", null, 0, 0)
-                {
-                    Note = "Unable to pause. Process may be blocked in native code."
-                };
-            }
-            return LastStop;
-        }
     }
 
     // ===================================================================
@@ -840,43 +798,42 @@ public class DebugSession : IDisposable
 
     private void OnStopped(StoppedEvent e)
     {
+        _activeThreadId = e.ThreadId;
         _stateMachine.TransitionTo(SessionState.Stopped);
         _lastStop = BuildStopEvent(e);
-        _activeThreadId = e.ThreadId;
 
-        // Only auto-continue when capture breakpoints exist (go-action loop)
-        _shouldAutoContinue = e.Reason == StoppedEvent.ReasonValue.Breakpoint
+        // Flag capture check for the MCP thread — we cannot call GetStackTrace
+        // from the DAP reader thread without corrupting debugger state.
+        _pendingCaptureCheck = e.Reason == StoppedEvent.ReasonValue.Breakpoint
             && _bpConfigs.Count > 0;
 
         var old = Interlocked.Exchange(ref _pendingStopTcs,
             new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously));
         old.TrySetResult(e);
-        _logger.LogInformation($"← StoppedEvent: reason={e.Reason}, thread={e.ThreadId}" +
-            (_shouldAutoContinue ? " (auto-continue)" : ""));
+        _logger.LogInformation("← StoppedEvent: reason={Reason}, thread={ThreadId}" +
+            (_pendingCaptureCheck ? " (pending-capture-check)" : ""), e.Reason, e.ThreadId);
     }
 
-    private (bool IsGo, bool ShouldCapture, string Scope, int Depth) ResolveBreakpointAction()
+    private (bool IsCapture, bool ShouldCapture, string Scope, int Depth) ResolveBreakpointAction()
     {
         if (_activeThreadId is null) return (false, false, "all", 0);
         try
         {
             var frames = GetStackTrace(_activeThreadId.Value, 0, 1);
-            if (frames.Count > 0 && frames[0].Source is not null)
+            if (frames.Count > 0 && frames[0].Source is not null
+                && _bpConfigs.TryGetValue((Path.GetFullPath(frames[0].Source!), frames[0].Line), out var bpCfg))
             {
-                if (frames[0].Source is not null
-                    && _bpConfigs.TryGetValue((Path.GetFullPath(frames[0].Source!), frames[0].Line), out var bpCfg))
-                    return (bpCfg.Action == "capture", bpCfg.Action == "capture",
-                        bpCfg.CaptureScope ?? "all", bpCfg.CaptureDepth);
+                return (bpCfg.Action == "capture", bpCfg.Action == "capture",
+                    bpCfg.CaptureScope ?? "all", bpCfg.CaptureDepth);
             }
         }
-        catch { /* ignore lookup errors on MCP thread */ }
+        catch { /* ignore lookup errors on DAP reader thread */ }
         return (false, false, "all", 0);
     }
 
     private void OnExited(ExitedEvent e)
     {
         _stateMachine.TransitionTo(SessionState.Exited);
-        _shouldAutoContinue = false;
         _lastStop = new StopEvent("exited", null, null, "exited", null, 0, 0)
         {
             ExitCode = e.ExitCode
@@ -889,7 +846,6 @@ public class DebugSession : IDisposable
     private void OnTerminated(TerminatedEvent e)
     {
         _stateMachine.TransitionTo(SessionState.Exited);
-        _shouldAutoContinue = false;
         CompletePendingStopTcs();
         _logger.LogInformation("← TerminatedEvent");
         Cleanup();

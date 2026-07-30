@@ -58,9 +58,9 @@ try
     Console.WriteLine();
 
     // === Step 2: Set breakpoint ===
-    Console.WriteLine("2. Setting breakpoint on line 22 (counter++)...");
+    Console.WriteLine("2. Setting breakpoint on line 23 (for loop)...");
     var bps = session.SetBreakpoints(sourceFile,
-        (Line: 22, Column: null, Condition: null, HitCondition: null,
+        (Line: 23, Column: null, Condition: null, HitCondition: null,
          Action: "break", CaptureScope: null, CaptureDepth: 0));
     var bp = bps[0];
     Console.WriteLine($"   ID={bp.Id}, Verified={bp.Verified}, Line={bp.Line}");
