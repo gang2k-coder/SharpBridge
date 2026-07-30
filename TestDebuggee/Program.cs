@@ -2,13 +2,17 @@
 
 using System.Diagnostics;
 
-// Check for --throw mode
+// Check for --throw mode and --no-wait (skip ReadLine for launch tests)
 bool throwMode = args.Length > 0 && args[0] == "--throw";
+bool noWait = args.Length > 0 && args[0] == "--no-wait";
 
 // Show PID for attach and pause to give time to connect
 Console.WriteLine($"PID: {Environment.ProcessId}");
-Console.WriteLine("Press ENTER to start...");
-Console.ReadLine();
+if (!noWait)
+{
+    Console.WriteLine("Press ENTER to start...");
+    Console.ReadLine();
+}
 
 Console.WriteLine("=== SharpBridge Test Debuggee ===");
 

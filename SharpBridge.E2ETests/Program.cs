@@ -100,6 +100,29 @@ try
     Assert(counterVal == "0", $"Expected counter=0, got {counterVal}");
     Console.WriteLine($"   counter={counterVal} ✅");
 
+    // Test 4b: Evaluate (still in Main scope with counter variable)
+    tests++; passed++;
+    Console.WriteLine("4b. Evaluate...");
+    var evalJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("evaluate", new Dictionary<string, object?> { ["expression"] = "counter + 100", ["frameId"] = frameId, ["processId"] = attachedPid })));
+    Assert(evalJson.RootElement.GetProperty("type").GetString() == "int", "Expected int type");
+    Console.WriteLine($"   counter+100={evalJson.RootElement.GetProperty("result").GetString()} ✅");
+
+    // Test 4c: Variables expand (use numbers variable from Main scope)
+    tests++; passed++;
+    Console.WriteLine("4c. Variables expand...");
+    var varsExResp = await client.CallToolAsync("variables_get",
+        new Dictionary<string, object?> { ["frameId"] = frameId, ["scope"] = "locals" });
+    var varsExJson = JsonDocument.Parse(GetText(varsExResp));
+    var numbersVar2 = varsExJson.RootElement.GetProperty("variables").EnumerateArray()
+        .First(v => v.GetProperty("Name").GetString() == "numbers");
+    Assert(numbersVar2.GetProperty("VariablesReference").GetInt32() > 0, "numbers not expandable");
+    var expandJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("variables_expand",
+            new Dictionary<string, object?> { ["variablesReference"] = numbersVar2.GetProperty("VariablesReference").GetInt32() })));
+    Assert(expandJson.RootElement.GetProperty("count").GetInt32() >= 5, $"Expected >=5 children, got {expandJson.RootElement.GetProperty("count").GetInt32()}");
+    Console.WriteLine($"   {expandJson.RootElement.GetProperty("count").GetInt32()} children ✅");
+
     // Test 5: Breakpoint list + remove
     tests++; passed++;
     Console.WriteLine("5. Breakpoint list/remove...");
@@ -245,8 +268,70 @@ try
     Assert(stateJson.RootElement.GetProperty("state").GetString() == "Stopped", "Not Stopped");
     Console.WriteLine("   ✅");
 
-    // Cleanup
+    // Test 9: Debug step — in
+    tests++; passed++;
+    Console.WriteLine("10. Step in...");
+    var stepInJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_step", new Dictionary<string, object?> { ["type"] = "in" })));
+    Assert(stepInJson.RootElement.GetProperty("status").GetString() == "stopped", "Step in failed");
+    Console.WriteLine("   ✅");
+
+    // Test 11: Exception info
+    tests++; passed++;
+    Console.WriteLine("12. Exception info...");
+    var exInfoJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("exception_info", new Dictionary<string, object?>())));
+    Assert(exInfoJson.RootElement.GetProperty("hasException").GetBoolean() == false, "Unexpected exception");
+    Console.WriteLine("   ✅");
+
+    // Test 13: session context back to original after operations
+    tests++; passed++;
+    Console.WriteLine("13. Session context preserved...");
+    var stateCheckJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_state", new Dictionary<string, object?> { ["processId"] = attachedPid })));
+    Assert(stateCheckJson.RootElement.GetProperty("state").GetString() == "Stopped", "Not Stopped");
+    Console.WriteLine("   ✅");
+
+    // Test 14: Filter rejection — call Stopped-only tool in Attaching state
+    tests++; passed++;
+    Console.WriteLine("14. Filter rejection (stacktrace_get requires Stopped)...");
+    var psi2 = new ProcessStartInfo("dotnet", debuggeeDll)
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    psi2.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var debuggee2 = Process.Start(psi2)!;
+    int pid2 = debuggee2.Id;
+    await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = pid2 });
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid2 });
+    try
+    {
+        GetText(await client.CallToolAsync("stacktrace_get", new Dictionary<string, object?> { ["threadId"] = 1 }));
+        throw new Exception("Should have been rejected by filter!");
+    }
+    catch (Exception ex) when (ex.Message.Contains("requires session state"))
+    {
+        Console.WriteLine($"   Rejected as expected ✅");
+    }
     await client.CallToolAsync("debug_disconnect", new Dictionary<string, object?> { ["terminateDebuggee"] = true });
+    if (!debuggee2.HasExited) debuggee2.Kill();
+
+    // Test 15: Filter rejection — no session selected
+    tests++; passed++;
+    Console.WriteLine("15. Filter rejection (no session)...");
+    // Disconnect attachedPid first to clear session
+    await client.CallToolAsync("debug_disconnect", new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = attachedPid });
+    try
+    {
+        GetText(await client.CallToolAsync("stacktrace_get", new Dictionary<string, object?> { ["threadId"] = 1 }));
+        throw new Exception("Should have been rejected!");
+    }
+    catch (Exception ex) when (ex.Message.Contains("No debug session"))
+    {
+        Console.WriteLine($"   Rejected as expected ✅");
+    }
+
     Console.WriteLine($"\n=== {passed}/{tests} PASSED ===");
 }
 catch (Exception ex)
