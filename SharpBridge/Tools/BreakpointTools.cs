@@ -1,7 +1,9 @@
 using System.ComponentModel;
 using System.Text.Json;
 using ModelContextProtocol.Server;
+using SharpBridge.Infrastructure.Attributes;
 using SharpBridge.Services;
+using SharpBridge.State;
 
 namespace SharpBridge.Tools;
 
@@ -10,7 +12,9 @@ public class BreakpointTools(DebugSessionManager manager)
 {
     private readonly DebugSessionManager _manager = manager;
 
-    [McpServerTool, Description("Set a breakpoint at a specific file and line. " +
+    [McpServerTool]
+    [AllowedState(SessionState.Stopped, SessionState.Running)]
+    [Description("Set a breakpoint at a specific file and line. " +
         "Supports conditional breakpoints, hit count conditions, and capture action. " +
         "action='break' (default) stops and waits; action='capture' auto-captures " +
         "variables (per captureScope/captureDepth) and continues without stopping. " +
@@ -24,9 +28,10 @@ public class BreakpointTools(DebugSessionManager manager)
         [Description("'break' = stop and wait (default), 'capture' = auto-snapshot variables and continue")] string action = "break",
         [Description("Capture scope (only when action='capture'): 'locals', 'arguments', or 'all' (default)")] string captureScope = "all",
         [Description("Capture expansion depth (only when action='capture'): 0=summary, 1+=expand children")] int captureDepth = 0,
-        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
+        [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
-        var session = _manager.Resolve(sessionId);
+        var session = ResolveSession(processId, processName);
 
         var entries = session.SetBreakpoints(filePath,
             (line, column, condition, hitCondition, action, captureScope, captureDepth));
@@ -51,7 +56,9 @@ public class BreakpointTools(DebugSessionManager manager)
         });
     }
 
-    [McpServerTool, Description(
+    [McpServerTool]
+    [AllowedState(SessionState.Stopped, SessionState.Running)]
+    [Description(
         "Set a function breakpoint that breaks when a specific method is entered. " +
         "Supports multiple naming patterns for precise method targeting:\n" +
         "- 'Namespace.Class.Method' — fully qualified name (exact or suffix match)\n" +
@@ -72,9 +79,10 @@ public class BreakpointTools(DebugSessionManager manager)
             "- 'MyApp.GenericProcessor<T>.Process(T)' — generic method with parameter")] string functionName,
         [Description("Optional C# expression that must be true for the breakpoint to trigger")] string? condition = null,
         [Description("Optional hit count condition (e.g. '>=5', '==3', '%2')")] string? hitCondition = null,
-        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
+        [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
-        var session = _manager.Resolve(sessionId);
+        var session = ResolveSession(processId, processName);
 
         // DAP replaces all function breakpoints each call — preserve existing ones
         var all = session.GetAllBreakpoints()
@@ -103,12 +111,15 @@ public class BreakpointTools(DebugSessionManager manager)
         });
     }
 
-    [McpServerTool, Description("Remove a breakpoint by its ID (returned from breakpoint_set).")]
+    [McpServerTool]
+    [AllowedState(SessionState.Stopped, SessionState.Running)]
+    [Description("Remove a breakpoint by its ID (returned from breakpoint_set).")]
     public string BreakpointRemove(
         [Description("The breakpoint ID to remove")] int id,
-        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
+        [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
-        var session = _manager.Resolve(sessionId);
+        var session = ResolveSession(processId, processName);
         var removed = session.RemoveBreakpoint(id);
 
         return JsonSerializer.Serialize(new
@@ -119,11 +130,14 @@ public class BreakpointTools(DebugSessionManager manager)
         });
     }
 
-    [McpServerTool, Description("List all currently set breakpoints with their status, conditions, and capture configuration.")]
+    [McpServerTool]
+    [AllowedState(SessionState.Stopped, SessionState.Running)]
+    [Description("List all currently set breakpoints with their status, conditions, and capture configuration.")]
     public string BreakpointList(
-        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
+        [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
-        var session = _manager.Resolve(sessionId);
+        var session = ResolveSession(processId, processName);
         var bps = session.GetAllBreakpoints();
 
         return JsonSerializer.Serialize(new
@@ -148,5 +162,14 @@ public class BreakpointTools(DebugSessionManager manager)
                     : null
             })
         });
+    }
+
+    private DebugSession ResolveSession(int? processId, string? processName)
+    {
+        if (processId.HasValue)
+            return _manager.Resolve(processId.Value);
+        if (!string.IsNullOrWhiteSpace(processName))
+            return _manager.Resolve(processName);
+        return _manager.Resolve(processId: null);
     }
 }

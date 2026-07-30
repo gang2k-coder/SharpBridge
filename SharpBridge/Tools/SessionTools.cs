@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Text.Json;
 using ModelContextProtocol.Server;
 using SharpBridge.Services;
+using SharpBridge.State;
 
 namespace SharpBridge.Tools;
 
@@ -67,7 +68,7 @@ public class SessionTools(DebugSessionManager manager)
             processName = result.ProcessName,
             state = result.State,
             note = result.AlreadyAttached
-                ? "Already attached to this process. Use debug_select or specify sessionId to operate on it."
+                ? "Already attached to this process. Use debug_select or specify processId to operate on it."
                 : "Attached. All threads suspended. Set breakpoints and use debug_continue."
         });
     }
@@ -75,9 +76,11 @@ public class SessionTools(DebugSessionManager manager)
     [McpServerTool, Description("Disconnect the debugger from a session and optionally terminate the debuggee.")]
     public string DebugDisconnect(
         [Description("Whether to terminate the debugged process (default: true)")] bool terminateDebuggee = true,
-        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
+        [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
-        _manager.DisconnectSession(sessionId, terminateDebuggee);
+        var session = ResolveSession(processId, processName);
+        _manager.DisconnectSession(session.ProcessId, terminateDebuggee);
 
         return JsonSerializer.Serialize(new
         {
@@ -90,9 +93,10 @@ public class SessionTools(DebugSessionManager manager)
         "Shows state (Running/Stopped/Exited), breakpoint count, and contextual hints. " +
         "Always call this first if a previous operation returned an error or the state is unclear.")]
     public string DebugState(
-        [Description("Process ID. Uses the currently selected session if omitted.")] int? sessionId = null)
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
+        [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
-        var session = _manager.Resolve(sessionId);
+        var session = ResolveSession(processId, processName);
 
         return JsonSerializer.Serialize(new
         {
@@ -102,10 +106,11 @@ public class SessionTools(DebugSessionManager manager)
             breakpointCount = session.BreakpointCount,
             info = session.CurrentState switch
             {
-                DebugSession.State.NotStarted => "No debug session. Use debug_launch or debug_attach to start.",
-                DebugSession.State.Running => "Program is running. Use debug_pause to interrupt or wait for a breakpoint.",
-                DebugSession.State.Stopped => "Program is stopped. Use inspection tools (stacktrace_get, variables_get, etc.) or debug_continue/step.",
-                DebugSession.State.Exited => "Program has exited. Use debug_disconnect to clean up.",
+                SessionState.Detached => "No debug session. Use debug_launch or debug_attach to start.",
+                SessionState.Attaching => "Attaching to process. Use debug_continue to complete attach.",
+                SessionState.Running => "Program is running. Use debug_pause to interrupt or wait for a breakpoint.",
+                SessionState.Stopped => "Program is stopped. Use inspection tools (stacktrace_get, variables_get, etc.) or debug_continue/step.",
+                SessionState.Exited => "Program has exited. Use debug_disconnect to clean up.",
                 _ => ""
             }
         });
@@ -113,9 +118,11 @@ public class SessionTools(DebugSessionManager manager)
 
     [McpServerTool, Description("Select a debug session as the default for subsequent operations.")]
     public string DebugSelect(
-        [Description("Process ID of the session to select")] int processId)
+        [Description("Process ID of the session to select")] int? processId = null,
+        [Description("Process name of the session to select")] string? processName = null)
     {
-        var info = _manager.SelectSession(processId);
+        var session = ResolveSession(processId, processName);
+        var info = _manager.SelectSession(session.ProcessId!.Value);
 
         return JsonSerializer.Serialize(new
         {
@@ -123,7 +130,7 @@ public class SessionTools(DebugSessionManager manager)
             processId = info.ProcessId,
             processName = info.ProcessName,
             state = info.State,
-            hint = "This session is now the default. All subsequent tools will use it unless you specify a different sessionId."
+            hint = "This session is now the default. All subsequent tools will use it unless you specify a different processId or processName."
         });
     }
 
@@ -150,5 +157,14 @@ public class SessionTools(DebugSessionManager manager)
                 state = s.State
             })
         });
+    }
+
+    private DebugSession ResolveSession(int? processId, string? processName)
+    {
+        if (processId.HasValue)
+            return _manager.Resolve(processId.Value);
+        if (!string.IsNullOrWhiteSpace(processName))
+            return _manager.Resolve(processName);
+        return _manager.Resolve(processId: null);
     }
 }

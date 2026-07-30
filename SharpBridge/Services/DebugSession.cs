@@ -2,6 +2,7 @@ using System.Text.RegularExpressions;
 using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol;
 using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages;
 using Newtonsoft.Json.Linq;
+using SharpBridge.State;
 using SharpDbg.InMemory;
 
 namespace SharpBridge.Services;
@@ -20,43 +21,8 @@ namespace SharpBridge.Services;
 /// </summary>
 public class DebugSession : IDisposable
 {
-    public enum DebugSessionState
-    {
-        Detached,
-        Attaching,
-        Stopped,
-        Running,
-        Disconnecting,
-        Exited,
-        Faulted
-    };
 
-    private DebugSessionState _state;
-
-    private void TransitionTo(DebugSessionState newState)
-    {
-        if (!CanTransition(_state, newState))
-        {
-            throw new InvalidOperationException(
-                $"{_state} -> {newState}");
-        }
-
-        _state = newState;
-    }
-
-    private static bool CanTransition(DebugSessionState from, DebugSessionState to)
-    {
-        return (from, to) switch
-        {
-            (Detached, Attaching) => true,
-            (Attaching, Stopped) => true,
-            (Stopped, Running) => true,
-            (Running, Stopped) => true,
-            (_, Faulted) => true,
-            (_, Exited) => true,
-            _ => false
-        };
-    }
+    private SessionStateMachine _stateMachine = new SessionStateMachine();
     
     // ===================================================================
     // DAP Protocol Host
@@ -72,8 +38,7 @@ public class DebugSession : IDisposable
     // ===================================================================
     // Session state
     // ===================================================================
-    public enum State { NotStarted, Running, Stopped, Exited }
-    public State CurrentState { get; private set; } = State.NotStarted;
+    public SessionState CurrentState => _stateMachine.Current;
 
     private StopEvent? _lastStop;
     private StopEvent LastStop => _lastStop
@@ -94,7 +59,6 @@ public class DebugSession : IDisposable
     // ===================================================================
     public int? ProcessId { get; private set; }
     public string? ProcessName { get; private set; }
-    public bool IsAttached { get; private set; }
 
     // ===================================================================
     // Lifecycle callbacks
@@ -185,8 +149,8 @@ public class DebugSession : IDisposable
         Dictionary<string, string>? env = null,
         CancellationToken ct = default)
     {
-        if (CurrentState != State.NotStarted)
-            throw new InvalidOperationException("Session not in correct state for launch.");
+        // if (CurrentState != State.NotStarted)
+        //     throw new InvalidOperationException("Session not in correct state for launch.");
 
         ProcessName = Path.GetFileNameWithoutExtension(program);
 
@@ -205,6 +169,7 @@ public class DebugSession : IDisposable
             ConfigurationProperties = launchArgs
         });
 
+        _stateMachine.TransitionTo(SessionState.Attaching);
         // Swap in a fresh stop TCS BEFORE configurationDone —
         // the StoppedEvent may fire as soon as the process starts.
         var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -212,7 +177,8 @@ public class DebugSession : IDisposable
 
         _host.SendRequestSync(new ConfigurationDoneRequest());
 
-        CurrentState = State.Running;
+        _stateMachine.TransitionTo(SessionState.Running);
+
 
         if (stopAtEntry)
         {
@@ -222,7 +188,7 @@ public class DebugSession : IDisposable
             {
                 await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
                 LogInfo("Launch: stopped at entry.");
-                IsAttached = true;
+                _stateMachine.TransitionTo(SessionState.Stopped);
                 return;
             }
             catch (TimeoutException) { }
@@ -230,8 +196,6 @@ public class DebugSession : IDisposable
             LogInfo("Launch: no StoppedEvent — trying pause to force stopAtEntry.");
             await ForceStopAfterLaunch(ct);
         }
-
-        IsAttached = true;
     }
 
     private async Task ForceStopAfterLaunch(CancellationToken ct)
@@ -241,7 +205,7 @@ public class DebugSession : IDisposable
         {
             if (i > 0) await Task.Delay(delays[i], ct);
 
-            if (CurrentState is State.Exited or State.Stopped) return;
+            if (_stateMachine.Current is SessionState.Exited or SessionState.Stopped) return;
 
             var pauseTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
             Interlocked.Exchange(ref _pendingStopTcs, pauseTcs);
@@ -252,15 +216,16 @@ public class DebugSession : IDisposable
             {
                 await pauseTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
                 LogInfo("Pause succeeded.");
+                _stateMachine.TransitionTo(SessionState.Stopped);
                 return;
             }
             catch (TimeoutException) { }
         }
 
-        if (CurrentState == State.Running)
+        if (_stateMachine.Current == SessionState.Running)
         {
             LogInfo("Pause did not respond — synthesizing stopped state.");
-            CurrentState = State.Stopped;
+            _stateMachine.TransitionTo(SessionState.Stopped);
             _lastStop = new StopEvent("stopped", null, true, "entry", null, 0, 0)
             {
                 Note = "Process is running (did not respond to pause). " +
@@ -271,8 +236,8 @@ public class DebugSession : IDisposable
 
     public async Task AttachAsync(int processId, CancellationToken ct = default)
     {
-        if (CurrentState != State.NotStarted)
-            throw new InvalidOperationException("Session not in correct state for attach.");
+        // if (CurrentState != State.NotStarted)
+        //     throw new InvalidOperationException("Session not in correct state for attach.");
 
         ProcessId = processId;
         try
@@ -295,16 +260,7 @@ public class DebugSession : IDisposable
                 ["processId"] = processId
             }
         });
-
-        _host.SendRequestSync(new ConfigurationDoneRequest());
-
-        // After attach, DebugActiveProcess(pid, false) suspends all threads.
-        CurrentState = State.Stopped;
-        IsAttached = true;
-        _lastStop = new StopEvent("stopped", null, true, "attach", null, 0, 0)
-        {
-            Note = "Attached to process. All threads suspended. Set breakpoints and use debug_continue."
-        };
+        _stateMachine.TransitionTo(SessionState.Attaching);
     }
 
     // ===================================================================
@@ -553,12 +509,10 @@ public class DebugSession : IDisposable
                 "or specify a timeout value (e.g. timeout=30).");
         }
 
-        if (CurrentState != State.Stopped)
-            throw new InvalidOperationException($"Cannot continue: debugger state is {CurrentState}.");
+        if (_stateMachine.Current != SessionState.Stopped && _stateMachine.Current != SessionState.Attaching)
+            throw new InvalidOperationException($"Cannot continue: debugger state is {_stateMachine.Current}.");
 
-        // After attach/launch, SharpDbg's auto-Create/ConfigurationDone has already
-        // continued the process. Don't send a redundant ContinueRequest.
-        bool needsContinue = _lastStop?.Reason is not "attach";
+        bool isAttaching = _stateMachine.Current == SessionState.Attaching;
 
         using var totalCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, totalCts.Token);
@@ -569,26 +523,25 @@ public class DebugSession : IDisposable
             var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
             Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
 
-            if (needsContinue)
+            if (isAttaching)
             {
-                CurrentState = State.Running;
-                _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
+                _host!.SendRequestSync(new ConfigurationDoneRequest());   
             }
             else
             {
-                // Process already running (post-attach). State says "Stopped" but it's not.
-                // Don't change state — keep it as-is until OnStopped fires.
+                _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
             }
+            _stateMachine.TransitionTo(SessionState.Running);
 
             try
             {
                 var stopEvent = await stopTcs.Task.WaitAsync(linked.Token);
-                if (CurrentState == State.Exited) return LastStop;
+                if (_stateMachine.Current == SessionState.Exited) return LastStop;
                 return BuildStopEvent(stopEvent);
             }
             catch (OperationCanceledException)
             {
-                if (CurrentState == State.Exited)
+                if (_stateMachine.Current == SessionState.Exited)
                     return LastStop;
                 LogInfo("Continue timed out — pausing.");
                 var result = await PauseAndReturn(ct);
@@ -603,12 +556,8 @@ public class DebugSession : IDisposable
             var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
             Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
 
-            if (needsContinue)
-            {
-                CurrentState = State.Running;
-                _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
-            }
-            needsContinue = true; // After first iteration, always send Continue
+            _stateMachine.TransitionTo(SessionState.Running);
+            _host!.SendRequestSync(new ContinueRequest { ThreadId = LastStop.ThreadId ?? 0 });
 
             try
             {
@@ -616,7 +565,7 @@ public class DebugSession : IDisposable
             }
             catch (OperationCanceledException)
             {
-                if (CurrentState == State.Exited)
+                if (_stateMachine.Current == SessionState.Exited)
                     return LastStop;
                 LogInfo("Continue timed out — pausing.");
                 var result = await PauseAndReturn(ct);
@@ -624,16 +573,16 @@ public class DebugSession : IDisposable
             }
 
             // On MCP thread — safe to query debugger
-            if (CurrentState == State.Stopped && _shouldAutoContinue)
+            if (_stateMachine.Current == SessionState.Stopped && _shouldAutoContinue)
             {
                 var (isGo, shouldCapture, scope, depth) = ResolveBreakpointAction();
                 if (shouldCapture)
                     CaptureState(scope, depth);
                 _shouldAutoContinue = isGo;
             }
-        } while (_shouldAutoContinue && CurrentState == State.Stopped);
+        } while (_shouldAutoContinue && _stateMachine.Current == SessionState.Stopped);
 
-        if (CurrentState == State.Exited)
+        if (_stateMachine.Current == SessionState.Exited)
             return LastStop;
         return BuildStopEvent(loopStopEvent);
     }
@@ -641,10 +590,10 @@ public class DebugSession : IDisposable
     public async Task<StopEvent> StepAsync(
         string type, int? threadId = null, CancellationToken ct = default)
     {
-        if (CurrentState != State.Stopped)
-            throw new InvalidOperationException($"Cannot step: debugger state is {CurrentState}.");
+        if (_stateMachine.Current != SessionState.Stopped)
+            throw new InvalidOperationException($"Cannot step: debugger state is {_stateMachine.Current}.");
 
-        CurrentState = State.Running;
+        _stateMachine.TransitionTo(SessionState.Running);
         var tid = threadId ?? LastStop.ThreadId ?? 1;
 
         var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -663,8 +612,8 @@ public class DebugSession : IDisposable
 
     public async Task<StopEvent> PauseAsync(CancellationToken ct = default)
     {
-        if (CurrentState != State.Running)
-            throw new InvalidOperationException($"Cannot pause: debugger state is {CurrentState}.");
+        if (_stateMachine.Current != SessionState.Running)
+            throw new InvalidOperationException($"Cannot pause: debugger state is {_stateMachine.Current}.");
 
         var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
@@ -683,9 +632,9 @@ public class DebugSession : IDisposable
         }
         catch
         {
-            if (CurrentState == State.Running)
+            if (_stateMachine.Current == SessionState.Running)
             {
-                CurrentState = State.Stopped;
+                _stateMachine.TransitionTo(SessionState.Stopped);
                 _lastStop = new StopEvent("stopped", null, true, "pause", null, 0, 0)
                 {
                     Note = "Unable to pause. Process may be blocked in native code."
@@ -848,7 +797,7 @@ public class DebugSession : IDisposable
 
     public void Disconnect(bool terminateDebuggee = true)
     {
-        if (CurrentState == State.NotStarted) return;
+        if (_stateMachine.Current == SessionState.Detached) return;
         try
         {
             _host!.SendRequestSync(new DisconnectRequest { TerminateDebuggee = terminateDebuggee });
@@ -864,7 +813,6 @@ public class DebugSession : IDisposable
         if (_cleanedUp) return;
         _cleanedUp = true;
 
-        CurrentState = State.NotStarted;
         _host?.Stop();
         _host?.WaitForReader();
         _adapter?.Dispose();
@@ -880,7 +828,7 @@ public class DebugSession : IDisposable
 
     private void OnStopped(StoppedEvent e)
     {
-        CurrentState = State.Stopped;
+        _stateMachine.TransitionTo(SessionState.Stopped);
         _lastStop = BuildStopEvent(e);
         _activeThreadId = e.ThreadId;
 
@@ -915,7 +863,7 @@ public class DebugSession : IDisposable
 
     private void OnExited(ExitedEvent e)
     {
-        CurrentState = State.Exited;
+        _stateMachine.TransitionTo(SessionState.Exited);
         _shouldAutoContinue = false;
         _lastStop = new StopEvent("exited", null, null, "exited", null, 0, 0)
         {
@@ -928,7 +876,7 @@ public class DebugSession : IDisposable
 
     private void OnTerminated(TerminatedEvent e)
     {
-        CurrentState = State.Exited;
+        _stateMachine.TransitionTo(SessionState.Exited);
         _shouldAutoContinue = false;
         CompletePendingStopTcs();
         LogInfo("← TerminatedEvent");
@@ -960,9 +908,9 @@ public class DebugSession : IDisposable
 
     private void EnsureStopped()
     {
-        if (CurrentState != State.Stopped)
+        if (_stateMachine.Current != SessionState.Stopped)
             throw new InvalidOperationException(
-                $"Debugger is not stopped (state: {CurrentState}). Use debug_state first.");
+                $"Debugger is not stopped (state: {_stateMachine.Current}). Use debug_state first.");
     }
 
     private StopEvent BuildStopEvent(StoppedEvent e)
@@ -989,8 +937,6 @@ public class DebugSession : IDisposable
 // ===================================================================
 // Data Types
 // ===================================================================
-
-public enum DebuggerState { NotStarted, Running, Stopped, Exited }
 
 public record StopEvent(
     string Status,

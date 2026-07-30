@@ -26,12 +26,12 @@ public class DebugSessionManager : IDisposable
     // ===================================================================
 
     /// <summary>
-    /// Resolve the target session from an optional sessionId parameter.
-    /// Falls back to CurrentSessionId if sessionId is null.
+    /// Resolve the target session by process ID.
+    /// Falls back to CurrentSessionId if processId is null.
     /// </summary>
-    public DebugSession Resolve(int? sessionId)
+    public DebugSession Resolve(int? processId)
     {
-        var targetId = sessionId ?? CurrentSessionId;
+        var targetId = processId ?? CurrentSessionId;
         if (targetId is null)
             throw new InvalidOperationException(
                 "No debug session. Use debug_launch, debug_attach, or debug_select first.");
@@ -42,6 +42,46 @@ public class DebugSessionManager : IDisposable
         throw new InvalidOperationException(
             $"Session for PID {targetId.Value} not found. " +
             "It may have exited. Use debug_list to see active sessions.");
+    }
+
+    /// <summary>
+    /// Resolve the target session by process name.
+    /// Searches existing sessions first, then queries the OS.
+    /// Requires exactly one matching process.
+    /// </summary>
+    public DebugSession Resolve(string processName)
+    {
+        // 1. Search existing sessions by ProcessName
+        var existing = _sessions.Values
+            .FirstOrDefault(s => string.Equals(s.ProcessName, processName, StringComparison.OrdinalIgnoreCase));
+        if (existing is not null)
+            return existing;
+
+        // 2. Query OS for running processes by name
+        System.Diagnostics.Process[] procs;
+        try
+        {
+            procs = System.Diagnostics.Process.GetProcessesByName(processName);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(
+                $"Cannot query processes by name '{processName}': {ex.Message}");
+        }
+
+        if (procs.Length == 0)
+            throw new InvalidOperationException(
+                $"No process named '{processName}' is running. Start the program first, then use debug_attach.");
+
+        if (procs.Length > 1)
+            throw new InvalidOperationException(
+                $"Multiple processes named '{processName}' found. Use debug_attach with a specific processId instead.");
+
+        var pid = procs[0].Id;
+        try { foreach (var p in procs) p.Dispose(); } catch { }
+
+        throw new InvalidOperationException(
+            $"No debug session for PID {pid} ('{processName}'). Use debug_attach processName=\"{processName}\" first.");
     }
 
     // ===================================================================

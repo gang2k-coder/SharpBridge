@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using SharpBridge.Services;
+using SharpBridge.State;
 
 // ===================================================================
 // Attach-mode integration test
@@ -56,7 +57,7 @@ try
     Console.WriteLine("1. Attaching to debuggee...");
     await session.AttachAsync(pid);
     Console.WriteLine($"   State: {session.CurrentState}");
-    if (session.CurrentState != DebugSession.State.Stopped)
+    if (session.CurrentState != SessionState.Stopped)
         throw new Exception("Expected Stopped state after attach!");
     Console.WriteLine("   ✅ PASS");
     Console.WriteLine();
@@ -83,7 +84,7 @@ try
     Console.WriteLine($"   {(stop.Status == "stopped" ? "✅ PASS" : $"State: {session.CurrentState}")}");
     Console.WriteLine();
 
-    if (session.CurrentState != DebugSession.State.Stopped)
+    if (session.CurrentState != SessionState.Stopped)
     {
         Console.WriteLine("   Not stopped — skipping remaining tests.");
         session.Disconnect(true);
@@ -171,7 +172,7 @@ try
     Assert(fnBp.Verified, $"Not verified: {fnBp.Message}");
     Console.WriteLine($"id={fnBp.Id}, verified ");
     await session.ContinueAndWaitAsync(timeoutSeconds: 10);
-    Assert(session.CurrentState == DebugSession.State.Stopped, "Should stop at function bp");
+    Assert(session.CurrentState == SessionState.Stopped, "Should stop at function bp");
     var fnFrames = session.GetStackTrace(
         session.GetThreads().First(t => t.IsActive).Id, 0, 5);
     Assert(fnFrames.Any(f => f.Name.Contains("Multiply")),
@@ -186,7 +187,7 @@ try
         ("Multiply", null, null, "break", null, 0));
     Assert(fnBps2[0].Verified, $"Not verified: {fnBps2[0].Message}");
     await session.ContinueAndWaitAsync(timeoutSeconds: 10);
-    Assert(session.CurrentState == DebugSession.State.Stopped, "Should stop");
+    Assert(session.CurrentState == SessionState.Stopped, "Should stop");
     var fnFrames2 = session.GetStackTrace(
         session.GetThreads().First(t => t.IsActive).Id, 0, 5);
     Assert(fnFrames2.Any(f => f.Name.Contains("Multiply")),
@@ -248,7 +249,7 @@ try
     if (fnBps5[0].Verified)
     {
         await session.ContinueAndWaitAsync(timeoutSeconds: 10);
-        Assert(session.CurrentState == DebugSession.State.Stopped, "Should stop");
+        Assert(session.CurrentState == SessionState.Stopped, "Should stop");
         var fnFrames5 = session.GetStackTrace(
             session.GetThreads().First(t => t.IsActive).Id, 0, 5);
         Assert(fnFrames5.Any(f => f.Name.Contains("Process")),
@@ -291,7 +292,7 @@ try
 
     // === Step 12: Get + clear captures ===
     Console.WriteLine("12. Get captures...");
-    Assert(session.CurrentState == DebugSession.State.Stopped, "Expected Stopped");
+    Assert(session.CurrentState == SessionState.Stopped, "Expected Stopped");
     Console.WriteLine($"   state={session.CurrentState} ✅ PASS");
     Console.WriteLine();
 

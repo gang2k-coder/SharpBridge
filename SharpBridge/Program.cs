@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using SharpBridge.Infrastructure.Filters;
 using SharpBridge.Services;
 using SharpBridge.Tools;
 
@@ -23,7 +24,7 @@ builder.Services.AddMcpServer(options =>
     options.ServerInfo = new()
     {
         Name = "SharpBridge",
-        Version = "0.1.0"  //TODO: should change to version sync with project version. 
+        Version = "0.1.0"  //TODO: should change to version sync with project version.
     };
     options.ServerInstructions = """
         SharpBridge is a .NET debugger MCP server. It can launch, attach to,
@@ -38,6 +39,10 @@ builder.Services.AddMcpServer(options =>
         5. debug_step: step through code line by line
         6. debug_disconnect: clean up when done
         """;
+})
+.WithRequestFilters(filters =>
+{
+    filters.AddCallToolFilter(CallToolFilters.SessionStateFilter);
 })
 .WithTools<SessionTools>()
 .WithTools<BreakpointTools>()
