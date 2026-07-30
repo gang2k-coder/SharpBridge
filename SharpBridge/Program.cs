@@ -13,7 +13,7 @@ var builder = Host.CreateApplicationBuilder(args);
 
 // Suppress MCP SDK logs from stdout (stdout is the JSON-RPC channel!)
 builder.Logging.ClearProviders();
-builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Warning); //TODO: should change to Level Trace? Prevent all log to stdout. 
+builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
 
 // Register DebugSessionManager as singleton — manages all debug sessions
 builder.Services.AddSingleton<DebugSessionManager>();
