@@ -13,7 +13,7 @@ public class BreakpointTools(DebugSessionManager manager)
     private readonly DebugSessionManager _manager = manager;
 
     [McpServerTool]
-    [AllowedState(SessionState.Stopped, SessionState.Running)]
+    [AllowedState(SessionState.Attaching, SessionState.Stopped, SessionState.Running)]
     [Description("Set a breakpoint at a specific file and line. " +
         "Supports conditional breakpoints, hit count conditions, and capture action. " +
         "action='break' (default) stops and waits; action='capture' auto-captures " +
@@ -57,7 +57,7 @@ public class BreakpointTools(DebugSessionManager manager)
     }
 
     [McpServerTool]
-    [AllowedState(SessionState.Stopped, SessionState.Running)]
+    [AllowedState(SessionState.Attaching, SessionState.Stopped, SessionState.Running)]
     [Description(
         "Set a function breakpoint that breaks when a specific method is entered. " +
         "Supports multiple naming patterns for precise method targeting:\n" +
@@ -112,7 +112,7 @@ public class BreakpointTools(DebugSessionManager manager)
     }
 
     [McpServerTool]
-    [AllowedState(SessionState.Stopped, SessionState.Running)]
+    [AllowedState(SessionState.Attaching, SessionState.Stopped, SessionState.Running)]
     [Description("Remove a breakpoint by its ID (returned from breakpoint_set).")]
     public string BreakpointRemove(
         [Description("The breakpoint ID to remove")] int id,
@@ -131,7 +131,7 @@ public class BreakpointTools(DebugSessionManager manager)
     }
 
     [McpServerTool]
-    [AllowedState(SessionState.Stopped, SessionState.Running)]
+    [AllowedState(SessionState.Attaching, SessionState.Stopped, SessionState.Running)]
     [Description("List all currently set breakpoints with their status, conditions, and capture configuration.")]
     public string BreakpointList(
         [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,

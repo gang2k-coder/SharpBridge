@@ -57,8 +57,8 @@ try
     Console.WriteLine("1. Attaching to debuggee...");
     await session.AttachAsync(pid);
     Console.WriteLine($"   State: {session.CurrentState}");
-    if (session.CurrentState != SessionState.Stopped)
-        throw new Exception("Expected Stopped state after attach!");
+    if (session.CurrentState != SessionState.Attaching)
+        throw new Exception($"Expected Attaching state after attach, got {session.CurrentState}");
     Console.WriteLine("   ✅ PASS");
     Console.WriteLine();
 
@@ -74,7 +74,7 @@ try
     Console.WriteLine();
 
     // === Step 3: Let debuggee run past ReadLine to hit breakpoint ===
-    Console.WriteLine("3. Sending ENTER to debuggee, then continuing...");
+    Console.WriteLine("3. Sending ENTER to debuggee, then continuing (sends ConfigurationDone)...");
     await debuggeeProcess.StandardInput.WriteLineAsync();
 
     var stop = await session.ContinueAndWaitAsync(timeoutSeconds: 20);

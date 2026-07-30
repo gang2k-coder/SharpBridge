@@ -176,7 +176,7 @@ public class InspectionTools(DebugSessionManager manager)
     }
 
     [McpServerTool]
-    [AllowedState(SessionState.Stopped, SessionState.Running)]
+    [AllowedState(SessionState.Attaching, SessionState.Stopped, SessionState.Running)]
     [Description("Configure which exceptions cause the debugger to break. " +
         "Use action='list' to see available exception filters from the debug adapter. " +
         "Use action='set' with a list of filter IDs to enable them (empty array = break on no exceptions).")]
