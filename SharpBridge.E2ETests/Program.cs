@@ -159,6 +159,59 @@ try
     await client.CallToolAsync("breakpoint_remove", new Dictionary<string, object?> { ["id"] = fn2Id });
     Console.WriteLine("   ✅");
 
+    // Test 5d: Function breakpoint — two-param overload
+    tests++; passed++;
+    Console.WriteLine("5d. Function breakpoint (Greeter.GetGreeting(string, string))...");
+    var fn3Json = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("function_breakpoint_set",
+            new Dictionary<string, object?> { ["functionName"] = "Greeter.GetGreeting(string, string)" })));
+    Assert(fn3Json.RootElement.GetProperty("verified").GetBoolean(), "Should be verified");
+    var fn3Id = fn3Json.RootElement.GetProperty("id").GetInt32();
+    var fn3ContJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
+    Assert(fn3ContJson.RootElement.GetProperty("status").GetString() == "stopped", "Not stopped");
+    await client.CallToolAsync("breakpoint_remove", new Dictionary<string, object?> { ["id"] = fn3Id });
+    Console.WriteLine("   ✅");
+
+    // Test 5e: Function breakpoint — generic type
+    tests++; passed++;
+    Console.WriteLine("5e. Function breakpoint (GenericProcessor<T>.Process)... ");
+    IReadOnlyDictionary<string, object?> fn4Args;
+    bool fn4Ok = false;
+    foreach (var pattern in new[] { "GenericProcessor<T>.Process", "GenericProcessor`1.Process", "Process" })
+    {
+        var fn4Json = JsonDocument.Parse(GetText(
+            await client.CallToolAsync("function_breakpoint_set",
+                new Dictionary<string, object?> { ["functionName"] = pattern })));
+        if (fn4Json.RootElement.GetProperty("verified").GetBoolean())
+        {
+            fn4Args = new Dictionary<string, object?> { ["id"] = fn4Json.RootElement.GetProperty("id").GetInt32() };
+            var fn4ContJson = JsonDocument.Parse(GetText(
+                await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
+            Assert(fn4ContJson.RootElement.GetProperty("status").GetString() == "stopped",
+                $"Hit with pattern '{pattern}' but didn't stop");
+            await client.CallToolAsync("breakpoint_remove", fn4Args);
+            fn4Ok = true;
+            break;
+        }
+    }
+    Assert(fn4Ok, "No generic pattern verified");
+    Console.WriteLine("✅");
+
+    // Test 5f: Function breakpoint — multi-bind (method name only, matches Calculator.Multiply)
+    tests++; passed++;
+    Console.WriteLine("5f. Function breakpoint multi-bind ('Multiply')...");
+    var fn5Json = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("function_breakpoint_set",
+            new Dictionary<string, object?> { ["functionName"] = "Multiply" })));
+    Assert(fn5Json.RootElement.GetProperty("verified").GetBoolean(), "Should be verified");
+    var fn5Id = fn5Json.RootElement.GetProperty("id").GetInt32();
+    var fn5ContJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
+    Assert(fn5ContJson.RootElement.GetProperty("status").GetString() == "stopped", "Not stopped");
+    await client.CallToolAsync("breakpoint_remove", new Dictionary<string, object?> { ["id"] = fn5Id });
+    Console.WriteLine("   ✅");
+
     // Test 6: Exception breakpoints
     tests++; passed++;
     Console.WriteLine("6. Exception breakpoints...");
