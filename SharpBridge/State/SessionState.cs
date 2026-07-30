@@ -20,6 +20,9 @@ public sealed class SessionStateMachine
         while (true)
         {
             var old = (SessionState)Volatile.Read(ref _current);
+            if (old == newState)
+                return;
+
             if (!CanTransition(old, newState))
                 throw new InvalidOperationException($"{old} -> {newState} is invalid");
 
