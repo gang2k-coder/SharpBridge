@@ -55,7 +55,6 @@ public class DebugSession : IDisposable
     private int? _activeThreadId;
     private readonly List<CaptureSnapshot> _captures = [];
     private int _captureIndex;
-    private bool _pendingCaptureCheck;
 
     // ===================================================================
     // Session identity
@@ -532,48 +531,25 @@ public class DebugSession : IDisposable
         }
         _stateMachine.TransitionTo(SessionState.Running);
 
-        // Wait for OnStopped to wake us. Capture BPs loop transparently on MCP thread.
+        // Wait for OnStopped to wake us. Capture BPs are handled transparently in OnStopped.
         using var totalCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, totalCts.Token);
+        var tcs = Volatile.Read(ref _pendingStopTcs);
 
-        while (true)
+        try
         {
-            var tcs = Volatile.Read(ref _pendingStopTcs);
-
-            StoppedEvent stopEvent;
-            try
-            {
-                stopEvent = await tcs.Task.WaitAsync(linked.Token);
-            }
-            catch (OperationCanceledException)
-            {
-                if (_stateMachine.Current == SessionState.Exited)
-                    return LastStop;
-                return new StopEvent("running", null, null, "timeout", null, 0, 0)
-                {
-                    Note = "Process is still running. Use debug_pause to interrupt."
-                };
-            }
-
+            var stopEvent = await tcs.Task.WaitAsync(linked.Token);
+            if (_stateMachine.Current == SessionState.Exited) return LastStop;
+            return BuildStopEvent(stopEvent);
+        }
+        catch (OperationCanceledException)
+        {
             if (_stateMachine.Current == SessionState.Exited)
                 return LastStop;
-
-            // Check if this was a capture-action BP (safe to call on MCP thread)
-            if (_pendingCaptureCheck)
+            return new StopEvent("running", null, null, "timeout", null, 0, 0)
             {
-                _pendingCaptureCheck = false;
-                var (isCapture, shouldCapture, scope, depth) = ResolveBreakpointAction();
-                if (shouldCapture)
-                {
-                    CaptureState(scope, depth);
-                    _host!.SendRequestSync(new ContinueRequest { ThreadId = _activeThreadId ?? 0 });
-                    _stateMachine.TransitionTo(SessionState.Running);
-                    _logger.LogInformation("Continue: auto-continue (capture)");
-                    continue; // loop back, OnStopped already set up fresh TCS
-                }
-            }
-
-            return BuildStopEvent(stopEvent);
+                Note = "Process is still running. Use debug_pause to interrupt."
+            };
         }
     }
 
@@ -800,18 +776,39 @@ public class DebugSession : IDisposable
     {
         _activeThreadId = e.ThreadId;
         _stateMachine.TransitionTo(SessionState.Stopped);
+
+        // Check if this is a capture-action breakpoint
+        if (e.Reason == StoppedEvent.ReasonValue.Breakpoint
+            && _bpConfigs.Count > 0
+            && ResolveBreakpointAction() is (true, true, var scope, var depth))
+        {
+            // Offload capture to thread pool — don't block the DAP reader.
+            // DO NOT touch _pendingStopTcs — caller keeps waiting.
+            var host = _host!;
+            var threadId = e.ThreadId;
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    CaptureState(scope, depth);
+                    host.SendRequestSync(new ContinueRequest { ThreadId = threadId ?? 0 });
+                    _stateMachine.TransitionTo(SessionState.Running);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Capture auto-continue failed");
+                }
+            });
+            _logger.LogInformation("← StoppedEvent: auto-continue (capture), thread={ThreadId}", e.ThreadId);
+            return;
+        }
+
+        // Break-action or non-breakpoint stop: stay stopped, wake caller
         _lastStop = BuildStopEvent(e);
-
-        // Flag capture check for the MCP thread — we cannot call GetStackTrace
-        // from the DAP reader thread without corrupting debugger state.
-        _pendingCaptureCheck = e.Reason == StoppedEvent.ReasonValue.Breakpoint
-            && _bpConfigs.Count > 0;
-
         var old = Interlocked.Exchange(ref _pendingStopTcs,
             new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously));
         old.TrySetResult(e);
-        _logger.LogInformation("← StoppedEvent: reason={Reason}, thread={ThreadId}" +
-            (_pendingCaptureCheck ? " (pending-capture-check)" : ""), e.Reason, e.ThreadId);
+        _logger.LogInformation("← StoppedEvent: reason={Reason}, thread={ThreadId}", e.Reason, e.ThreadId);
     }
 
     private (bool IsCapture, bool ShouldCapture, string Scope, int Depth) ResolveBreakpointAction()

@@ -7,53 +7,37 @@ public enum SessionState
     Stopped,
     Running,
     Exited
-};
+}
 
 public sealed class SessionStateMachine
 {
-    public SessionState Current { get; private set; }
+    private int _current = (int)SessionState.Detached;
 
-
-    public SessionStateMachine()
-    {
-        Current = SessionState.Detached;
-    }
-
+    public SessionState Current => (SessionState)Volatile.Read(ref _current);
 
     public void TransitionTo(SessionState newState)
     {
-        if (!CanTransition(Current, newState))
+        while (true)
         {
-            throw new InvalidOperationException(
-                $"{Current} -> {newState} is invalid");
-        }
+            var old = (SessionState)Volatile.Read(ref _current);
+            if (!CanTransition(old, newState))
+                throw new InvalidOperationException($"{old} -> {newState} is invalid");
 
-        Current = newState;
+            if (Interlocked.CompareExchange(ref _current, (int)newState, (int)old) == (int)old)
+                return;
+        }
     }
 
-
-    private static bool CanTransition(
-        SessionState from,
-        SessionState to)
+    private static bool CanTransition(SessionState from, SessionState to)
     {
         return (from, to) switch
         {
-            (SessionState.Detached,
-             SessionState.Attaching) => true,
-
-            (SessionState.Attaching,
-             SessionState.Running) => true,
-
-            (SessionState.Stopped,
-             SessionState.Running) => true,
-
-            (SessionState.Running,
-             SessionState.Stopped) => true,
-
-            (_, SessionState.Exited) => true,
-
+            (SessionState.Detached,    SessionState.Attaching) => true,
+            (SessionState.Attaching,   SessionState.Running)   => true,
+            (SessionState.Stopped,     SessionState.Running)   => true,
+            (SessionState.Running,     SessionState.Stopped)   => true,
+            (_,                        SessionState.Exited)    => true,
             _ => false
         };
     }
 }
-
