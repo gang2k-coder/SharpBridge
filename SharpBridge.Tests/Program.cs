@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Microsoft.Extensions.Logging;
 using SharpBridge.Services;
 using SharpBridge.State;
 
@@ -42,8 +43,8 @@ int pid = debuggeeProcess.Id;
 Console.WriteLine($"Debuggee PID: {pid}");
 Console.WriteLine();
 
-using var session = new DebugSession();
-session.OnLog += msg => Console.WriteLine($"  LOG: {msg}");
+using var loggerFactory = LoggerFactory.Create(b => b.AddConsole().SetMinimumLevel(LogLevel.Debug));
+using var session = new DebugSession(loggerFactory.CreateLogger<DebugSession>());
 
 try
 {

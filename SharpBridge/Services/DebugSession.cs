@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 using Microsoft.Diagnostics.NETCore.Client;
+using Microsoft.Extensions.Logging;
 using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol;
 using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages;
 using Newtonsoft.Json.Linq;
@@ -23,6 +24,7 @@ namespace SharpBridge.Services;
 public class DebugSession : IDisposable
 {
 
+    private readonly ILogger _logger;
     private SessionStateMachine _stateMachine = new SessionStateMachine();
     
     // ===================================================================
@@ -77,9 +79,11 @@ public class DebugSession : IDisposable
     // ===================================================================
 
     public DebugSession(
+        ILogger<DebugSession> logger,
         Action<int>? onDisposed = null,
         Action<int, Exception>? onError = null)
     {
+        _logger = logger;
         _onDisposed = onDisposed;
         _onError = onError;
 
@@ -93,8 +97,7 @@ public class DebugSession : IDisposable
                 if (m.Success && int.TryParse(m.Groups[1].Value, out var pid))
                     ProcessId = pid;
             }
-            // Forward to OnLog for external consumers
-            OnLog?.Invoke(msg);
+            _logger.LogDebug("SharpDbg: {Message}", msg);
         });
         _adapter = disposable;
 
@@ -106,9 +109,9 @@ public class DebugSession : IDisposable
         _host.RegisterEventType<TerminatedEvent>(OnTerminated);
         _host.RegisterEventType<OutputEvent>(OnOutput);
         _host.RegisterEventType<ContinuedEvent>(e =>
-            LogInfo($"← ContinuedEvent: thread={e.ThreadId}"));
+            _logger.LogInformation($"← ContinuedEvent: thread={e.ThreadId}"));
         _host.RegisterEventType<InitializedEvent>(e =>
-            LogInfo("← InitializedEvent"));
+            _logger.LogInformation("← InitializedEvent"));
 
         _host.VerifySynchronousOperationAllowed();
 
@@ -135,7 +138,7 @@ public class DebugSession : IDisposable
         _exceptionFilters = initResponse.ExceptionBreakpointFilters;
 
         _adapterId = "sharpdbg";
-        LogInfo($"DAP initialized. Adapter: {_adapterId}");
+        _logger.LogInformation($"DAP initialized. Adapter: {_adapterId}");
     }
 
     // ===================================================================
@@ -188,13 +191,13 @@ public class DebugSession : IDisposable
             try
             {
                 await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
-                LogInfo("Launch: stopped at entry.");
+                _logger.LogInformation("Launch: stopped at entry.");
                 _stateMachine.TransitionTo(SessionState.Stopped);
                 return;
             }
             catch (TimeoutException) { }
 
-            LogInfo("Launch: no StoppedEvent — trying pause to force stopAtEntry.");
+            _logger.LogInformation("Launch: no StoppedEvent — trying pause to force stopAtEntry.");
             await ForceStopAfterLaunch(ct);
         }
     }
@@ -216,7 +219,7 @@ public class DebugSession : IDisposable
             try
             {
                 await pauseTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
-                LogInfo("Pause succeeded.");
+                _logger.LogInformation("Pause succeeded.");
                 _stateMachine.TransitionTo(SessionState.Stopped);
                 return;
             }
@@ -225,7 +228,7 @@ public class DebugSession : IDisposable
 
         if (_stateMachine.Current == SessionState.Running)
         {
-            LogInfo("Pause did not respond — synthesizing stopped state.");
+            _logger.LogInformation("Pause did not respond — synthesizing stopped state.");
             _stateMachine.TransitionTo(SessionState.Stopped);
             _lastStop = new StopEvent("stopped", null, true, "entry", null, 0, 0)
             {
@@ -491,7 +494,7 @@ public class DebugSession : IDisposable
         {
             Filters = filters.ToList()
         });
-        LogInfo($"Exception breakpoints set: [{string.Join(", ", filters)}]");
+        _logger.LogInformation($"Exception breakpoints set: [{string.Join(", ", filters)}]");
     }
 
     // ===================================================================
@@ -552,7 +555,7 @@ public class DebugSession : IDisposable
             {
                 if (_stateMachine.Current == SessionState.Exited)
                     return LastStop;
-                LogInfo("Continue timed out — pausing.");
+                _logger.LogInformation("Continue timed out — pausing.");
                 var result = await PauseAndReturn(ct);
                 return result with { Note = (result.Note is not null ? result.Note + " " : "") + "(timed out waiting for breakpoint)" };
             }
@@ -576,7 +579,7 @@ public class DebugSession : IDisposable
             {
                 if (_stateMachine.Current == SessionState.Exited)
                     return LastStop;
-                LogInfo("Continue timed out — pausing.");
+                _logger.LogInformation("Continue timed out — pausing.");
                 var result = await PauseAndReturn(ct);
                 return result with { Note = (result.Note is not null ? result.Note + " " : "") + "(timed out waiting for breakpoint)" };
             }
@@ -848,7 +851,7 @@ public class DebugSession : IDisposable
         var old = Interlocked.Exchange(ref _pendingStopTcs,
             new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously));
         old.TrySetResult(e);
-        LogInfo($"← StoppedEvent: reason={e.Reason}, thread={e.ThreadId}" +
+        _logger.LogInformation($"← StoppedEvent: reason={e.Reason}, thread={e.ThreadId}" +
             (_shouldAutoContinue ? " (auto-continue)" : ""));
     }
 
@@ -879,7 +882,7 @@ public class DebugSession : IDisposable
             ExitCode = e.ExitCode
         };
         CompletePendingStopTcs();
-        LogInfo($"← ExitedEvent: code={e.ExitCode}");
+        _logger.LogInformation($"← ExitedEvent: code={e.ExitCode}");
         Cleanup();
     }
 
@@ -888,7 +891,7 @@ public class DebugSession : IDisposable
         _stateMachine.TransitionTo(SessionState.Exited);
         _shouldAutoContinue = false;
         CompletePendingStopTcs();
-        LogInfo("← TerminatedEvent");
+        _logger.LogInformation("← TerminatedEvent");
         Cleanup();
     }
 
@@ -933,14 +936,6 @@ public class DebugSession : IDisposable
             e.HitBreakpointIds?.FirstOrDefault() ?? 0,
             0);
     }
-
-    // ===================================================================
-    // Logging
-    // ===================================================================
-
-    public event Action<string>? OnLog;
-
-    private void LogInfo(string msg) => OnLog?.Invoke($"[DebugSession] {msg}");
 }
 
 // ===================================================================

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Microsoft.Extensions.Logging;
 using SharpBridge.Services;
 
 // ===================================================================
@@ -27,8 +28,8 @@ if (!File.Exists(debuggeeDll))
     return;
 }
 
-using var session = new DebugSession();
-session.OnLog += msg => Console.WriteLine($"  LOG: {msg}");
+using var loggerFactory = LoggerFactory.Create(b => b.AddConsole().SetMinimumLevel(LogLevel.Debug));
+using var session = new DebugSession(loggerFactory.CreateLogger<DebugSession>());
 
 try
 {

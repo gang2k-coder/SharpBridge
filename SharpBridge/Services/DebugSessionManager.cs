@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using Microsoft.Extensions.Logging;
 
 namespace SharpBridge.Services;
 
@@ -9,8 +10,14 @@ namespace SharpBridge.Services;
 /// </summary>
 public class DebugSessionManager : IDisposable
 {
+    private readonly ILogger<DebugSession> _logger;
     private readonly ConcurrentDictionary<int, DebugSession> _sessions = new();
     private int? _currentSessionId;
+
+    public DebugSessionManager(ILogger<DebugSession> logger)
+    {
+        _logger = logger;
+    }
 
     /// <summary>
     /// The currently selected default session ID (set via debug_select).
@@ -96,11 +103,10 @@ public class DebugSessionManager : IDisposable
         Dictionary<string, string>? env = null,
         CancellationToken ct = default)
     {
-        var session = new DebugSession(
+        var session = new DebugSession(_logger,
             onDisposed: OnSessionDisposed,
             onError: OnSessionError);
 
-        session.OnLog += msg => Debug.WriteLine($"[DebugSession] {msg}");
 
         try
         {
@@ -167,11 +173,10 @@ public class DebugSessionManager : IDisposable
             };
         }
 
-        var session = new DebugSession(
+        var session = new DebugSession(_logger,
             onDisposed: OnSessionDisposed,
             onError: OnSessionError);
 
-        session.OnLog += msg => Debug.WriteLine($"[DebugSession] {msg}");
 
         try
         {
