@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using Microsoft.Diagnostics.NETCore.Client;
 using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol;
 using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages;
 using Newtonsoft.Json.Linq;
@@ -525,7 +526,15 @@ public class DebugSession : IDisposable
 
             if (isAttaching)
             {
-                _host!.SendRequestSync(new ConfigurationDoneRequest());   
+                _host!.SendRequestSync(new ConfigurationDoneRequest());
+                // Attach mode: SharpDbg PerformAttach only attaches, doesn't resume.
+                // If the process was started with DOTNET_DefaultDiagnosticPortSuspend=1,
+                // we must manually resume the runtime. Otherwise it's a no-op.
+                if (ProcessId.HasValue)
+                {
+                    try { new DiagnosticsClient(ProcessId.Value).ResumeRuntime(); }
+                    catch (ServerNotAvailableException) { /* runtime not suspended via diagnostics */ }
+                }
             }
             else
             {

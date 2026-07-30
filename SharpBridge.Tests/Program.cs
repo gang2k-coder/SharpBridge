@@ -23,28 +23,22 @@ Console.WriteLine($"Debuggee: {debuggeeDll}");
 Console.WriteLine($"Source:   {sourceFile}");
 Console.WriteLine();
 
-// Start the debuggee process (it will print PID and wait for ENTER)
-var debuggeeProcess = Process.Start(new ProcessStartInfo
+// Start the debuggee process with diagnostic suspend — CLR freezes at startup
+// until we call ResumeRuntime after ConfigurationDone.
+var psi = new ProcessStartInfo("dotnet", debuggeeDll)
 {
-    FileName = "dotnet",
-    ArgumentList = { debuggeeDll },
     RedirectStandardOutput = true,
     RedirectStandardInput = true,
     RedirectStandardError = true,
     UseShellExecute = false,
     CreateNoWindow = true
-})!;
+};
+psi.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+var debuggeeProcess = Process.Start(psi)!;
 
-// Read the PID from stdout
-var pidLine = debuggeeProcess.StandardOutput.ReadLine();
-Console.WriteLine($"Debuggee output: {pidLine}");
-
-var pidStr = pidLine?.Split(":")[1].Trim();
-if (!int.TryParse(pidStr, out var pid))
-{
-    Console.WriteLine($"❌ Could not parse PID from: {pidLine}");
-    return;
-}
+// With DOTNET_DefaultDiagnosticPortSuspend=1, the CLR is frozen before
+// managed code runs. Get PID from Process.Id instead of stdout.
+int pid = debuggeeProcess.Id;
 Console.WriteLine($"Debuggee PID: {pid}");
 Console.WriteLine();
 
@@ -73,8 +67,9 @@ try
     Console.WriteLine($"   {(bp.Verified ? "✅ PASS" : "⚠️ WARN — module not loaded yet (will be verified on continue)")}");
     Console.WriteLine();
 
-    // === Step 3: Let debuggee run past ReadLine to hit breakpoint ===
-    Console.WriteLine("3. Sending ENTER to debuggee, then continuing (sends ConfigurationDone)...");
+    // === Step 3: Send ENTER + Continue (ConfigurationDone + ResumeRuntime) ===
+    // ENTER goes into stdin pipe now; debuggee reads it after ResumeRuntime starts the CLR.
+    Console.WriteLine("3. Sending ENTER to debuggee, then continuing (ConfigurationDone + ResumeRuntime)...");
     await debuggeeProcess.StandardInput.WriteLineAsync();
 
     var stop = await session.ContinueAndWaitAsync(timeoutSeconds: 20);
@@ -233,8 +228,6 @@ try
     Console.WriteLine();
 
     // === Step 9g: Function breakpoint — generic type ===
-    // SharpDbg 0.1.6 normalizes GenericProcessor<T> → GenericProcessor`1 internally.
-    // Try both the C#-style syntax and the CLR naming convention.
     Console.Write("9g. Function breakpoint generic type... ");
     IReadOnlyList<DebugSession.BreakpointEntry> fnBps5 = null!;
     foreach (var pattern in new[] {
@@ -280,7 +273,7 @@ try
     Console.WriteLine($"   index={snap.Index}, vars={snap.Variables.Count} ✅ PASS");
     Console.WriteLine();
 
-    // === Step 11: Get + clear captures ===
+    // === Step 12: Get + clear captures ===
     Console.WriteLine("12. Get captures...");
     var caps = session.GetCaptures();
     Assert(caps.Count == 1, $"Expected 1 capture, got {caps.Count}");
@@ -290,8 +283,8 @@ try
     Console.WriteLine("   ✅ PASS");
     Console.WriteLine();
 
-    // === Step 12: Get + clear captures ===
-    Console.WriteLine("12. Get captures...");
+    // === Step 13: State check ===
+    Console.WriteLine("13. State check...");
     Assert(session.CurrentState == SessionState.Stopped, "Expected Stopped");
     Console.WriteLine($"   state={session.CurrentState} ✅ PASS");
     Console.WriteLine();

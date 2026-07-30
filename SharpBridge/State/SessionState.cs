@@ -42,7 +42,7 @@ public sealed class SessionStateMachine
              SessionState.Attaching) => true,
 
             (SessionState.Attaching,
-             SessionState.Stopped) => true,
+             SessionState.Running) => true,
 
             (SessionState.Stopped,
              SessionState.Running) => true,
