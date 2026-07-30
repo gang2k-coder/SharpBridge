@@ -168,6 +168,11 @@ SharpBridge/
 ├── SharpBridge.sln
 ├── SharpBridge/                      # MCP server
 │   ├── Program.cs                    # Server bootstrap + DI
+│   ├── Infrastructure/
+│   │   ├── Attributes.cs             # [AllowedState] attribute
+│   │   └── Filters.cs                # CallToolFilter — per-tool state enforcement
+│   ├── State/
+│   │   └── SessionState.cs           # SessionStateMachine (Detached→Attaching→Running↔Stopped→Exited)
 │   ├── Services/
 │   │   ├── DebugSession.cs           # Per-process DAP client + state machine
 │   │   └── DebugSessionManager.cs    # Multi-session manager + process lookup
@@ -186,19 +191,20 @@ SharpBridge/
 ### Multi-session design
 
 ```
-MCP Request (with optional sessionId)
+MCP Request (with optional processId/processName)
     │
     ▼
 DebugSessionManager (DI singleton)
     ├── ConcurrentDictionary<int, DebugSession>  (pid → session)
     ├── CurrentSessionId (debug_select)
-    └── Resolve(sessionId) → routes to correct session
+    ├── Resolve(int? processId) / Resolve(string processName)
+    └── CallToolFilter — enforces [AllowedState] per-tool constraints
           │
           ▼
      DebugSession (one per process)
           ├── Own DebugAdapterHost + streams (SharpDbg in-memory)
           ├── ProcessId, ProcessName, IsAttached
-          ├── State machine (NotStarted → Running/Stopped → Exited)
+          ├── State machine (Detached → Attaching → Running ↔ Stopped → Exited)
           └── Breakpoints, TCS-based event coordination
 ```
 

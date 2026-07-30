@@ -24,7 +24,7 @@ builder.Services.AddMcpServer(options =>
     options.ServerInfo = new()
     {
         Name = "SharpBridge",
-        Version = "0.3.0"  //TODO: should change to version sync with project version.
+        Version = "0.3.0"
     };
     options.ServerInstructions = """
         SharpBridge is a .NET debugger MCP server. It can launch, attach to,
