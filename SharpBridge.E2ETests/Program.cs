@@ -20,15 +20,15 @@ buildPsi = new ProcessStartInfo("dotnet", ["build", debuggeeProj, "-q"])
 { RedirectStandardOutput = true, RedirectStandardError = true };
 (Process.Start(buildPsi)!).WaitForExit();
 
-// Start debuggee
-var debuggee = Process.Start(new ProcessStartInfo
+// Start debuggee with diagnostic suspend — CLR freezes until ResumeRuntime
+var psi = new ProcessStartInfo("dotnet", debuggeeDll)
 {
-    FileName = "dotnet", ArgumentList = { debuggeeDll },
     RedirectStandardOutput = true, RedirectStandardInput = true,
     RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
-})!;
-var pidLine = await debuggee.StandardOutput.ReadLineAsync();
-var pid = int.Parse(pidLine!.Split(":")[1].Trim());
+};
+psi.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+var debuggee = Process.Start(psi)!;
+int pid = debuggee.Id;
 Console.WriteLine($"Debuggee PID: {pid}\n");
 
 try
