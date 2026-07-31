@@ -1,0 +1,39 @@
+name: Auto Bump Version
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[auto-bump]')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute new version
+        id: version
+        run: |
+          CSPROJ="SharpBridge/SharpBridge.csproj"
+          CURRENT=$(grep -oP '<Version>\K[^<]+' "$CSPROJ")
+          MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+          MINOR=$(echo "$CURRENT" | cut -d. -f2)
+          COUNT=$(git rev-list --count HEAD)
+          NEW="$MAJOR.$MINOR.$COUNT"
+          echo "old=$CURRENT" >> $GITHUB_OUTPUT
+          echo "new=$NEW" >> $GITHUB_OUTPUT
+
+      - name: Update csproj
+        if: steps.version.outputs.old != steps.version.outputs.new
+        run: |
+          sed -i "s|<Version>${{ steps.version.outputs.old }}</Version>|<Version>${{ steps.version.outputs.new }}</Version>|" SharpBridge/SharpBridge.csproj
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add SharpBridge/SharpBridge.csproj
+          git commit -m "chore: [auto-bump] ${{ steps.version.outputs.old }} → ${{ steps.version.outputs.new }}"
+          git push
