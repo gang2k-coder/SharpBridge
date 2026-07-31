@@ -16,7 +16,7 @@ SharpBridge translates MCP tool calls into DAP debug commands, giving AI coding 
 - **Launch** .NET programs with debugging, or **attach** to running processes (by PID or process name)
 - **Smart attach**: auto-detect single vs. multiple process instances by name
 - **Session management**: `debug_select` to switch default session, `debug_list` to see all active sessions
-- **23 MCP tools**: session management, breakpoints (source + function, with auto-capture), exception breakpoints, execution control, state inspection, and capture snapshots
+- **24 MCP tools**: session management, breakpoints (source + function, with auto-capture), exception breakpoints, execution control, state inspection, and capture snapshots
 - **Smart inspect**: `variables_get` supports scope selection (locals/arguments/all), auto-expand depth, and targeted expansion by name — one call replaces multiple round-trips
 - **Exception breakpoints**: `exception_breakpoints` lists available filters and configures which exceptions cause breaks
 - **Auto-capture**: breakpoints with `action="capture"` auto-capture variables and continue (per `captureScope`/`captureDepth`), accumulating snapshots. `capture_state` / `get_captures` / `clear_captures` manage state snapshots
