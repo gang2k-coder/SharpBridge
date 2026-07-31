@@ -500,6 +500,55 @@ public class DebugSession : IDisposable
     // Execution Control
     // ===================================================================
 
+    /// <summary>
+    /// Race <see cref="_pendingStopTcs"/> against a timeout and user cancellation.
+    /// Returns a <see cref="StopEvent"/> indicating whether a real stop occurred,
+    /// the wait timed out, or the user cancelled.
+    /// </summary>
+    private async Task<StopEvent> WaitForStopInTimespanAsync(
+        int timeoutSeconds,
+        CancellationToken ct)
+    {
+        var tcs = Volatile.Read(ref _pendingStopTcs);
+        var timeoutSpan = timeoutSeconds > 0
+            ? TimeSpan.FromSeconds(timeoutSeconds)
+            : Timeout.InfiniteTimeSpan;
+        var timeoutTask = Task.Delay(timeoutSpan);
+        var cancelTask = Task.Delay(Timeout.Infinite, ct);
+
+        _logger.LogInformation("WaitForStop: waiting (timeout={Timeout}s)...", timeoutSeconds);
+
+        var completed = await Task.WhenAny(tcs.Task, timeoutTask, cancelTask);
+
+        if (completed == tcs.Task)
+        {
+            _logger.LogInformation("WaitForStop: stop event received");
+            if (_stateMachine.Current == SessionState.Exited) return LastStop;
+            return BuildStopEvent(tcs.Task.Result);
+        }
+
+        if (_stateMachine.Current == SessionState.Exited)
+        {
+            _logger.LogInformation("WaitForStop: process exited during wait");
+            return LastStop;
+        }
+
+        if (completed == cancelTask)
+        {
+            _logger.LogInformation("WaitForStop: cancelled by user");
+            return new StopEvent("running", null, null, "cancelled", null, 0, 0)
+            {
+                Note = "Wait was cancelled."
+            };
+        }
+
+        _logger.LogInformation("WaitForStop: timed out");
+        return new StopEvent("running", null, null, "timeout", null, 0, 0)
+        {
+            Note = "Process is in running. Use debug_wait or debug_pause to interrupt."
+        };
+    }
+
     public async Task<StopEvent> ContinueAndWaitAsync(
         int timeoutSeconds = 30,
         CancellationToken ct = default)
@@ -531,26 +580,7 @@ public class DebugSession : IDisposable
         }
         _stateMachine.TransitionTo(SessionState.Running);
 
-        // Wait for OnStopped to wake us. Capture BPs are handled transparently in OnStopped.
-        using var totalCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, totalCts.Token);
-        var tcs = Volatile.Read(ref _pendingStopTcs);
-
-        try
-        {
-            var stopEvent = await tcs.Task.WaitAsync(linked.Token);
-            if (_stateMachine.Current == SessionState.Exited) return LastStop;
-            return BuildStopEvent(stopEvent);
-        }
-        catch (OperationCanceledException)
-        {
-            if (_stateMachine.Current == SessionState.Exited)
-                return LastStop;
-            return new StopEvent("running", null, null, "timeout", null, 0, 0)
-            {
-                Note = "Process is still running. Use debug_pause to interrupt."
-            };
-        }
+        return await WaitForStopInTimespanAsync(timeoutSeconds, ct);
     }
 
     /// <summary>
@@ -564,25 +594,7 @@ public class DebugSession : IDisposable
         if (_stateMachine.Current != SessionState.Running)
             throw new InvalidOperationException($"Cannot wait: debugger state is {_stateMachine.Current}.");
 
-        using var totalCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, totalCts.Token);
-        var tcs = Volatile.Read(ref _pendingStopTcs);
-
-        try
-        {
-            var stopEvent = await tcs.Task.WaitAsync(linked.Token);
-            if (_stateMachine.Current == SessionState.Exited) return LastStop;
-            return BuildStopEvent(stopEvent);
-        }
-        catch (OperationCanceledException)
-        {
-            if (_stateMachine.Current == SessionState.Exited)
-                return LastStop;
-            return new StopEvent("running", null, null, "timeout", null, 0, 0)
-            {
-                Note = "Process is still running. Use debug_pause to interrupt."
-            };
-        }
+        return await WaitForStopInTimespanAsync(timeoutSeconds, ct);
     }
 
     public async Task<StopEvent> StepAsync(
