@@ -65,6 +65,23 @@ public class ExecutionTools(DebugSessionManager manager)
         return FormatStopEvent(stop);
     }
 
+    [McpServerTool]
+    [AllowedState(SessionState.Running)]
+    [Description("Wait for the program to stop (breakpoint hit, exception, exit) " +
+        "without sending any execution command. Use when the process is already running " +
+        "(e.g. after debug_continue timed out). Returns stop event on break/exit, " +
+        "or running status on timeout.")]
+    public async Task<string> DebugWait(
+        [Description("Maximum seconds to wait (default: 30)")] int timeout = 30,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
+        [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
+    {
+        var session = ResolveSession(processId, processName);
+        var stop = await session.WaitAndWaitAsync(timeout);
+
+        return FormatStopEvent(stop);
+    }
+
     private static string FormatStopEvent(StopEvent stop)
     {
         return JsonSerializer.Serialize(new

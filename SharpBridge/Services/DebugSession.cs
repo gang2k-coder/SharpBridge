@@ -553,6 +553,38 @@ public class DebugSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// Wait for a stop event without sending any DAP command.
+    /// Only valid when the process is already running.
+    /// </summary>
+    public async Task<StopEvent> WaitAndWaitAsync(
+        int timeoutSeconds = 30,
+        CancellationToken ct = default)
+    {
+        if (_stateMachine.Current != SessionState.Running)
+            throw new InvalidOperationException($"Cannot wait: debugger state is {_stateMachine.Current}.");
+
+        using var totalCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, totalCts.Token);
+        var tcs = Volatile.Read(ref _pendingStopTcs);
+
+        try
+        {
+            var stopEvent = await tcs.Task.WaitAsync(linked.Token);
+            if (_stateMachine.Current == SessionState.Exited) return LastStop;
+            return BuildStopEvent(stopEvent);
+        }
+        catch (OperationCanceledException)
+        {
+            if (_stateMachine.Current == SessionState.Exited)
+                return LastStop;
+            return new StopEvent("running", null, null, "timeout", null, 0, 0)
+            {
+                Note = "Process is still running. Use debug_pause to interrupt."
+            };
+        }
+    }
+
     public async Task<StopEvent> StepAsync(
         string type, int? threadId = null, CancellationToken ct = default)
     {
