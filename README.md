@@ -14,6 +14,7 @@ SharpBridge translates MCP tool calls into DAP debug commands, giving AI coding 
 
 - **Multi-session**: debug multiple processes simultaneously — each with its own DAP connection, breakpoints, and state
 - **Launch** .NET programs with debugging, or **attach** to running processes (by PID or process name)
+- **Target validation**: `debug_launch` verifies the file is a .NET assembly (PE CorHeader, with AppHost `.exe`→`.dll` fallback); `debug_attach` verifies the process has the CLR loaded — non-.NET targets are rejected with a clear error before any debugger work starts
 - **Smart attach**: auto-detect single vs. multiple process instances by name
 - **Session management**: `debug_select` to switch default session, `debug_list` to see all active sessions
 - **24 MCP tools**: session management, breakpoints (source + function, with auto-capture), exception breakpoints, execution control, state inspection, and capture snapshots
@@ -221,6 +222,8 @@ Each `DebugSession` runs a `DebugProtocolHost` on a background thread that reads
 - **Error recovery**: DAP reader errors trigger cleanup callback to manager
 
 ## Known Issues
+
+- **Attach validation waits up to 2s for young processes**: `debug_attach` gives a freshly-started process up to 2 seconds to load its CLR before the module check (a .NET process loads the CLR within ~1s of start; a non-.NET process is rejected as soon as it is 2s old). Attaching to a process you just launched may therefore take a moment.
 
 - **Launch PID extraction**: PID is extracted from SharpDbg log output via regex (`Process created suspended with PID: (\d+)`). This depends on SharpDbg's log format, which is not a stable API. If SharpDbg changes its log format, launch will fail with "Could not determine PID." Long-term fix: use DAP `ProcessEvent` if SharpDbg adds PID support, or manage process creation ourselves.
 
