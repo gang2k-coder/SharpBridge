@@ -103,10 +103,26 @@ public class DebugSessionManager : IDisposable
         Dictionary<string, string>? env = null,
         CancellationToken ct = default)
     {
-        var session = new DebugSession(_logger,
-            onDisposed: OnSessionDisposed,
-            onError: OnSessionError);
+        if (!ClrDetector.IsDotNetAssembly(program))
+            return new SessionLaunchResult(null, null, "Failed")
+            {
+                Error = $"'{program}' is not a .NET assembly. SharpBridge requires a .NET DLL to debug."
+            };
 
+        DebugSession session;
+        try
+        {
+            session = new DebugSession(_logger,
+                onDisposed: OnSessionDisposed,
+                onError: OnSessionError);
+        }
+        catch (Exception ex)
+        {
+            return new SessionLaunchResult(null, null, "Failed")
+            {
+                Error = $"Failed to create debug session: {ex.Message}"
+            };
+        }
 
         try
         {
@@ -173,10 +189,27 @@ public class DebugSessionManager : IDisposable
             };
         }
 
-        var session = new DebugSession(_logger,
-            onDisposed: OnSessionDisposed,
-            onError: OnSessionError);
+        if (!ClrDetector.IsDotNetProcess(processId))
+            return new SessionAttachResult(processId, null, "NotDotNet")
+            {
+                Error = $"Process {processId} is not a .NET CLR process. " +
+                        "SharpBridge can only attach to .NET processes."
+            };
 
+        DebugSession session;
+        try
+        {
+            session = new DebugSession(_logger,
+                onDisposed: OnSessionDisposed,
+                onError: OnSessionError);
+        }
+        catch (Exception ex)
+        {
+            return new SessionAttachResult(processId, null, "Failed")
+            {
+                Error = $"Failed to create debug session: {ex.Message}"
+            };
+        }
 
         try
         {

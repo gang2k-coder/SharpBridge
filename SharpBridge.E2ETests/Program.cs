@@ -292,9 +292,11 @@ try
     Assert(stateCheckJson.RootElement.GetProperty("state").GetString() == "Stopped", "Not Stopped");
     Console.WriteLine("   ✅");
 
-    // Test 14: Filter rejection — call Stopped-only tool in Attaching state
+    // Test 14: Filter rejection — call Stopped-only tool in Attaching state.
+    // Disconnect the first session first: SharpDbg only supports one adapter per process.
     tests++; passed++;
     Console.WriteLine("14. Filter rejection (stacktrace_get requires Stopped)...");
+    await client.CallToolAsync("debug_disconnect", new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = attachedPid });
     var psi2 = new ProcessStartInfo("dotnet", debuggeeDll)
     {
         RedirectStandardOutput = true, RedirectStandardInput = true,

@@ -5,6 +5,7 @@ using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol;
 using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages;
 using Newtonsoft.Json.Linq;
 using SharpBridge.State;
+using SharpDbg.Infrastructure;
 using SharpDbg.InMemory;
 
 namespace SharpBridge.Services;
@@ -570,7 +571,7 @@ public class DebugSession : IDisposable
             _host!.SendRequestSync(new ConfigurationDoneRequest());
             if (ProcessId.HasValue)
             {
-                try { new DiagnosticsClient(ProcessId.Value).ResumeRuntime(); }
+                try { await DiagnosticClientHelper.DiagnosticClientResumeRuntime(ProcessId.Value); }
                 catch (ServerNotAvailableException) { }
             }
         }
@@ -818,6 +819,9 @@ public class DebugSession : IDisposable
 
     private void OnStopped(StoppedEvent e)
     {
+        _logger.LogInformation("→ OnStopped: reason={Reason}, thread={ThreadId}, state={State}",
+            e.Reason, e.ThreadId, _stateMachine.Current);
+
         _activeThreadId = e.ThreadId;
         _stateMachine.TransitionTo(SessionState.Stopped);
 
@@ -843,16 +847,17 @@ public class DebugSession : IDisposable
                     _logger.LogError(ex, "Capture auto-continue failed");
                 }
             });
-            _logger.LogInformation("← StoppedEvent: auto-continue (capture), thread={ThreadId}", e.ThreadId);
+            _logger.LogInformation("← OnStopped: auto-continue (capture), TCS not touched, thread={ThreadId}", e.ThreadId);
             return;
         }
 
         // Break-action or non-breakpoint stop: stay stopped, wake caller
         _lastStop = BuildStopEvent(e);
-        var old = Interlocked.Exchange(ref _pendingStopTcs,
-            new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously));
+        var newTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var old = Interlocked.Exchange(ref _pendingStopTcs, newTcs);
         old.TrySetResult(e);
-        _logger.LogInformation("← StoppedEvent: reason={Reason}, thread={ThreadId}", e.Reason, e.ThreadId);
+        _logger.LogInformation("← OnStopped: TCS resolved (reason={Reason}, thread={ThreadId}), new TCS created",
+            e.Reason, e.ThreadId);
     }
 
     private (bool IsCapture, bool ShouldCapture, string Scope, int Depth) ResolveBreakpointAction()
@@ -894,10 +899,12 @@ public class DebugSession : IDisposable
 
     private void CompletePendingStopTcs()
     {
-        var old = Interlocked.Exchange(ref _pendingStopTcs,
-            new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously));
+        var newTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var old = Interlocked.Exchange(ref _pendingStopTcs, newTcs);
         old.TrySetResult(
             new StoppedEvent(reason: StoppedEvent.ReasonValue.Breakpoint));
+        _logger.LogInformation("CompletePendingStopTcs: TCS resolved (synthetic Breakpoint), state={State}",
+            _stateMachine.Current);
     }
 
     private void OnOutput(OutputEvent e)
