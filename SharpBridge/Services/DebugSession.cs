@@ -114,6 +114,7 @@ public class DebugSession : IDisposable
             _logger.LogInformation($"← ContinuedEvent: thread={e.ThreadId}"));
         _host.RegisterEventType<InitializedEvent>(e =>
             _logger.LogInformation("← InitializedEvent"));
+        _host.RegisterEventType<ModuleEvent>(OnModuleChanged);
 
         _host.VerifySynchronousOperationAllowed();
 
@@ -309,6 +310,10 @@ public class DebugSession : IDisposable
 
     private readonly Dictionary<(string File, int Line), BreakpointEntry> _bpConfigs = [];
     private readonly Dictionary<int, BreakpointEntry> _bpsByAdapterId = [];
+
+    /// <summary>Modules reported by SharpDbg via ModuleEvent, keyed by module id (the module path).
+    /// Populated from LoadModule callbacks — empty while the CLR is frozen (Attaching) and cleared on cleanup.</summary>
+    private readonly Dictionary<string, LoadedModule> _modules = [];
 
     public IReadOnlyList<BreakpointEntry> SetBreakpoints(
         string filePath,
@@ -949,6 +954,9 @@ public class DebugSession : IDisposable
         if (_cleanedUp) return;
         _cleanedUp = true;
 
+        lock (_modules)
+            _modules.Clear();
+
         _host?.Stop();
         try
         {
@@ -970,6 +978,41 @@ public class DebugSession : IDisposable
     // ===================================================================
     // Event handlers (on host's internal reader thread)
     // ===================================================================
+
+    /// <summary>
+    /// Track modules as SharpDbg reports them (LoadModule callbacks). Only
+    /// 'new' is emitted by SharpDbg; 'removed' is handled for completeness.
+    /// Runs on the DAP reader thread; mutations are lock-protected because
+    /// MCP tool threads read the list concurrently.
+    /// </summary>
+    private void OnModuleChanged(ModuleEvent e)
+    {
+        var m = e.Module;
+        if (m is null || m.Id is not string id) return;
+
+        if (e.Reason == ModuleEvent.ReasonValue.Removed)
+        {
+            lock (_modules)
+                _modules.Remove(id);
+            _logger.LogInformation("← ModuleEvent: removed {Name}", m.Name);
+            return;
+        }
+
+        lock (_modules)
+            _modules[id] = new LoadedModule(id, m.Name, m.Path);
+        _logger.LogInformation("← ModuleEvent: {Name} ({Path})", m.Name, m.Path);
+    }
+
+    /// <summary>
+    /// Snapshot of the modules reported so far. Empty until the program runs
+    /// (first ConfigurationDone/continue) — the CLR is frozen before that, so
+    /// SharpDbg has not received any LoadModule callbacks yet.
+    /// </summary>
+    public IReadOnlyList<LoadedModule> GetModules()
+    {
+        lock (_modules)
+            return _modules.Values.ToList();
+    }
 
     /// <summary>
     /// SharpDbg notifies when a previously pending breakpoint binds (module
@@ -1244,6 +1287,10 @@ public record StopEvent(
 }
 
 public record ThreadInfo(int Id, string Name, bool IsActive);
+
+/// <summary>A module loaded into the debugged process, as reported by SharpDbg's LoadModule callback.</summary>
+public record LoadedModule(string Id, string Name, string Path);
+
 public record StackFrameInfo(
     int Id, string Name, string? Source,
     int Line, int Column, int EndLine, int EndColumn);

@@ -87,6 +87,19 @@ try
         return;
     }
 
+    // === Step 3b: Modules ===
+    Console.WriteLine("3b. Getting loaded modules...");
+    var modules = session.GetModules();
+    foreach (var m in modules)
+        Console.WriteLine($"   {m.Name} ({m.Path})");
+    Assert(modules.Any(m => m.Name == "TestDebuggee.dll"),
+        $"Expected TestDebuggee.dll in modules, got: {string.Join(", ", modules.Select(m => m.Name))}");
+    Assert(modules.Any(m => m.Name == "System.Private.CoreLib.dll"),
+        $"Expected System.Private.CoreLib.dll in modules, got: {string.Join(", ", modules.Select(m => m.Name))}");
+    Assert(modules.All(m => !string.IsNullOrEmpty(m.Path)), "Module path should not be empty");
+    Console.WriteLine($"   ✅ PASS ({modules.Count} modules)");
+    Console.WriteLine();
+
     // === Step 4: Threads ===
     Console.WriteLine("4. Getting threads...");
     var threads = session.GetThreads();

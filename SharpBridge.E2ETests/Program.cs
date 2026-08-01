@@ -137,6 +137,20 @@ try
         $"Expected adjusted line 24, got {bpCheck.GetProperty("line").GetInt32()}");
     Console.WriteLine($"   threadId={threadId}, alive ✅");
 
+    // Test 3b: Modules list (populated after the first continue loaded modules)
+    tests++; passed++;
+    Console.WriteLine("3b. Modules...");
+    var modJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("modules_list", new Dictionary<string, object?> { ["processId"] = attachedPid })));
+    var mods = modJson.RootElement.GetProperty("modules").EnumerateArray().ToList();
+    Assert(modJson.RootElement.GetProperty("count").GetInt32() >= 2, "Expected >=2 modules");
+    Assert(mods.Any(m => m.GetProperty("name").GetString() == "TestDebuggee.dll"),
+        $"Expected TestDebuggee.dll, got: {string.Join(", ", mods.Select(m => m.GetProperty("name").GetString()))}");
+    Assert(mods.Any(m => m.GetProperty("name").GetString() == "System.Private.CoreLib.dll"),
+        "Expected System.Private.CoreLib.dll");
+    Assert(mods.All(m => m.GetProperty("path").GetString()?.Length > 0), "Module path should be non-empty");
+    Console.WriteLine($"   {modJson.RootElement.GetProperty("count").GetInt32()} modules ✅");
+
     // Test 4: Stack + Variables
     tests++; passed++;
     Console.WriteLine("4. Stack + variables...");
