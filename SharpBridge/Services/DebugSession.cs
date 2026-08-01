@@ -384,10 +384,11 @@ public class DebugSession : IDisposable
                 entries[i].Verified = bpResults[i].Verified;
                 entries[i].Message = bpResults[i].Message;
                 entries[i].AdapterId = bpResults[i].Id;
-                if (bpResults[i].Line.HasValue && bpResults[i].Line.Value != entries[i].Line)
+                var bpLine = bpResults[i].Line;
+                if (bpLine.HasValue && bpLine.Value != entries[i].Line)
                 {
                     var oldKey = (normalizedFile, entries[i].Line);
-                    entries[i].Line = bpResults[i].Line!.Value;
+                    entries[i].Line = bpLine.Value;
                     // Re-key the capture config so hit-location lookups still
                     // match when the adapter adjusts the line (e.g. moved to
                     // the next executable statement).
