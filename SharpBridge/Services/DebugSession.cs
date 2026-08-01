@@ -106,6 +106,7 @@ public class DebugSession : IDisposable
 
         // Register events before Run()
         _host.RegisterEventType<StoppedEvent>(OnStopped);
+        _host.RegisterEventType<BreakpointEvent>(OnBreakpointChanged);
         _host.RegisterEventType<ExitedEvent>(OnExited);
         _host.RegisterEventType<TerminatedEvent>(OnTerminated);
         _host.RegisterEventType<OutputEvent>(OnOutput);
@@ -292,9 +293,22 @@ public class DebugSession : IDisposable
         public string? CaptureScope { get; set; }
         public int CaptureDepth { get; set; }
         public string? FunctionName { get; set; }
+
+        /// <summary>SharpDbg's breakpoint id — matches BreakpointEvent payloads.</summary>
+        public int? AdapterId { get; set; }
+
+        /// <summary>True when the adapter accepted the breakpoint but could not bind it yet (module not loaded).</summary>
+        public bool IsPending { get; set; }
+
+        // Writable so in-place line adjustments (response / BreakpointEvent)
+        // keep object identity across _bpConfigs and _bpsByAdapterId.
+        public int Line { get; set; } = Line;
+        public int? EndLine { get; set; } = EndLine;
+        public int? EndColumn { get; set; } = EndColumn;
     }
 
     private readonly Dictionary<(string File, int Line), BreakpointEntry> _bpConfigs = [];
+    private readonly Dictionary<int, BreakpointEntry> _bpsByAdapterId = [];
 
     public IReadOnlyList<BreakpointEntry> SetBreakpoints(
         string filePath,
@@ -364,10 +378,11 @@ public class DebugSession : IDisposable
             {
                 entries[i].Verified = bpResults[i].Verified;
                 entries[i].Message = bpResults[i].Message;
+                entries[i].AdapterId = bpResults[i].Id;
                 if (bpResults[i].Line.HasValue && bpResults[i].Line.Value != entries[i].Line)
                 {
                     var oldKey = (normalizedFile, entries[i].Line);
-                    entries[i] = entries[i] with { Line = bpResults[i].Line!.Value };
+                    entries[i].Line = bpResults[i].Line!.Value;
                     // Re-key the capture config so hit-location lookups still
                     // match when the adapter adjusts the line (e.g. moved to
                     // the next executable statement).
@@ -376,6 +391,9 @@ public class DebugSession : IDisposable
                 }
             }
         }
+
+        MarkPending(entries);
+        RebuildAdapterIdMap();
 
         return entries;
     }
@@ -429,11 +447,58 @@ public class DebugSession : IDisposable
                 {
                     entries[i].Verified = bpResults[i].Verified;
                     entries[i].Message = bpResults[i].Message;
+                    entries[i].AdapterId = bpResults[i].Id;
                 }
             }
         }
 
+        MarkPending(entries);
+        RebuildAdapterIdMap();
+
         return entries;
+    }
+
+    /// <summary>
+    /// Derive the agent-facing status of a breakpoint:
+    /// verified (bound), pending (accepted, module not loaded yet), or failed.
+    /// </summary>
+    public static string BreakpointStatus(BreakpointEntry entry)
+        => entry.Verified ? "verified" : entry.IsPending ? "pending" : "failed";
+
+    /// <summary>
+    /// A breakpoint set before its module is loaded is reported unverified
+    /// with SharpDbg's "not processed" message and binds later — mark it
+    /// pending so callers can distinguish it from a genuine binding failure.
+    /// </summary>
+    private void MarkPending(IReadOnlyList<BreakpointEntry> entries)
+    {
+        foreach (var entry in entries)
+        {
+            entry.IsPending = !entry.Verified
+                && (entry.Message == "Breakpoint has not been processed by the debugger."
+                    || _stateMachine.Current == SessionState.Attaching);
+        }
+    }
+
+    /// <summary>
+    /// Rebuild the adapter-id → entry map. SharpDbg assigns a fresh id on
+    /// every SetBreakpoints/SetFunctionBreakpoints call (including the
+    /// re-send inside RemoveBreakpoint), so incremental maintenance would
+    /// leave stale mappings — a full rebuild is simpler and always correct.
+    /// </summary>
+    private void RebuildAdapterIdMap()
+    {
+        _bpsByAdapterId.Clear();
+        foreach (var entry in _breakpointsByFile.Values.SelectMany(v => v))
+        {
+            if (entry.AdapterId.HasValue)
+                _bpsByAdapterId[entry.AdapterId.Value] = entry;
+        }
+        foreach (var entry in _functionBreakpoints)
+        {
+            if (entry.AdapterId.HasValue)
+                _bpsByAdapterId[entry.AdapterId.Value] = entry;
+        }
     }
 
     public bool RemoveBreakpoint(int id)
@@ -905,6 +970,47 @@ public class DebugSession : IDisposable
     // ===================================================================
     // Event handlers (on host's internal reader thread)
     // ===================================================================
+
+    /// <summary>
+    /// SharpDbg notifies when a previously pending breakpoint binds (module
+    /// loaded): sync Verified/Message and the adjusted line, and re-key any
+    /// capture config so hit-location lookups still match. Runs on the DAP
+    /// reader thread; the mutations are plain reference writes read by MCP
+    /// threads — the same model as _lastStop.
+    /// </summary>
+    private void OnBreakpointChanged(BreakpointEvent e)
+    {
+        var bp = e.Breakpoint;
+        if (bp.Id is not { } adapterId
+            || !_bpsByAdapterId.TryGetValue(adapterId, out var entry))
+        {
+            _logger.LogDebug("BreakpointEvent for unknown adapter breakpoint {Id} — ignoring", bp.Id);
+            return;
+        }
+
+        entry.Verified = bp.Verified;
+        entry.IsPending = false;
+        // SharpDbg clears the message on successful bind — mirroring it drops
+        // the stale "not been processed" text.
+        entry.Message = bp.Message;
+
+        if (bp.Line.HasValue && bp.Line.Value != entry.Line)
+        {
+            var oldKey = (NormalizePath(entry.FilePath), entry.Line);
+            entry.Line = bp.Line.Value;
+            if (bp.EndLine.HasValue) entry.EndLine = bp.EndLine;
+            if (bp.EndColumn.HasValue) entry.EndColumn = bp.EndColumn;
+            // Re-key the capture config: a capture breakpoint set early on a
+            // non-executable line binds at an adjusted line — without this
+            // the hit-location lookup misses and capture silently degrades
+            // to a plain break.
+            if (_bpConfigs.Remove(oldKey))
+                _bpConfigs[(NormalizePath(entry.FilePath), entry.Line)] = entry;
+        }
+
+        _logger.LogInformation("← BreakpointEvent: id={Id} verified={Verified} line={Line}",
+            adapterId, bp.Verified, bp.Line);
+    }
 
     private void OnStopped(StoppedEvent e)
     {

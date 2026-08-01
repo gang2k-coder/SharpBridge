@@ -90,6 +90,17 @@ try
     var hasStopSource = contJson.RootElement.TryGetProperty("source", out var stopSource)
         && stopSource.GetProperty("path").GetString()?.Contains("TestDebuggee") == true;
     Assert(hasStopSource, "Continue response missing hit source location");
+    // The breakpoint set while the module wasn't loaded must now be verified,
+    // with the line adjusted from the blank 23 to the executable line 24.
+    var bpCheckJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
+    Assert(bpCheckJson.RootElement.GetProperty("count").GetInt32() == 1, "Expected 1 BP after continue");
+    var bpCheck = bpCheckJson.RootElement.GetProperty("breakpoints")[0];
+    Assert(bpCheck.GetProperty("status").GetString() == "verified",
+        $"Expected verified after module load, got {bpCheck.GetProperty("status").GetString()}");
+    // Note: breakpoint_list serializes entry properties with PascalCase keys (bp.Line → "Line").
+    Assert(bpCheck.GetProperty("Line").GetInt32() == 24,
+        $"Expected adjusted line 24, got {bpCheck.GetProperty("Line").GetInt32()}");
     Console.WriteLine($"   threadId={threadId}, alive ✅");
 
     // Test 4: Stack + Variables
@@ -335,6 +346,14 @@ try
     // adapter reports breakpoints as pending (unverified); they bind when the
     // module loads. The functional assertions below are the real verification.
 
+    // Both breakpoints must be reported as pending while the module is unloaded.
+    var pendingListJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
+    var pendingBps = pendingListJson.RootElement.GetProperty("breakpoints").EnumerateArray().ToList();
+    Assert(pendingBps.Count == 2, $"Expected 2 breakpoints, got {pendingBps.Count}");
+    Assert(pendingBps.All(b => b.GetProperty("status").GetString() == "pending"),
+        $"Expected all breakpoints pending, got {string.Join(",", pendingBps.Select(b => b.GetProperty("status").GetString()))}");
+
     await debuggee3.StandardInput.WriteLineAsync();
     var capContJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 30 })));
@@ -343,6 +362,14 @@ try
     // The continue response must carry the real hit location now
     var capStopLine = capContJson.RootElement.GetProperty("source").GetProperty("line").GetInt32();
     Assert(capStopLine == loopEndLine, $"Expected stop at line {loopEndLine}, got {capStopLine}");
+
+    // BreakpointEvent sync: both breakpoints must have flipped to verified.
+    var verifiedListJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
+    var verifiedBps = verifiedListJson.RootElement.GetProperty("breakpoints").EnumerateArray().ToList();
+    Assert(verifiedBps.Count == 2, $"Expected 2 breakpoints after module load, got {verifiedBps.Count}");
+    Assert(verifiedBps.All(b => b.GetProperty("status").GetString() == "verified"),
+        $"Expected all breakpoints verified, got {string.Join(",", verifiedBps.Select(b => b.GetProperty("status").GetString()))}");
 
     var capCapsJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("get_captures", new Dictionary<string, object?>())));

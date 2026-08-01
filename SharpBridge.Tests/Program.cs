@@ -297,6 +297,54 @@ try
     Console.WriteLine("   ✅ PASS");
     Console.WriteLine();
 
+    // === Step 15: Capture breakpoint on a non-executable line ===
+    // A capture breakpoint set before the module loads binds at an ADJUSTED
+    // line (blank 23 -> executable 24). The BreakpointEvent handler must
+    // re-key the capture config, otherwise the auto-capture silently
+    // degrades to a plain break (blind spot ④).
+    Console.WriteLine("15. Capture bp on blank line (adjusted-line auto-capture)...");
+    var psi2 = new ProcessStartInfo("dotnet", debuggeeDll)
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    psi2.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var debuggee2 = Process.Start(psi2)!;
+    int pid2 = debuggee2.Id;
+
+    using var session2 = new DebugSession(loggerFactory.CreateLogger<DebugSession>());
+    await session2.AttachAsync(pid2);
+    var capBps = session2.SetBreakpoints(sourceFile,
+        (Line: 23, Column: null, Condition: null, HitCondition: null,
+         Action: "capture", CaptureScope: "all", CaptureDepth: 0));
+    var capBp = capBps[0];
+    Assert(!capBp.Verified && capBp.IsPending,
+        $"Expected pending before module load, got verified={capBp.Verified} pending={capBp.IsPending}");
+    Assert(DebugSession.BreakpointStatus(capBp) == "pending", "Expected status 'pending'");
+
+    await debuggee2.StandardInput.WriteLineAsync();
+    var capStop = await session2.ContinueAndWaitAsync(timeoutSeconds: 20);
+    Assert(capStop.Status == "exited",
+        $"Expected run-to-exit (capture bps auto-continue), got {capStop.Status}");
+
+    // BreakpointEvent sync: verified + adjusted line
+    var boundBp = session2.GetAllBreakpoints()[0];
+    Assert(boundBp.Verified, "Expected verified after module load");
+    Assert(boundBp.Line == 24, $"Expected adjusted line 24, got {boundBp.Line}");
+    Assert(DebugSession.BreakpointStatus(boundBp) == "verified", "Expected status 'verified'");
+
+    // Capture fired at the ADJUSTED line (the blind-spot fix)
+    var capCaps2 = session2.GetCaptures();
+    Assert(capCaps2.Count == 1, $"Expected 1 capture, got {capCaps2.Count}");
+    Assert(capCaps2[0].FilePath is not null && capCaps2[0].FilePath.Contains("TestDebuggee"),
+        "Capture missing source path");
+    Assert(capCaps2[0].Line == 24, $"Expected capture at adjusted line 24, got {capCaps2[0].Line}");
+    var counterVar = capCaps2[0].Variables.FirstOrDefault(v => v.Name == "counter");
+    Assert(counterVar is not null && counterVar.Value == "0",
+        $"Expected counter=0 at line 24, got {counterVar?.Value}");
+    Console.WriteLine("   ✅ PASS (pending → verified at line 24, capture fired, auto-continued to exit)");
+    Console.WriteLine();
+
     Console.WriteLine("=== ALL TESTS PASSED ✅ ===");
 }
 catch (Exception ex)
