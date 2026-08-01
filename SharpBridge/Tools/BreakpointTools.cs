@@ -80,7 +80,10 @@ public class BreakpointTools(DebugSessionManager manager)
         "- 'GenericClass<T>.Method' — generic type with arity\n" +
         "- 'GenericClass<T>.Method<T>(T, int)' — full generic method with parameters\n" +
         "C# type aliases (int, string, bool, long, etc.) are automatically resolved to CLR types.\n" +
-        "When multiple methods match (overloads, multiple modules), all are bound simultaneously.\n" +
+        "When multiple methods match (overloads, multiple modules), all are bound simultaneously — omit the parameter list to bind all overloads of a name.\n" +
+        "Method name matches EXACTLY (case-sensitive, no wildcards); type segment matches exactly or by '.TypeName' suffix.\n" +
+        "Requires the target module's PDB; binds at method entry. Set before the module loads → reported pending, binds automatically on load.\n" +
+        "LIMITATION: local functions and lambdas cannot be targeted — the compiler mangles them (e.g. <<Main>$>g__SignalLoopEnd|0_0) and '<>'/'|' are reserved; use regular methods.\n" +
         "Returns the breakpoint ID for later removal with breakpoint_remove.")]
     public string FunctionBreakpointSet(
         [Description("Function name pattern. Examples:\n" +

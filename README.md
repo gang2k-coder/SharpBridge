@@ -162,6 +162,38 @@ Typical debugging session with your AI agent:
 6. debug_disconnect — clean up when done
 ```
 
+### Function breakpoints
+
+`function_breakpoint_set` breaks when a method is **entered**, targeting the CLR
+metadata name rather than a source line. Pattern format:
+
+```
+[TypeName.]MethodName[(ParameterTypes)]
+```
+
+| Pattern | Matches |
+|---|---|
+| `Calculator.Multiply` | type (exact or `.TypeName` suffix) + exact method short name |
+| `Multiply` | any type with that method name |
+| `Greeter.GetGreeting(string)` | single-parameter overload only |
+| `MyApp.GenericProcessor<T>.Process(T)` | generic type/method by arity |
+
+Rules:
+
+- **Method name is matched exactly** (case-sensitive, no wildcards); the type
+  segment supports exact or `.TypeName`-suffix matching.
+- **Parameter types disambiguate overloads**; C# aliases (`int`, `string`, `bool`,
+  `long`, …) are resolved to CLR types automatically, `?` and nested generics
+  are supported. **Omitting the parameter list binds every overload** of that name.
+- The module must have a **PDB**; the breakpoint binds to the method entry IL.
+- Set before the module loads → reported `pending`, binds automatically when
+  the module loads (`verified` flips to `true`).
+- Repeated calls **accumulate** (existing function breakpoints are preserved),
+  unlike `breakpoint_set` which replaces a file's set.
+- **Local functions and lambdas cannot be targeted**: the compiler mangles their
+  names (e.g. `<<Main>$>g__SignalLoopEnd|0_0`) and `<>`/`|` cannot appear in a
+  pattern. Use regular methods instead.
+
 ## Project Structure
 
 ```
