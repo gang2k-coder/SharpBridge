@@ -10,14 +10,18 @@ var passed = 0;
 
 var serverProj = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../SharpBridge"));
 var debuggeeProj = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../TestDebuggee"));
-var debuggeeDll = Path.Combine(debuggeeProj, "bin/Debug/net10.0/TestDebuggee.dll");
 
-// Run a child dotnet build. The MSBuild server / node reuse can transiently
-// lock obj cache files (MSB3492 "cannot read existing file"); disable both
-// and retry once on failure.
-static (int ExitCode, string Output) RunBuild(string project)
+// Build into an isolated artifacts directory: the C# extension in VS Code
+// (Roslyn / Dev Kit design-time builds) touches the default obj/ dirs, which
+// intermittently races with our child builds (MSB3492 lock errors, "target is
+// being built fully"). A dedicated artifacts path has zero overlap with it.
+var e2eArtifacts = Path.Combine(Path.GetTempPath(), "sharpbridge-e2e-artifacts");
+
+// Run a child dotnet build. MSBuild server / node reuse are disabled to avoid
+// lingering processes; a single retry covers transient lock hiccups.
+static (int ExitCode, string Output) RunBuild(string project, string artifactsDir)
 {
-    var psi = new ProcessStartInfo("dotnet", ["build", project, "-q"])
+    var psi = new ProcessStartInfo("dotnet", ["build", project, "-v", "m", "--artifacts-path", artifactsDir])
     {
         RedirectStandardOutput = true, RedirectStandardError = true,
         Environment = { ["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0", ["MSBUILDDISABLENODEREUSE"] = "1" }
@@ -29,21 +33,11 @@ static (int ExitCode, string Output) RunBuild(string project)
 
 void BuildOrThrow(string project, string label)
 {
-    var (code, output) = RunBuild(project);
+    var (code, output) = RunBuild(project, e2eArtifacts);
     if (code == 0) return;
 
-    // Retry once after a pause: obj cache files can be transiently locked by
-    // lingering MSBuild nodes / AV scans (MSB3492 "cannot read existing file").
-    Thread.Sleep(1000);
-    (code, output) = RunBuild(project);
-    if (code == 0) return;
-
-    // Persistent lock: the cache file may be poisoned (exists but unreadable) —
-    // rebuilding from a clean obj always resolves it.
-    Console.WriteLine($"   ⚠️ {label} build hit a transient file lock — cleaning obj/bin and retrying...");
-    try { Directory.Delete(Path.Combine(project, "obj"), recursive: true); } catch { }
-    try { Directory.Delete(Path.Combine(project, "bin"), recursive: true); } catch { }
-    (code, output) = RunBuild(project);
+    Thread.Sleep(1000); // retry once — transient lock
+    (code, output) = RunBuild(project, e2eArtifacts);
     if (code != 0)
         throw new Exception($"{label} build failed:\n{output}");
 }
@@ -52,8 +46,21 @@ void BuildOrThrow(string project, string label)
 BuildOrThrow(serverProj, "Server");
 BuildOrThrow(debuggeeProj, "Debuggee");
 
+// Resolve outputs — the artifacts layout lower-cases the configuration
+// directory (bin/<Project>/debug/net10.0), so search by file name instead
+// of hard-coding the casing.
+static string FindOutputDll(string artifactsDir, string projectName)
+{
+    var dll = Directory.GetFiles(Path.Combine(artifactsDir, "bin", projectName), "*.dll", SearchOption.AllDirectories)
+        .FirstOrDefault(f => Path.GetFileName(f) == projectName + ".dll");
+    return dll ?? throw new Exception($"Build output not found for {projectName} under {artifactsDir}");
+}
+
+var serverDll = FindOutputDll(e2eArtifacts, "SharpBridge");
+var debuggeeDll = FindOutputDll(e2eArtifacts, "TestDebuggee");
+
 // Start debuggee with diagnostic suspend — CLR freezes until ResumeRuntime
-var psi = new ProcessStartInfo("dotnet", debuggeeDll)
+var psi = new ProcessStartInfo("dotnet", [debuggeeDll])
 {
     RedirectStandardOutput = true, RedirectStandardInput = true,
     RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
@@ -69,7 +76,7 @@ try
     var transport = new StdioClientTransport(new StdioClientTransportOptions
     {
         Command = "dotnet",
-        Arguments = ["run", "--project", serverProj, "--no-build"],
+        Arguments = [serverDll],
         WorkingDirectory = serverProj
     });
     await using var client = await McpClient.CreateAsync(transport, new McpClientOptions
@@ -141,8 +148,8 @@ try
     var varsJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("variables_get", new Dictionary<string, object?> { ["frameId"] = frameId })));
     var counterVal = varsJson.RootElement.GetProperty("variables")
-        .EnumerateArray().First(v => v.GetProperty("Name").GetString() == "counter")
-        .GetProperty("Value").GetString();
+        .EnumerateArray().First(v => v.GetProperty("name").GetString() == "counter")
+        .GetProperty("value").GetString();
     Assert(counterVal == "0", $"Expected counter=0, got {counterVal}");
     Console.WriteLine($"   counter={counterVal} ✅");
 
@@ -161,11 +168,11 @@ try
         new Dictionary<string, object?> { ["frameId"] = frameId, ["scope"] = "locals" });
     var varsExJson = JsonDocument.Parse(GetText(varsExResp));
     var numbersVar2 = varsExJson.RootElement.GetProperty("variables").EnumerateArray()
-        .First(v => v.GetProperty("Name").GetString() == "numbers");
-    Assert(numbersVar2.GetProperty("VariablesReference").GetInt32() > 0, "numbers not expandable");
+        .First(v => v.GetProperty("name").GetString() == "numbers");
+    Assert(numbersVar2.GetProperty("variablesReference").GetInt32() > 0, "numbers not expandable");
     var expandJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("variables_expand",
-            new Dictionary<string, object?> { ["variablesReference"] = numbersVar2.GetProperty("VariablesReference").GetInt32() })));
+            new Dictionary<string, object?> { ["variablesReference"] = numbersVar2.GetProperty("variablesReference").GetInt32() })));
     Assert(expandJson.RootElement.GetProperty("count").GetInt32() >= 5, $"Expected >=5 children, got {expandJson.RootElement.GetProperty("count").GetInt32()}");
     Console.WriteLine($"   {expandJson.RootElement.GetProperty("count").GetInt32()} children ✅");
 
@@ -338,7 +345,7 @@ try
     // second breakpoint in Program.cs would wipe the capture one.)
     tests++; passed++;
     Console.WriteLine("11. Capture breakpoint (auto-capture)...");
-    var psi3 = new ProcessStartInfo("dotnet", debuggeeDll)
+    var psi3 = new ProcessStartInfo("dotnet", [debuggeeDll])
     {
         RedirectStandardOutput = true, RedirectStandardInput = true,
         RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
@@ -410,8 +417,8 @@ try
         Assert(c.GetProperty("source").GetProperty("line").GetInt32() == actualCounterLine,
             $"Capture snapshot wrong line: {c.GetProperty("source").GetProperty("line").GetInt32()}");
         return c.GetProperty("variables").EnumerateArray()
-            .First(v => v.GetProperty("Name").GetString() == "counter")
-            .GetProperty("Value").GetString();
+            .First(v => v.GetProperty("name").GetString() == "counter")
+            .GetProperty("value").GetString();
     }).ToList();
     Assert(counters.SequenceEqual(new[] { "0", "1", "2", "3", "4" }),
         $"Expected counters 0..4 (breakpoint fires BEFORE the statement runs), got {string.Join(",", counters)}");
@@ -432,7 +439,7 @@ try
     tests++; passed++;
     Console.WriteLine("13. Filter rejection (stacktrace_get requires Stopped)...");
     await client.CallToolAsync("debug_disconnect", new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = attachedPid });
-    var psi2 = new ProcessStartInfo("dotnet", debuggeeDll)
+    var psi2 = new ProcessStartInfo("dotnet", [debuggeeDll])
     {
         RedirectStandardOutput = true, RedirectStandardInput = true,
         RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true

@@ -30,9 +30,9 @@ public class InspectionTools(DebugSessionManager manager)
             count = threads.Count,
             threads = threads.Select(t => new
             {
-                t.Id,
-                t.Name,
-                t.IsActive,
+                id = t.Id,
+                name = t.Name,
+                isActive = t.IsActive,
                 hint = t.IsActive ? "This thread triggered the current stop." : null
             })
         });
@@ -311,13 +311,13 @@ public class InspectionTools(DebugSessionManager manager)
     {
         return new
         {
-            v.Name,
-            v.Value,
-            v.Type,
-            v.VariablesReference,
-            v.EvaluateName,
-            v.IndexedVariables,
-            v.NamedVariables,
+            name = v.Name,
+            value = v.Value,
+            type = v.Type,
+            variablesReference = v.VariablesReference,
+            evaluateName = v.EvaluateName,
+            indexedVariables = v.IndexedVariables,
+            namedVariables = v.NamedVariables,
             expandable = v.VariablesReference > 0,
             hint = v.VariablesReference > 0 && v.Children is null
                 ? $"Use variables_expand with variablesReference={v.VariablesReference} to see children."
