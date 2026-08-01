@@ -40,7 +40,8 @@
 ### 步骤 2:`modules_list` 工具(InspectionTools.cs 或新 ModulesTools.cs)
 
 - 放 InspectionTools(与 threads_list/stacktrace_get 同族),签名:`ModulesList(int? processId = null, string? processName = null)`
-- `[AllowedState(SessionState.Attaching, SessionState.Running, SessionState.Stopped)]`——运行中也允许查(断点 pending 时 agent 需要能查)
+- `[AllowedState(SessionState.Running, SessionState.Stopped)]`——**不含 Attaching**:SharpBridge 的 attach 是 lazy 的(AttachAsync 只发 AttachRequest,ConfigurationDone 在首次 debug_continue 时才发),Attaching 状态下 CLR 仍冻结、LoadModule 事件尚未投递,模块表必为空——允许调用只会误导 agent。拒绝并提示"模块在首次 debug_continue 后可用"
+- 描述里写明:模块来自 SharpDbg 的 LoadModule 事件;attach 后首次 continue(模块加载)后列表才完整
 - 返回:
   ```json
   {
@@ -51,7 +52,7 @@
     ]
   }
   ```
-- 描述里写明:模块来自 SharpDbg 的 LoadModule 事件;attach 后已加载模块应已就绪;仅含 id/name/path(符号状态暂不可得)
+- 仅含 id/name/path(符号状态暂不可得)
 
 ### 步骤 3:测试
 
