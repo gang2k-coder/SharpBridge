@@ -12,17 +12,45 @@ var serverProj = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../
 var debuggeeProj = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../TestDebuggee"));
 var debuggeeDll = Path.Combine(debuggeeProj, "bin/Debug/net10.0/TestDebuggee.dll");
 
+// Run a child dotnet build. The MSBuild server / node reuse can transiently
+// lock obj cache files (MSB3492 "cannot read existing file"); disable both
+// and retry once on failure.
+static (int ExitCode, string Output) RunBuild(string project)
+{
+    var psi = new ProcessStartInfo("dotnet", ["build", project, "-q"])
+    {
+        RedirectStandardOutput = true, RedirectStandardError = true,
+        Environment = { ["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0", ["MSBUILDDISABLENODEREUSE"] = "1" }
+    };
+    using var proc = Process.Start(psi)!;
+    proc.WaitForExit();
+    return (proc.ExitCode, proc.StandardOutput.ReadToEnd() + proc.StandardError.ReadToEnd());
+}
+
+void BuildOrThrow(string project, string label)
+{
+    var (code, output) = RunBuild(project);
+    if (code == 0) return;
+
+    // Retry once after a pause: obj cache files can be transiently locked by
+    // lingering MSBuild nodes / AV scans (MSB3492 "cannot read existing file").
+    Thread.Sleep(1000);
+    (code, output) = RunBuild(project);
+    if (code == 0) return;
+
+    // Persistent lock: the cache file may be poisoned (exists but unreadable) —
+    // rebuilding from a clean obj always resolves it.
+    Console.WriteLine($"   ⚠️ {label} build hit a transient file lock — cleaning obj/bin and retrying...");
+    try { Directory.Delete(Path.Combine(project, "obj"), recursive: true); } catch { }
+    try { Directory.Delete(Path.Combine(project, "bin"), recursive: true); } catch { }
+    (code, output) = RunBuild(project);
+    if (code != 0)
+        throw new Exception($"{label} build failed:\n{output}");
+}
+
 // Build
-var buildPsi = new ProcessStartInfo("dotnet", ["build", serverProj, "-q"])
-{ RedirectStandardOutput = true, RedirectStandardError = true };
-var buildProc = Process.Start(buildPsi)!;
-buildProc.WaitForExit();
-if (buildProc.ExitCode != 0) throw new Exception($"Server build failed:\n{buildProc.StandardError.ReadToEnd()}");
-buildPsi = new ProcessStartInfo("dotnet", ["build", debuggeeProj, "-q"])
-{ RedirectStandardOutput = true, RedirectStandardError = true };
-buildProc = Process.Start(buildPsi)!;
-buildProc.WaitForExit();
-if (buildProc.ExitCode != 0) throw new Exception($"Debuggee build failed:\n{buildProc.StandardError.ReadToEnd()}");
+BuildOrThrow(serverProj, "Server");
+BuildOrThrow(debuggeeProj, "Debuggee");
 
 // Start debuggee with diagnostic suspend — CLR freezes until ResumeRuntime
 var psi = new ProcessStartInfo("dotnet", debuggeeDll)
@@ -98,9 +126,8 @@ try
     var bpCheck = bpCheckJson.RootElement.GetProperty("breakpoints")[0];
     Assert(bpCheck.GetProperty("status").GetString() == "verified",
         $"Expected verified after module load, got {bpCheck.GetProperty("status").GetString()}");
-    // Note: breakpoint_list serializes entry properties with PascalCase keys (bp.Line → "Line").
-    Assert(bpCheck.GetProperty("Line").GetInt32() == 24,
-        $"Expected adjusted line 24, got {bpCheck.GetProperty("Line").GetInt32()}");
+    Assert(bpCheck.GetProperty("line").GetInt32() == 24,
+        $"Expected adjusted line 24, got {bpCheck.GetProperty("line").GetInt32()}");
     Console.WriteLine($"   threadId={threadId}, alive ✅");
 
     // Test 4: Stack + Variables
@@ -148,7 +175,7 @@ try
     var bpListJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
     Assert(bpListJson.RootElement.GetProperty("count").GetInt32() == 1, "Expected 1 BP");
-    var bpId = bpListJson.RootElement.GetProperty("breakpoints")[0].GetProperty("Id").GetInt32();
+    var bpId = bpListJson.RootElement.GetProperty("breakpoints")[0].GetProperty("id").GetInt32();
     var rmJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("breakpoint_remove", new Dictionary<string, object?> { ["id"] = bpId })));
     Assert(rmJson.RootElement.GetProperty("removed").GetBoolean(), "Remove failed");
@@ -177,7 +204,7 @@ try
         await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
     Assert(fnListJson.RootElement.GetProperty("count").GetInt32() >= 1, "No bps in list");
     var fnBpInList = fnListJson.RootElement.GetProperty("breakpoints").EnumerateArray()
-        .FirstOrDefault(bp => bp.TryGetProperty("FunctionName", out var fn) && fn.GetString() == "Calculator.Multiply");
+        .FirstOrDefault(bp => bp.TryGetProperty("functionName", out var fn) && fn.GetString() == "Calculator.Multiply");
     Assert(fnBpInList.ValueKind != JsonValueKind.Undefined, "Function breakpoint not found in list");
     // Remove
     await client.CallToolAsync("breakpoint_remove", new Dictionary<string, object?> { ["id"] = fnBpId });

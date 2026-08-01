@@ -165,19 +165,19 @@ public class BreakpointTools(DebugSessionManager manager)
             count = bps.Count,
             breakpoints = bps.Select(bp => new
             {
-                bp.Id,
-                bp.FilePath,
-                bp.Line,
-                bp.Column,
-                bp.FunctionName,
-                bp.Verified,
+                id = bp.Id,
+                filePath = bp.FilePath,
+                line = bp.Line,
+                column = bp.Column,
+                functionName = bp.FunctionName,
+                verified = bp.Verified,
                 status = DebugSession.BreakpointStatus(bp),
-                bp.Message,
-                bp.Condition,
-                bp.HitCondition,
-                bp.Action,
-                bp.CaptureScope,
-                bp.CaptureDepth,
+                message = bp.Message,
+                condition = bp.Condition,
+                hitCondition = bp.HitCondition,
+                action = bp.Action,
+                captureScope = bp.CaptureScope,
+                captureDepth = bp.CaptureDepth,
                 hint = bp.Action == "capture"
                     ? "Capture-action: auto-captures variables and continues."
                     : bp.Verified
