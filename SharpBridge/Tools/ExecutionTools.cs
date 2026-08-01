@@ -18,7 +18,8 @@ public class ExecutionTools(DebugSessionManager manager)
         "exception, or exit. If capture-action breakpoints are set, they will " +
         "auto-capture variables and continue silently — use get_captures afterwards. " +
         "When a break-action breakpoint or non-breakpoint stop occurs, returns the stop event. " +
-        "On timeout, the program is automatically paused so state can be inspected.")]
+        "On timeout, returns status 'running' without pausing — use debug_wait to keep " +
+        "waiting for a breakpoint, or debug_pause to interrupt and inspect state.")]
     public async Task<string> DebugContinue(
         [Description("Maximum seconds to wait before auto-pausing (default: 30). " +
             "Set to 0 for no timeout (NOT recommended if no breakpoints are set!)")] int timeout = 30,

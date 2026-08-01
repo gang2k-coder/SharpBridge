@@ -270,7 +270,7 @@ try
 
     // Test 9: Debug step — in
     tests++; passed++;
-    Console.WriteLine("10. Step in...");
+    Console.WriteLine("9. Step in...");
     var stepInJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("debug_step", new Dictionary<string, object?> { ["type"] = "in" })));
     Assert(stepInJson.RootElement.GetProperty("status").GetString() == "stopped", "Step in failed");
@@ -278,7 +278,7 @@ try
 
     // Test 11: Exception info
     tests++; passed++;
-    Console.WriteLine("12. Exception info...");
+    Console.WriteLine("11. Exception info...");
     var exInfoJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("exception_info", new Dictionary<string, object?>())));
     Assert(exInfoJson.RootElement.GetProperty("hasException").GetBoolean() == false, "Unexpected exception");

@@ -314,7 +314,15 @@ public class DebugSession : IDisposable
                 CaptureDepth = captureDepth
             };
             entries.Add(entry);
-            if (action == "capture") _bpConfigs[(Path.GetFullPath(filePath), line)] = entry;
+
+            // Track capture-action breakpoints for auto-capture on stop.
+            // Always update the registry so re-setting a line as a plain
+            // "break" breakpoint removes any stale capture config.
+            var configKey = (Path.GetFullPath(filePath), line);
+            if (action == "capture")
+                _bpConfigs[configKey] = entry;
+            else
+                _bpConfigs.Remove(configKey);
 
             var sbp = new SourceBreakpoint { Line = line };
             if (col.HasValue) sbp.Column = col.Value;
@@ -410,6 +418,9 @@ public class DebugSession : IDisposable
             if (entry is not null)
             {
                 entries.Remove(entry);
+                // Drop any capture config for this breakpoint so a stale
+                // auto-continue doesn't fire if the line is re-set as "break".
+                _bpConfigs.Remove((Path.GetFullPath(file), entry.Line));
                 if (entries.Count == 0)
                 {
                     _breakpointsByFile.Remove(file);
