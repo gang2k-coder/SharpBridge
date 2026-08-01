@@ -37,6 +37,7 @@ public class BreakpointTools(DebugSessionManager manager)
             (line, column, condition, hitCondition, action, captureScope, captureDepth));
         var entry = entries.FirstOrDefault()!;
 
+        var status = DebugSession.BreakpointStatus(entry);
         return JsonSerializer.Serialize(new
         {
             id = entry.Id,
@@ -44,15 +45,26 @@ public class BreakpointTools(DebugSessionManager manager)
             line = entry.Line,
             column = entry.Column,
             verified = entry.Verified,
-            message = entry.Message ?? (entry.Verified ? "Breakpoint is set and will be hit." : "Breakpoint could not be verified. It may not be in executable code."),
+            status,
+            message = status switch
+            {
+                "failed" => entry.Message ?? "Breakpoint could not be verified.",
+                "pending" => "Breakpoint is pending: the target module is not loaded yet.",
+                _ => entry.Message ?? "Breakpoint is set and will be hit."
+            },
             condition = entry.Condition,
             hitCondition = entry.HitCondition,
             action = entry.Action,
             captureScope = entry.CaptureScope,
             captureDepth = entry.CaptureDepth,
-            hint = entry.Verified
-                ? (entry.Action == "capture" ? "Capture-action: will auto-capture variables and continue." : null)
-                : "The breakpoint may be on a line that doesn't map to any IL instruction (e.g. a blank line or comment). Check the source line number."
+            hint = status switch
+            {
+                "pending" => "Breakpoint is pending: it will bind automatically when the module loads (verified will flip to true).",
+                "failed" => "Breakpoint could not be bound. Check that the source path matches the debuggee's PDB and the line is executable.",
+                _ => entry.Action == "capture"
+                    ? "Capture-action: will auto-capture variables and continue."
+                    : null
+            }
         });
     }
 
@@ -68,7 +80,10 @@ public class BreakpointTools(DebugSessionManager manager)
         "- 'GenericClass<T>.Method' — generic type with arity\n" +
         "- 'GenericClass<T>.Method<T>(T, int)' — full generic method with parameters\n" +
         "C# type aliases (int, string, bool, long, etc.) are automatically resolved to CLR types.\n" +
-        "When multiple methods match (overloads, multiple modules), all are bound simultaneously.\n" +
+        "When multiple methods match (overloads, multiple modules), all are bound simultaneously — omit the parameter list to bind all overloads of a name.\n" +
+        "Method name matches EXACTLY (case-sensitive, no wildcards); type segment matches exactly or by '.TypeName' suffix.\n" +
+        "Requires the target module's PDB; binds at method entry. Set before the module loads → reported pending, binds automatically on load.\n" +
+        "LIMITATION: local functions and lambdas cannot be targeted — the compiler mangles them (e.g. <<Main>$>g__SignalLoopEnd|0_0) and '<>'/'|' are reserved; use regular methods.\n" +
         "Returns the breakpoint ID for later removal with breakpoint_remove.")]
     public string FunctionBreakpointSet(
         [Description("Function name pattern. Examples:\n" +
@@ -95,19 +110,27 @@ public class BreakpointTools(DebugSessionManager manager)
         var entries = session.SetFunctionBreakpoints(all.ToArray());
         var entry = entries.Last(); // the one just added
 
+        var status = DebugSession.BreakpointStatus(entry);
         return JsonSerializer.Serialize(new
         {
             id = entry.Id,
             functionName = entry.FunctionName,
             verified = entry.Verified,
-            message = entry.Message ?? (entry.Verified
-                ? "Function breakpoint is set and will be hit when the method is called."
-                : "Function breakpoint could not be resolved. It may match a method in a module that hasn't loaded yet."),
+            status,
+            message = status switch
+            {
+                "failed" => entry.Message ?? "Function breakpoint could not be resolved.",
+                "pending" => "Function breakpoint is pending: the target module is not loaded yet.",
+                _ => entry.Message ?? "Function breakpoint is set and will be hit when the method is called."
+            },
             condition = entry.Condition,
             hitCondition = entry.HitCondition,
-            hint = entry.Verified
-                ? "The breakpoint will fire whenever any matching method is called."
-                : "It will bind automatically when the matching module loads."
+            hint = status switch
+            {
+                "pending" => "It will bind automatically when the matching module loads.",
+                "failed" => "No matching method found in any loaded module. Note: local functions and lambdas compile to mangled names (e.g. <<Main>$>g__Name|0_0) and cannot be targeted.",
+                _ => "The breakpoint will fire whenever any matching method is called."
+            }
         });
     }
 
@@ -145,21 +168,26 @@ public class BreakpointTools(DebugSessionManager manager)
             count = bps.Count,
             breakpoints = bps.Select(bp => new
             {
-                bp.Id,
-                bp.FilePath,
-                bp.Line,
-                bp.Column,
-                bp.FunctionName,
-                bp.Verified,
-                bp.Message,
-                bp.Condition,
-                bp.HitCondition,
-                bp.Action,
-                bp.CaptureScope,
-                bp.CaptureDepth,
+                id = bp.Id,
+                filePath = bp.FilePath,
+                line = bp.Line,
+                column = bp.Column,
+                functionName = bp.FunctionName,
+                verified = bp.Verified,
+                status = DebugSession.BreakpointStatus(bp),
+                message = bp.Message,
+                condition = bp.Condition,
+                hitCondition = bp.HitCondition,
+                action = bp.Action,
+                captureScope = bp.CaptureScope,
+                captureDepth = bp.CaptureDepth,
                 hint = bp.Action == "capture"
                     ? "Capture-action: auto-captures variables and continues."
-                    : null
+                    : bp.Verified
+                        ? null
+                        : bp.IsPending
+                            ? "Pending: binds when the module loads. May remain pending forever if the module never loads."
+                            : "Not verified: check the source path/line against the debuggee's PDB."
             })
         });
     }

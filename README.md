@@ -162,6 +162,38 @@ Typical debugging session with your AI agent:
 6. debug_disconnect — clean up when done
 ```
 
+### Function breakpoints
+
+`function_breakpoint_set` breaks when a method is **entered**, targeting the CLR
+metadata name rather than a source line. Pattern format:
+
+```
+[TypeName.]MethodName[(ParameterTypes)]
+```
+
+| Pattern | Matches |
+|---|---|
+| `Calculator.Multiply` | type (exact or `.TypeName` suffix) + exact method short name |
+| `Multiply` | any type with that method name |
+| `Greeter.GetGreeting(string)` | single-parameter overload only |
+| `MyApp.GenericProcessor<T>.Process(T)` | generic type/method by arity |
+
+Rules:
+
+- **Method name is matched exactly** (case-sensitive, no wildcards); the type
+  segment supports exact or `.TypeName`-suffix matching.
+- **Parameter types disambiguate overloads**; C# aliases (`int`, `string`, `bool`,
+  `long`, …) are resolved to CLR types automatically, `?` and nested generics
+  are supported. **Omitting the parameter list binds every overload** of that name.
+- The module must have a **PDB**; the breakpoint binds to the method entry IL.
+- Set before the module loads → reported `pending`, binds automatically when
+  the module loads (`verified` flips to `true`).
+- Repeated calls **accumulate** (existing function breakpoints are preserved),
+  unlike `breakpoint_set` which replaces a file's set.
+- **Local functions and lambdas cannot be targeted**: the compiler mangles their
+  names (e.g. `<<Main>$>g__SignalLoopEnd|0_0`) and `<>`/`|` cannot appear in a
+  pattern. Use regular methods instead.
+
 ## Project Structure
 
 ```
@@ -228,6 +260,10 @@ Each `DebugSession` runs a `DebugProtocolHost` on a background thread that reads
 - **Launch PID extraction**: PID is extracted from SharpDbg log output via regex (`Process created suspended with PID: (\d+)`). This depends on SharpDbg's log format, which is not a stable API. If SharpDbg changes its log format, launch will fail with "Could not determine PID." Long-term fix: use DAP `ProcessEvent` if SharpDbg adds PID support, or manage process creation ourselves.
 
 - **Exception filter support incomplete**: SharpDbg advertises `"all"` and `"user-unhandled"` exception breakpoint filters but hardcodes `breakOnAllExceptions = true` regardless of filter selection. Both filters currently behave identically (break on every exception). Per-exception-type configuration (`ExceptionOptions`) is not supported by SharpDbg. `exception_breakpoints` works correctly for stopping on exceptions, but fine-grained filtering requires future SharpDbg improvements.
+
+- **Function breakpoints cannot target local functions or lambdas**: C# compiles these to compiler-generated names — e.g. `static void SignalLoopEnd()` in top-level statements becomes `<<Main>$>g__SignalLoopEnd|0_0` (the `<>`/`|` characters are reserved and cannot appear in a typed identifier). SharpDbg matches the method name **exactly** against the CLR metadata name (short name only — no namespace/type prefix), while type names support exact or `.TypeName` suffix matching, so a `function_breakpoint_set` for a local function never binds. Use regular methods instead (e.g. `LoopEnd.Signal`). Note that a function breakpoint set before the target module is loaded is reported as unverified and binds automatically when the module loads — `verified=false` at set time is normal in that case.
+
+- **breakpoint_set replaces all breakpoints in a file**: DAP `SetBreakpointsRequest` replaces the entire breakpoint set of a source file, and the `breakpoint_set` MCP tool sends one request per call — setting a second breakpoint in the same file removes the first. For multiple breakpoints in one file they must be sent in a single `SetBreakpointsRequest` (the underlying API supports it, but the MCP tool currently exposes a single breakpoint per call), or spread across different files.
 
 - **Goto/GotoTargets not yet implemented by SharpDbg**: `HandleGotoRequest` and `HandleGotoTargetsRequest` handlers exist in SharpDbg but their functionality is unclear. Not exposed via SharpBridge.
 

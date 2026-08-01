@@ -10,18 +10,57 @@ var passed = 0;
 
 var serverProj = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../SharpBridge"));
 var debuggeeProj = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../TestDebuggee"));
-var debuggeeDll = Path.Combine(debuggeeProj, "bin/Debug/net10.0/TestDebuggee.dll");
+
+// Build into an isolated artifacts directory: the C# extension in VS Code
+// (Roslyn / Dev Kit design-time builds) touches the default obj/ dirs, which
+// intermittently races with our child builds (MSB3492 lock errors, "target is
+// being built fully"). A dedicated artifacts path has zero overlap with it.
+var e2eArtifacts = Path.Combine(Path.GetTempPath(), "sharpbridge-e2e-artifacts");
+
+// Run a child dotnet build. MSBuild server / node reuse are disabled to avoid
+// lingering processes; a single retry covers transient lock hiccups.
+static (int ExitCode, string Output) RunBuild(string project, string artifactsDir)
+{
+    var psi = new ProcessStartInfo("dotnet", ["build", project, "-v", "m", "--artifacts-path", artifactsDir])
+    {
+        RedirectStandardOutput = true, RedirectStandardError = true,
+        Environment = { ["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0", ["MSBUILDDISABLENODEREUSE"] = "1" }
+    };
+    using var proc = Process.Start(psi)!;
+    proc.WaitForExit();
+    return (proc.ExitCode, proc.StandardOutput.ReadToEnd() + proc.StandardError.ReadToEnd());
+}
+
+void BuildOrThrow(string project, string label)
+{
+    var (code, output) = RunBuild(project, e2eArtifacts);
+    if (code == 0) return;
+
+    Thread.Sleep(1000); // retry once — transient lock
+    (code, output) = RunBuild(project, e2eArtifacts);
+    if (code != 0)
+        throw new Exception($"{label} build failed:\n{output}");
+}
 
 // Build
-var buildPsi = new ProcessStartInfo("dotnet", ["build", serverProj, "-q"])
-{ RedirectStandardOutput = true, RedirectStandardError = true };
-(Process.Start(buildPsi)!).WaitForExit();
-buildPsi = new ProcessStartInfo("dotnet", ["build", debuggeeProj, "-q"])
-{ RedirectStandardOutput = true, RedirectStandardError = true };
-(Process.Start(buildPsi)!).WaitForExit();
+BuildOrThrow(serverProj, "Server");
+BuildOrThrow(debuggeeProj, "Debuggee");
+
+// Resolve outputs — the artifacts layout lower-cases the configuration
+// directory (bin/<Project>/debug/net10.0), so search by file name instead
+// of hard-coding the casing.
+static string FindOutputDll(string artifactsDir, string projectName)
+{
+    var dll = Directory.GetFiles(Path.Combine(artifactsDir, "bin", projectName), "*.dll", SearchOption.AllDirectories)
+        .FirstOrDefault(f => Path.GetFileName(f) == projectName + ".dll");
+    return dll ?? throw new Exception($"Build output not found for {projectName} under {artifactsDir}");
+}
+
+var serverDll = FindOutputDll(e2eArtifacts, "SharpBridge");
+var debuggeeDll = FindOutputDll(e2eArtifacts, "TestDebuggee");
 
 // Start debuggee with diagnostic suspend — CLR freezes until ResumeRuntime
-var psi = new ProcessStartInfo("dotnet", debuggeeDll)
+var psi = new ProcessStartInfo("dotnet", [debuggeeDll])
 {
     RedirectStandardOutput = true, RedirectStandardInput = true,
     RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
@@ -37,7 +76,7 @@ try
     var transport = new StdioClientTransport(new StdioClientTransportOptions
     {
         Command = "dotnet",
-        Arguments = ["run", "--project", serverProj, "--no-build"],
+        Arguments = [serverDll],
         WorkingDirectory = serverProj
     });
     await using var client = await McpClient.CreateAsync(transport, new McpClientOptions
@@ -82,6 +121,20 @@ try
     Assert(contJson.RootElement.GetProperty("status").GetString() == "stopped", "Not stopped");
     var threadId = contJson.RootElement.GetProperty("threadId").GetInt32();
     Assert(!debuggee.HasExited, "Debuggee exited during continue");
+    // The continue response must carry the real hit location now
+    var hasStopSource = contJson.RootElement.TryGetProperty("source", out var stopSource)
+        && stopSource.GetProperty("path").GetString()?.Contains("TestDebuggee") == true;
+    Assert(hasStopSource, "Continue response missing hit source location");
+    // The breakpoint set while the module wasn't loaded must now be verified,
+    // with the line adjusted from the blank 23 to the executable line 24.
+    var bpCheckJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
+    Assert(bpCheckJson.RootElement.GetProperty("count").GetInt32() == 1, "Expected 1 BP after continue");
+    var bpCheck = bpCheckJson.RootElement.GetProperty("breakpoints")[0];
+    Assert(bpCheck.GetProperty("status").GetString() == "verified",
+        $"Expected verified after module load, got {bpCheck.GetProperty("status").GetString()}");
+    Assert(bpCheck.GetProperty("line").GetInt32() == 24,
+        $"Expected adjusted line 24, got {bpCheck.GetProperty("line").GetInt32()}");
     Console.WriteLine($"   threadId={threadId}, alive ✅");
 
     // Test 4: Stack + Variables
@@ -95,8 +148,8 @@ try
     var varsJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("variables_get", new Dictionary<string, object?> { ["frameId"] = frameId })));
     var counterVal = varsJson.RootElement.GetProperty("variables")
-        .EnumerateArray().First(v => v.GetProperty("Name").GetString() == "counter")
-        .GetProperty("Value").GetString();
+        .EnumerateArray().First(v => v.GetProperty("name").GetString() == "counter")
+        .GetProperty("value").GetString();
     Assert(counterVal == "0", $"Expected counter=0, got {counterVal}");
     Console.WriteLine($"   counter={counterVal} ✅");
 
@@ -115,11 +168,11 @@ try
         new Dictionary<string, object?> { ["frameId"] = frameId, ["scope"] = "locals" });
     var varsExJson = JsonDocument.Parse(GetText(varsExResp));
     var numbersVar2 = varsExJson.RootElement.GetProperty("variables").EnumerateArray()
-        .First(v => v.GetProperty("Name").GetString() == "numbers");
-    Assert(numbersVar2.GetProperty("VariablesReference").GetInt32() > 0, "numbers not expandable");
+        .First(v => v.GetProperty("name").GetString() == "numbers");
+    Assert(numbersVar2.GetProperty("variablesReference").GetInt32() > 0, "numbers not expandable");
     var expandJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("variables_expand",
-            new Dictionary<string, object?> { ["variablesReference"] = numbersVar2.GetProperty("VariablesReference").GetInt32() })));
+            new Dictionary<string, object?> { ["variablesReference"] = numbersVar2.GetProperty("variablesReference").GetInt32() })));
     Assert(expandJson.RootElement.GetProperty("count").GetInt32() >= 5, $"Expected >=5 children, got {expandJson.RootElement.GetProperty("count").GetInt32()}");
     Console.WriteLine($"   {expandJson.RootElement.GetProperty("count").GetInt32()} children ✅");
 
@@ -129,7 +182,7 @@ try
     var bpListJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
     Assert(bpListJson.RootElement.GetProperty("count").GetInt32() == 1, "Expected 1 BP");
-    var bpId = bpListJson.RootElement.GetProperty("breakpoints")[0].GetProperty("Id").GetInt32();
+    var bpId = bpListJson.RootElement.GetProperty("breakpoints")[0].GetProperty("id").GetInt32();
     var rmJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("breakpoint_remove", new Dictionary<string, object?> { ["id"] = bpId })));
     Assert(rmJson.RootElement.GetProperty("removed").GetBoolean(), "Remove failed");
@@ -158,7 +211,7 @@ try
         await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
     Assert(fnListJson.RootElement.GetProperty("count").GetInt32() >= 1, "No bps in list");
     var fnBpInList = fnListJson.RootElement.GetProperty("breakpoints").EnumerateArray()
-        .FirstOrDefault(bp => bp.TryGetProperty("FunctionName", out var fn) && fn.GetString() == "Calculator.Multiply");
+        .FirstOrDefault(bp => bp.TryGetProperty("functionName", out var fn) && fn.GetString() == "Calculator.Multiply");
     Assert(fnBpInList.ValueKind != JsonValueKind.Undefined, "Function breakpoint not found in list");
     // Remove
     await client.CallToolAsync("breakpoint_remove", new Dictionary<string, object?> { ["id"] = fnBpId });
@@ -276,28 +329,117 @@ try
     Assert(stepInJson.RootElement.GetProperty("status").GetString() == "stopped", "Step in failed");
     Console.WriteLine("   ✅");
 
-    // Test 11: Exception info
+    // Test 10: Exception info
     tests++; passed++;
-    Console.WriteLine("11. Exception info...");
+    Console.WriteLine("10. Exception info...");
     var exInfoJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("exception_info", new Dictionary<string, object?>())));
     Assert(exInfoJson.RootElement.GetProperty("hasException").GetBoolean() == false, "Unexpected exception");
     Console.WriteLine("   ✅");
 
-    // Test 13: session context back to original after operations
+    // Test 11: Capture-action breakpoint — auto-capture without stopping
+    // Uses a fresh debuggee: one capture breakpoint on the loop's counter++
+    // line (fires once per iteration, silently) plus a plain breakpoint in a
+    // SECOND source file (LoopEnd.cs) so we can stop and read the snapshots
+    // before the process exits. (Source breakpoints replace per-file, so a
+    // second breakpoint in Program.cs would wipe the capture one.)
     tests++; passed++;
-    Console.WriteLine("13. Session context preserved...");
+    Console.WriteLine("11. Capture breakpoint (auto-capture)...");
+    var psi3 = new ProcessStartInfo("dotnet", [debuggeeDll])
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    psi3.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var debuggee3 = Process.Start(psi3)!;
+    var pid3 = debuggee3.Id;
+    var attach3Json = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = pid3 })));
+    Assert(attach3Json.RootElement.GetProperty("status").GetString() == "attached", "Attach #3 failed");
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid3 });
+
+    const int counterLine = 29;   // counter++ inside the loop
+    var capSetJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
+        {
+            ["filePath"] = sourceFile, ["line"] = counterLine, ["action"] = "capture"
+        })));
+    Assert(capSetJson.RootElement.GetProperty("action").GetString() == "capture", "Capture action not set");
+    var actualCounterLine = capSetJson.RootElement.GetProperty("line").GetInt32();
+    // Stop after the loop via a breakpoint in a different source file
+    // (LoopEnd.Signal) — set while the module is not yet loaded, so it binds
+    // when the module loads (pending-breakpoint rebinding).
+    var loopEndFile = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+        "../../../../TestDebuggee/LoopEnd.cs"));
+    const int loopEndLine = 8;   // GC.KeepAlive(0); inside LoopEnd.Signal()
+    await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
+    {
+        ["filePath"] = loopEndFile, ["line"] = loopEndLine
+    });
+    // Note: at attach time the module's symbols may not be loaded yet, so the
+    // adapter reports breakpoints as pending (unverified); they bind when the
+    // module loads. The functional assertions below are the real verification.
+
+    // Both breakpoints must be reported as pending while the module is unloaded.
+    var pendingListJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
+    var pendingBps = pendingListJson.RootElement.GetProperty("breakpoints").EnumerateArray().ToList();
+    Assert(pendingBps.Count == 2, $"Expected 2 breakpoints, got {pendingBps.Count}");
+    Assert(pendingBps.All(b => b.GetProperty("status").GetString() == "pending"),
+        $"Expected all breakpoints pending, got {string.Join(",", pendingBps.Select(b => b.GetProperty("status").GetString()))}");
+
+    await debuggee3.StandardInput.WriteLineAsync();
+    var capContJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 30 })));
+    Assert(capContJson.RootElement.GetProperty("status").GetString() == "stopped",
+        $"Expected stopped after the capture loop, got {capContJson.RootElement.GetProperty("status").GetString()}");
+    // The continue response must carry the real hit location now
+    var capStopLine = capContJson.RootElement.GetProperty("source").GetProperty("line").GetInt32();
+    Assert(capStopLine == loopEndLine, $"Expected stop at line {loopEndLine}, got {capStopLine}");
+
+    // BreakpointEvent sync: both breakpoints must have flipped to verified.
+    var verifiedListJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
+    var verifiedBps = verifiedListJson.RootElement.GetProperty("breakpoints").EnumerateArray().ToList();
+    Assert(verifiedBps.Count == 2, $"Expected 2 breakpoints after module load, got {verifiedBps.Count}");
+    Assert(verifiedBps.All(b => b.GetProperty("status").GetString() == "verified"),
+        $"Expected all breakpoints verified, got {string.Join(",", verifiedBps.Select(b => b.GetProperty("status").GetString()))}");
+
+    var capCapsJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures", new Dictionary<string, object?>())));
+    var capList = capCapsJson.RootElement.GetProperty("captures");
+    Assert(capCapsJson.RootElement.GetProperty("count").GetInt32() == 5,
+        $"Expected 5 captures (one per loop iteration), got {capCapsJson.RootElement.GetProperty("count").GetInt32()}");
+    var counters = capList.EnumerateArray().Select(c =>
+    {
+        Assert(c.GetProperty("source").GetProperty("path").GetString()!.Contains("TestDebuggee"),
+            "Capture snapshot missing source path");
+        Assert(c.GetProperty("source").GetProperty("line").GetInt32() == actualCounterLine,
+            $"Capture snapshot wrong line: {c.GetProperty("source").GetProperty("line").GetInt32()}");
+        return c.GetProperty("variables").EnumerateArray()
+            .First(v => v.GetProperty("name").GetString() == "counter")
+            .GetProperty("value").GetString();
+    }).ToList();
+    Assert(counters.SequenceEqual(new[] { "0", "1", "2", "3", "4" }),
+        $"Expected counters 0..4 (breakpoint fires BEFORE the statement runs), got {string.Join(",", counters)}");
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid3 });
+    Console.WriteLine($"   counters={string.Join(",", counters)} ✅");
+
+    // Test 12: session context back to original after operations
+    tests++; passed++;
+    Console.WriteLine("12. Session context preserved...");
     var stateCheckJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("debug_state", new Dictionary<string, object?> { ["processId"] = attachedPid })));
     Assert(stateCheckJson.RootElement.GetProperty("state").GetString() == "Stopped", "Not Stopped");
     Console.WriteLine("   ✅");
 
-    // Test 14: Filter rejection — call Stopped-only tool in Attaching state.
+    // Test 13: Filter rejection — call Stopped-only tool in Attaching state.
     // Disconnect the first session first: SharpDbg only supports one adapter per process.
     tests++; passed++;
-    Console.WriteLine("14. Filter rejection (stacktrace_get requires Stopped)...");
+    Console.WriteLine("13. Filter rejection (stacktrace_get requires Stopped)...");
     await client.CallToolAsync("debug_disconnect", new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = attachedPid });
-    var psi2 = new ProcessStartInfo("dotnet", debuggeeDll)
+    var psi2 = new ProcessStartInfo("dotnet", [debuggeeDll])
     {
         RedirectStandardOutput = true, RedirectStandardInput = true,
         RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
@@ -319,9 +461,9 @@ try
     await client.CallToolAsync("debug_disconnect", new Dictionary<string, object?> { ["terminateDebuggee"] = true });
     if (!debuggee2.HasExited) debuggee2.Kill();
 
-    // Test 15: Filter rejection — no session selected
+    // Test 14: Filter rejection — no session selected
     tests++; passed++;
-    Console.WriteLine("15. Filter rejection (no session)...");
+    Console.WriteLine("14. Filter rejection (no session)...");
     // Disconnect attachedPid first to clear session
     await client.CallToolAsync("debug_disconnect", new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = attachedPid });
     try

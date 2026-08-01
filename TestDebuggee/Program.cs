@@ -47,6 +47,7 @@ for (int i = 0; i < numbers.Count; i++)
 Console.WriteLine($"\nFinal counter: {counter}");
 Console.WriteLine($"Message: {message}");
 Console.WriteLine("Done!");
+LoopEnd.Signal();
 
 static int DoubleValue(int x)
 {

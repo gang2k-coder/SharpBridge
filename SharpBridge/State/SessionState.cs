@@ -35,6 +35,7 @@ public sealed class SessionStateMachine
         {
             (SessionState.Detached,    SessionState.Attaching) => true,
             (SessionState.Attaching,   SessionState.Running)   => true,
+            (SessionState.Attaching,   SessionState.Stopped)   => true,
             (SessionState.Stopped,     SessionState.Running)   => true,
             (SessionState.Running,     SessionState.Stopped)   => true,
             (_,                        SessionState.Exited)    => true,

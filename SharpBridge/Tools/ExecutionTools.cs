@@ -98,6 +98,7 @@ public class ExecutionTools(DebugSessionManager manager)
                 column = stop.Column
             } : null,
             exitCode = stop.ExitCode,
+            hitBreakpointIds = stop.HitBreakpointIds,
             note = stop.Note,
             state = stop.Status switch
             {
