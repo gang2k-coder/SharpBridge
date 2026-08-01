@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Text.RegularExpressions;
 using Microsoft.Diagnostics.NETCore.Client;
 using Microsoft.Extensions.Logging;
@@ -192,6 +193,13 @@ public class DebugSession : IDisposable
             {
                 await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
                 _logger.LogInformation("Launch: stopped at entry.");
+                // The wait may have been resolved by the process exiting
+                // (fast-exiting debuggees) — do not force Stopped in that case.
+                if (_stateMachine.Current == SessionState.Exited)
+                {
+                    _logger.LogInformation("Launch: process exited before the entry stop — leaving state as Exited.");
+                    return;
+                }
                 _stateMachine.TransitionTo(SessionState.Stopped);
                 return;
             }
@@ -220,6 +228,8 @@ public class DebugSession : IDisposable
             {
                 await pauseTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
                 _logger.LogInformation("Pause succeeded.");
+                // The pause wait may have been resolved by the process exiting.
+                if (_stateMachine.Current is SessionState.Exited or SessionState.Stopped) return;
                 _stateMachine.TransitionTo(SessionState.Stopped);
                 return;
             }
@@ -293,6 +303,12 @@ public class DebugSession : IDisposable
     {
         _breakpointsByFile.Remove(filePath);
 
+        // Drop stale capture configs for this file — the set below replaces
+        // all breakpoints in it, so old configs must not survive.
+        var normalizedFile = NormalizePath(filePath);
+        foreach (var staleKey in _bpConfigs.Keys.Where(k => k.File == normalizedFile).ToList())
+            _bpConfigs.Remove(staleKey);
+
         var entries = new List<BreakpointEntry>();
         var sourceBreakpoints = new List<SourceBreakpoint>();
 
@@ -317,8 +333,10 @@ public class DebugSession : IDisposable
 
             // Track capture-action breakpoints for auto-capture on stop.
             // Always update the registry so re-setting a line as a plain
-            // "break" breakpoint removes any stale capture config.
-            var configKey = (Path.GetFullPath(filePath), line);
+            // "break" breakpoint removes any stale capture config. Keys are
+            // normalized to match the hit location SharpDbg reports in the
+            // stopped event.
+            var configKey = (normalizedFile, line);
             if (action == "capture")
                 _bpConfigs[configKey] = entry;
             else
@@ -346,8 +364,16 @@ public class DebugSession : IDisposable
             {
                 entries[i].Verified = bpResults[i].Verified;
                 entries[i].Message = bpResults[i].Message;
-                if (bpResults[i].Line.HasValue)
+                if (bpResults[i].Line.HasValue && bpResults[i].Line.Value != entries[i].Line)
+                {
+                    var oldKey = (normalizedFile, entries[i].Line);
                     entries[i] = entries[i] with { Line = bpResults[i].Line!.Value };
+                    // Re-key the capture config so hit-location lookups still
+                    // match when the adapter adjusts the line (e.g. moved to
+                    // the next executable statement).
+                    if (_bpConfigs.Remove(oldKey))
+                        _bpConfigs[(normalizedFile, entries[i].Line)] = entries[i];
+                }
             }
         }
 
@@ -420,7 +446,7 @@ public class DebugSession : IDisposable
                 entries.Remove(entry);
                 // Drop any capture config for this breakpoint so a stale
                 // auto-continue doesn't fire if the line is re-set as "break".
-                _bpConfigs.Remove((Path.GetFullPath(file), entry.Line));
+                _bpConfigs.Remove((NormalizePath(file), entry.Line));
                 if (entries.Count == 0)
                 {
                     _breakpointsByFile.Remove(file);
@@ -470,15 +496,19 @@ public class DebugSession : IDisposable
     public CaptureSnapshot CaptureState(string scope = "all", int depth = 0)
     {
         EnsureStopped();
+
+        // Location comes from the actual top frame — the ground truth for
+        // "where the snapshot was taken", and it works even when no stop
+        // event was ever processed (e.g. launch with pause-success).
+        var frame = GetStackTrace(_activeThreadId ?? 1, 0, 1).FirstOrDefault();
+
         var snapshot = new CaptureSnapshot(
             Index: ++_captureIndex,
-            Reason: _lastStop!.Reason,
-            ThreadId: _lastStop.ThreadId,
-            FilePath: _lastStop.FilePath,
-            Line: _lastStop.Line,
-            Variables: GetVariablesForFrame(
-                GetStackTrace(_activeThreadId ?? 1).First().Id,
-                scope, depth),
+            Reason: _lastStop?.Reason,
+            ThreadId: _lastStop?.ThreadId,
+            FilePath: frame?.Source,
+            Line: frame?.Line ?? 0,
+            Variables: frame is null ? [] : GetVariablesForFrame(frame.Id, scope, depth),
             Timestamp: DateTime.UtcNow);
         _captures.Add(snapshot);
         return snapshot;
@@ -513,15 +543,16 @@ public class DebugSession : IDisposable
     // ===================================================================
 
     /// <summary>
-    /// Race <see cref="_pendingStopTcs"/> against a timeout and user cancellation.
+    /// Race <paramref name="stopTcs"/> (already swapped into <see cref="_pendingStopTcs"/>)
+    /// against a timeout and user cancellation.
     /// Returns a <see cref="StopEvent"/> indicating whether a real stop occurred,
     /// the wait timed out, or the user cancelled.
     /// </summary>
     private async Task<StopEvent> WaitForStopInTimespanAsync(
         int timeoutSeconds,
-        CancellationToken ct)
+        CancellationToken ct,
+        TaskCompletionSource<StoppedEvent> stopTcs)
     {
-        var tcs = Volatile.Read(ref _pendingStopTcs);
         var timeoutSpan = timeoutSeconds > 0
             ? TimeSpan.FromSeconds(timeoutSeconds)
             : Timeout.InfiniteTimeSpan;
@@ -530,13 +561,13 @@ public class DebugSession : IDisposable
 
         _logger.LogInformation("WaitForStop: waiting (timeout={Timeout}s)...", timeoutSeconds);
 
-        var completed = await Task.WhenAny(tcs.Task, timeoutTask, cancelTask);
+        var completed = await Task.WhenAny(stopTcs.Task, timeoutTask, cancelTask);
 
-        if (completed == tcs.Task)
+        if (completed == stopTcs.Task)
         {
             _logger.LogInformation("WaitForStop: stop event received");
             if (_stateMachine.Current == SessionState.Exited) return LastStop;
-            return BuildStopEvent(tcs.Task.Result);
+            return BuildStopEvent(stopTcs.Task.Result);
         }
 
         if (_stateMachine.Current == SessionState.Exited)
@@ -576,6 +607,12 @@ public class DebugSession : IDisposable
         if (_stateMachine.Current != SessionState.Stopped && _stateMachine.Current != SessionState.Attaching)
             throw new InvalidOperationException($"Cannot continue: debugger state is {_stateMachine.Current}.");
 
+        // Swap in a fresh stop TCS BEFORE sending the command: any stop that
+        // arrives after this point resolves THIS TCS, so no stop can be missed
+        // between the command and the wait (same pattern as StepAsync).
+        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+
         // Send the right command to get the process running
         if (_stateMachine.Current == SessionState.Attaching)
         {
@@ -590,9 +627,16 @@ public class DebugSession : IDisposable
         {
             _host!.SendRequestSync(new ContinueRequest { ThreadId = _lastStop?.ThreadId ?? 0 });
         }
+
+        // A stop may have arrived while the command was in flight (e.g. a
+        // breakpoint hit immediately after resume). The TCS check is exact:
+        // OnStopped resolves exactly the TCS swapped in above.
+        if (stopTcs.Task.IsCompleted)
+            return LastStop;
+
         _stateMachine.TransitionTo(SessionState.Running);
 
-        return await WaitForStopInTimespanAsync(timeoutSeconds, ct);
+        return await WaitForStopInTimespanAsync(timeoutSeconds, ct, stopTcs);
     }
 
     /// <summary>
@@ -606,7 +650,15 @@ public class DebugSession : IDisposable
         if (_stateMachine.Current != SessionState.Running)
             throw new InvalidOperationException($"Cannot wait: debugger state is {_stateMachine.Current}.");
 
-        return await WaitForStopInTimespanAsync(timeoutSeconds, ct);
+        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+
+        // A stop may have arrived between the state guard and the swap —
+        // report it instead of waiting for the next stop.
+        if (stopTcs.Task.IsCompleted)
+            return LastStop;
+
+        return await WaitForStopInTimespanAsync(timeoutSeconds, ct, stopTcs);
     }
 
     public async Task<StopEvent> StepAsync(
@@ -629,6 +681,7 @@ public class DebugSession : IDisposable
         }
 
         var stopEvent = await stopTcs.Task.WaitAsync(ct);
+        if (_stateMachine.Current == SessionState.Exited) return LastStop;
         return BuildStopEvent(stopEvent);
     }
 
@@ -640,9 +693,14 @@ public class DebugSession : IDisposable
         var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
 
+        // A breakpoint stop may have arrived before the pause was processed.
+        if (stopTcs.Task.IsCompleted)
+            return LastStop;
+
         _host!.SendRequestSync(new PauseRequest());
 
         var stopEvent = await stopTcs.Task.WaitAsync(ct);
+        if (_stateMachine.Current == SessionState.Exited) return LastStop;
         return BuildStopEvent(stopEvent);
     }
 
@@ -800,6 +858,17 @@ public class DebugSession : IDisposable
     public void Disconnect(bool terminateDebuggee = true)
     {
         if (_stateMachine.Current == SessionState.Detached) return;
+
+        // If the process already exited, the adapter session is over — skip
+        // the DisconnectRequest entirely. Sending one after OnExited would
+        // block forever: Cleanup() already stopped the reader thread, so no
+        // response would ever be dispatched.
+        if (_stateMachine.Current == SessionState.Exited)
+        {
+            Cleanup();
+            return;
+        }
+
         try
         {
             _host!.SendRequestSync(new DisconnectRequest { TerminateDebuggee = terminateDebuggee });
@@ -816,7 +885,16 @@ public class DebugSession : IDisposable
         _cleanedUp = true;
 
         _host?.Stop();
-        _host?.WaitForReader();
+        try
+        {
+            _host?.WaitForReader();
+        }
+        catch
+        {
+            // OnExited/OnTerminated run on the reader thread itself, where
+            // joining is forbidden — the host is already stopped, so the
+            // reader drains on its own.
+        }
         _adapter?.Dispose();
         _host = null;
 
@@ -836,34 +914,42 @@ public class DebugSession : IDisposable
         _activeThreadId = e.ThreadId;
         _stateMachine.TransitionTo(SessionState.Stopped);
 
-        // Check if this is a capture-action breakpoint
-        if (e.Reason == StoppedEvent.ReasonValue.Breakpoint
-            && _bpConfigs.Count > 0
-            && ResolveBreakpointAction() is (true, true, var scope, var depth))
+        // Record the stop before any branching: capture snapshots, waiters and
+        // step/pause re-checks all rely on _lastStop being set for every stop.
+        // Assignments happen on the reader thread while the process is frozen
+        // (no Continue has been sent), so there is no concurrent writer.
+        _lastStop = BuildStopEvent(e);
+
+        // Capture-action breakpoints auto-capture and continue without waking
+        // the caller. Resolution must NOT issue DAP requests here — OnStopped
+        // runs on the DAP dispatcher thread where SendRequestSync throws by
+        // design. SharpDbg delivers the hit location in the event itself.
+        if (e.Reason == StoppedEvent.ReasonValue.Breakpoint && _bpConfigs.Count > 0)
         {
-            // Offload capture to thread pool — don't block the DAP reader.
-            // DO NOT touch _pendingStopTcs — caller keeps waiting.
-            var host = _host!;
-            var threadId = e.ThreadId;
-            _ = Task.Run(() =>
+            if (TryResolveCapture(e) is { } capture)
             {
-                try
+                // Offload capture to thread pool — don't block the DAP reader.
+                // DO NOT touch _pendingStopTcs — the caller keeps waiting and
+                // the next stop (or exit) resolves it.
+                _ = Task.Run(() => RunCaptureAndContinueAsync(e.ThreadId, capture.Scope, capture.Depth));
+                _logger.LogInformation("← OnStopped: auto-continue (capture), TCS not touched, thread={ThreadId}", e.ThreadId);
+                return;
+            }
+
+            if (!TryGetHitLocation(e, out _, out _))
+            {
+                // Adapter sent no hit location (format change?) — the safest
+                // failure mode is an explicit stop, not a silent continue.
+                _lastStop = _lastStop with
                 {
-                    CaptureState(scope, depth);
-                    host.SendRequestSync(new ContinueRequest { ThreadId = threadId ?? 0 });
-                    _stateMachine.TransitionTo(SessionState.Running);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Capture auto-continue failed");
-                }
-            });
-            _logger.LogInformation("← OnStopped: auto-continue (capture), TCS not touched, thread={ThreadId}", e.ThreadId);
-            return;
+                    Note = "Stopped at a breakpoint without a hit location, so a capture config " +
+                           "could not be matched — stopping instead of auto-capturing."
+                };
+                _logger.LogWarning("Stopped event without hit location while capture breakpoints are configured; treating as a plain break.");
+            }
         }
 
         // Break-action or non-breakpoint stop: stay stopped, wake caller
-        _lastStop = BuildStopEvent(e);
         var newTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         var old = Interlocked.Exchange(ref _pendingStopTcs, newTcs);
         old.TrySetResult(e);
@@ -871,21 +957,97 @@ public class DebugSession : IDisposable
             e.Reason, e.ThreadId);
     }
 
-    private (bool IsCapture, bool ShouldCapture, string Scope, int Depth) ResolveBreakpointAction()
+    /// <summary>
+    /// Resolve whether a breakpoint stop is a capture-action breakpoint, using
+    /// only the hit location SharpDbg embeds in the stopped event. Pure
+    /// in-memory lookup — safe on the dispatcher thread (no DAP requests).
+    /// Returns null when the event carries no location or no config matches.
+    /// </summary>
+    private CaptureResolution? TryResolveCapture(StoppedEvent e)
     {
-        if (_activeThreadId is null) return (false, false, "all", 0);
+        if (!TryGetHitLocation(e, out var file, out var line))
+            return null;
+
+        return _bpConfigs.TryGetValue((NormalizePath(file), line), out var cfg)
+            && cfg.Action == "capture"
+            ? new CaptureResolution(cfg.CaptureScope ?? "all", cfg.CaptureDepth)
+            : null;
+    }
+
+    /// <summary>
+    /// Read the hit location SharpDbg attaches to breakpoint stopped events
+    /// (source/line/column in the event's AdditionalProperties). Null-safe:
+    /// pause and exception stops carry no location.
+    /// </summary>
+    private static bool TryGetHitLocation(StoppedEvent e, out string file, out int line)
+    {
+        file = "";
+        line = 0;
         try
         {
-            var frames = GetStackTrace(_activeThreadId.Value, 0, 1);
-            if (frames.Count > 0 && frames[0].Source is not null
-                && _bpConfigs.TryGetValue((Path.GetFullPath(frames[0].Source!), frames[0].Line), out var bpCfg))
+            var props = ReadAdditionalProperties(e);
+            if (props is null
+                || !props.TryGetValue("source", out var sourceToken)
+                || sourceToken is not JObject source
+                || source["path"]?.Value<string>() is not { Length: > 0 } path)
             {
-                return (bpCfg.Action == "capture", bpCfg.Action == "capture",
-                    bpCfg.CaptureScope ?? "all", bpCfg.CaptureDepth);
+                return false;
             }
+
+            file = path;
+            line = props.TryGetValue("line", out var lineToken) ? lineToken.Value<int>() : 0;
+            return line > 0;
         }
-        catch { /* ignore lookup errors on DAP reader thread */ }
-        return (false, false, "all", 0);
+        catch
+        {
+            // Adapter format changed — caller decides the fallback behavior.
+            return false;
+        }
+    }
+
+    private static readonly PropertyInfo? AdditionalPropertiesProperty =
+        typeof(ProtocolObject).GetProperty(
+            "AdditionalProperties",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+    private static Dictionary<string, JToken>? ReadAdditionalProperties(DebugEvent e)
+        => AdditionalPropertiesProperty?.GetValue(e) as Dictionary<string, JToken>;
+
+    /// <summary>
+    /// Normalize a source path for capture-config lookup: absolute and, on
+    /// Windows, case-insensitive — the adapter may report paths with different
+    /// casing than the one the agent used to set the breakpoint.
+    /// </summary>
+    private static string NormalizePath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        return OperatingSystem.IsWindows() ? full.ToLowerInvariant() : full;
+    }
+
+    private readonly record struct CaptureResolution(string Scope, int Depth);
+
+    private void RunCaptureAndContinueAsync(int? threadId, string scope, int depth)
+    {
+        try
+        {
+            CaptureState(scope, depth);
+
+            var host = _host;
+            if (host is null || _stateMachine.Current is SessionState.Exited or SessionState.Detached)
+            {
+                _logger.LogWarning("Capture recorded but the session is no longer active — skipping auto-continue.");
+                return;
+            }
+
+            host.SendRequestSync(new ContinueRequest { ThreadId = threadId ?? 0 });
+            _stateMachine.TransitionTo(SessionState.Running);
+        }
+        catch (Exception ex)
+        {
+            // The debuggee may be left paused — log it so the hang is
+            // diagnosable instead of silent.
+            _logger.LogError(ex, "Capture auto-continue failed; the debuggee may remain paused");
+        }
     }
 
     private void OnExited(ExitedEvent e)
@@ -942,14 +1104,18 @@ public class DebugSession : IDisposable
 
     private StopEvent BuildStopEvent(StoppedEvent e)
     {
+        TryGetHitLocation(e, out var file, out var line);
         return new StopEvent(
             "stopped",
             e.ThreadId,
             e.AllThreadsStopped,
             e.Reason.ToString(),
-            null,
-            e.HitBreakpointIds?.FirstOrDefault() ?? 0,
-            0);
+            file,
+            line,
+            0)
+        {
+            HitBreakpointIds = e.HitBreakpointIds
+        };
     }
 }
 
@@ -968,6 +1134,7 @@ public record StopEvent(
 {
     public int? ExitCode { get; init; }
     public string? Note { get; init; }
+    public IReadOnlyList<int>? HitBreakpointIds { get; init; }
 }
 
 public record ThreadInfo(int Id, string Name, bool IsActive);
