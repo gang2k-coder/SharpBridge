@@ -13,6 +13,31 @@ public class InspectionTools(DebugSessionManager manager)
     private readonly DebugSessionManager _manager = manager;
 
     [McpServerTool]
+    [AllowedState(SessionState.Running, SessionState.Stopped)]
+    [Description("List all modules (assemblies) loaded into the debugged process. " +
+        "Modules are reported by SharpDbg as they load (LoadModule callbacks); after attach the list is populated once the program runs — the CLR is frozen during Attaching and no modules are known until the first debug_continue. " +
+        "Use this to check whether a target assembly has loaded (e.g. when a breakpoint stays pending, or to verify which path an assembly was loaded from). " +
+        "Each module has id (module path), name (file name), and path.")]
+    public string ModulesList(
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
+        [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
+    {
+        var session = ResolveSession(processId, processName);
+        var modules = session.GetModules();
+
+        return JsonSerializer.Serialize(new
+        {
+            count = modules.Count,
+            modules = modules.Select(m => new
+            {
+                id = m.Id,
+                name = m.Name,
+                path = m.Path
+            })
+        });
+    }
+
+    [McpServerTool]
     [AllowedState(SessionState.Stopped)]
     [Description("List all threads in the debugged process. " +
         "Requires the debugger to be in Stopped state. " +

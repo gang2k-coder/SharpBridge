@@ -18,6 +18,7 @@ SharpBridge translates MCP tool calls into DAP debug commands, giving AI coding 
 - **Smart attach**: auto-detect single vs. multiple process instances by name
 - **Session management**: `debug_select` to switch default session, `debug_list` to see all active sessions
 - **24 MCP tools**: session management, breakpoints (source + function, with auto-capture), exception breakpoints, execution control, state inspection, and capture snapshots
+- **Module introspection**: `modules_list` shows the modules (assemblies) loaded into the debugged process with their paths — useful for diagnosing pending breakpoints or verifying which assembly was loaded
 - **Smart inspect**: `variables_get` supports scope selection (locals/arguments/all), auto-expand depth, and targeted expansion by name — one call replaces multiple round-trips
 - **Exception breakpoints**: `exception_breakpoints` lists available filters and configures which exceptions cause breaks
 - **Auto-capture**: breakpoints with `action="capture"` auto-capture variables and continue (per `captureScope`/`captureDepth`), accumulating snapshots. `capture_state` / `get_captures` / `clear_captures` manage state snapshots
@@ -264,6 +265,8 @@ Each `DebugSession` runs a `DebugProtocolHost` on a background thread that reads
 - **Function breakpoints cannot target local functions or lambdas**: C# compiles these to compiler-generated names — e.g. `static void SignalLoopEnd()` in top-level statements becomes `<<Main>$>g__SignalLoopEnd|0_0` (the `<>`/`|` characters are reserved and cannot appear in a typed identifier). SharpDbg matches the method name **exactly** against the CLR metadata name (short name only — no namespace/type prefix), while type names support exact or `.TypeName` suffix matching, so a `function_breakpoint_set` for a local function never binds. Use regular methods instead (e.g. `LoopEnd.Signal`). Note that a function breakpoint set before the target module is loaded is reported as unverified and binds automatically when the module loads — `verified=false` at set time is normal in that case.
 
 - **breakpoint_set replaces all breakpoints in a file**: DAP `SetBreakpointsRequest` replaces the entire breakpoint set of a source file, and the `breakpoint_set` MCP tool sends one request per call — setting a second breakpoint in the same file removes the first. For multiple breakpoints in one file they must be sent in a single `SetBreakpointsRequest` (the underlying API supports it, but the MCP tool currently exposes a single breakpoint per call), or spread across different files.
+
+- **Module list reflects LoadModule events only**: `modules_list` is populated from SharpDbg's LoadModule callbacks — modules are only added (no unload tracking), and the list is empty while the CLR is frozen (during `Attaching`, i.e. before the first `debug_continue`). Only id/name/path are available; PDB/symbol status is not exposed by SharpDbg yet.
 
 - **Goto/GotoTargets not yet implemented by SharpDbg**: `HandleGotoRequest` and `HandleGotoTargetsRequest` handlers exist in SharpDbg but their functionality is unclear. Not exposed via SharpBridge.
 
