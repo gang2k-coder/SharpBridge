@@ -114,7 +114,7 @@ try
     var sourceFile = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
         "../../../../TestDebuggee/Program.cs"));
     await client.CallToolAsync("breakpoint_set",
-        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 23 });
+        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 24 });
     await debuggee.StandardInput.WriteLineAsync();
     var contJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
@@ -126,15 +126,15 @@ try
         && stopSource.GetProperty("path").GetString()?.Contains("TestDebuggee") == true;
     Assert(hasStopSource, "Continue response missing hit source location");
     // The breakpoint set while the module wasn't loaded must now be verified,
-    // with the line adjusted from the blank 23 to the executable line 24.
+    // with the line adjusted from the blank 24 to the executable line 25.
     var bpCheckJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
     Assert(bpCheckJson.RootElement.GetProperty("count").GetInt32() == 1, "Expected 1 BP after continue");
     var bpCheck = bpCheckJson.RootElement.GetProperty("breakpoints")[0];
     Assert(bpCheck.GetProperty("status").GetString() == "verified",
         $"Expected verified after module load, got {bpCheck.GetProperty("status").GetString()}");
-    Assert(bpCheck.GetProperty("line").GetInt32() == 24,
-        $"Expected adjusted line 24, got {bpCheck.GetProperty("line").GetInt32()}");
+    Assert(bpCheck.GetProperty("line").GetInt32() == 25,
+        $"Expected adjusted line 25, got {bpCheck.GetProperty("line").GetInt32()}");
     Console.WriteLine($"   threadId={threadId}, alive ✅");
 
     // Test 3b: Modules list (populated after the first continue loaded modules)
@@ -372,7 +372,7 @@ try
     Assert(attach3Json.RootElement.GetProperty("status").GetString() == "attached", "Attach #3 failed");
     await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid3 });
 
-    const int counterLine = 29;   // counter++ inside the loop
+    const int counterLine = 38;   // counter++ inside the loop
     var capSetJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
         {
@@ -490,6 +490,106 @@ try
         Console.WriteLine($"   Rejected as expected ✅");
     }
 
+    // Test 15: Gap stop — stop-ledger delivers the pending stop on the next
+    // continue WITHOUT resuming. Uses a fresh debuggee in --gap mode: it
+    // sleeps 5s before the loop, so a breakpoint on the loop body hits only
+    // AFTER the short continue has timed out (no tool call waiting).
+    tests++; passed++;
+    Console.WriteLine("15. Gap stop (stop-ledger delivery)...");
+    var psi4 = new ProcessStartInfo("dotnet", [debuggeeDll, "--gap"])
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    psi4.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var debuggee4 = Process.Start(psi4)!;
+    int pid4 = debuggee4.Id;
+    var attach4Json = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = pid4 })));
+    Assert(attach4Json.RootElement.GetProperty("status").GetString() == "attached", "Attach #4 failed");
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid4 });
+
+    const int gapCounterLine = 38;   // counter++ inside the loop (after the 5s gap sleep)
+    var gapBpJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_set",
+            new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = gapCounterLine })));
+    var gapBpLine = gapBpJson.RootElement.GetProperty("line").GetInt32();
+
+    await debuggee4.StandardInput.WriteLineAsync();
+    // Short continue: the debuggee is still sleeping — must time out as running.
+    var gapCont1 = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 1 })));
+    Assert(gapCont1.RootElement.GetProperty("status").GetString() == "running",
+        $"Expected running after 1s timeout, got {gapCont1.RootElement.GetProperty("status").GetString()}");
+
+    // Wait until the debuggee announces the gap sleep, then wait past it —
+    // the breakpoint now hits while no tool call is waiting.
+    await WaitForGapSleep(debuggee4);
+
+    // The pending stop must be delivered WITHOUT resuming.
+    var gapCont2 = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 5 })));
+    Assert(gapCont2.RootElement.GetProperty("status").GetString() == "stopped",
+        $"Expected stopped (gap delivery), got {gapCont2.RootElement.GetProperty("status").GetString()}");
+    Assert(gapCont2.RootElement.GetProperty("source").GetProperty("line").GetInt32() == gapBpLine,
+        $"Expected gap delivery at line {gapBpLine}, got {gapCont2.RootElement.GetProperty("source").GetProperty("line").GetInt32()}");
+    var gapNote = gapCont2.RootElement.TryGetProperty("note", out var gapNoteEl) ? gapNoteEl.GetString() : null;
+    Assert(gapNote is not null && gapNote.Contains("NOT been resumed"),
+        "Gap delivery must state the process was not resumed");
+
+    // The next continue actually resumes → normal stop at the next iteration.
+    var gapCont3 = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 10 })));
+    Assert(gapCont3.RootElement.GetProperty("status").GetString() == "stopped",
+        $"Expected normal stop after resume, got {gapCont3.RootElement.GetProperty("status").GetString()}");
+    var gapNote3 = gapCont3.RootElement.TryGetProperty("note", out var gapNote3El) ? gapNote3El.GetString() : null;
+    Assert(string.IsNullOrEmpty(gapNote3), "Normal stop must not carry the gap note");
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid4 });
+    Console.WriteLine("   ✅");
+
+    // Test 16: Gap stop acknowledged via debug_state → the next continue
+    // resumes normally (no re-delivery).
+    tests++; passed++;
+    Console.WriteLine("16. Gap stop + debug_state (acknowledged)...");
+    var psi5 = new ProcessStartInfo("dotnet", [debuggeeDll, "--gap"])
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    psi5.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var debuggee5 = Process.Start(psi5)!;
+    int pid5 = debuggee5.Id;
+    var attach5Json = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = pid5 })));
+    Assert(attach5Json.RootElement.GetProperty("status").GetString() == "attached", "Attach #5 failed");
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid5 });
+    await client.CallToolAsync("breakpoint_set",
+        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = gapCounterLine });
+    await debuggee5.StandardInput.WriteLineAsync();
+    var ackCont1 = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 1 })));
+    Assert(ackCont1.RootElement.GetProperty("status").GetString() == "running",
+        $"Expected running after 1s timeout, got {ackCont1.RootElement.GetProperty("status").GetString()}");
+    await WaitForGapSleep(debuggee5);
+
+    // The client checks the state → acknowledges the stop.
+    var ackState = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_state", new Dictionary<string, object?>())));
+    Assert(ackState.RootElement.GetProperty("state").GetString() == "Stopped",
+        $"Expected Stopped after gap stop, got {ackState.RootElement.GetProperty("state").GetString()}");
+
+    // Next continue resumes normally — no gap note.
+    var ackCont2 = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 10 })));
+    Assert(ackCont2.RootElement.GetProperty("status").GetString() == "stopped",
+        $"Expected normal stop after ack, got {ackCont2.RootElement.GetProperty("status").GetString()}");
+    var ackNote = ackCont2.RootElement.TryGetProperty("note", out var ackNoteEl) ? ackNoteEl.GetString() : null;
+    Assert(string.IsNullOrEmpty(ackNote), "No gap note after debug_state acknowledgment");
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid5 });
+    Console.WriteLine("   ✅");
+
     Console.WriteLine($"\n=== {passed}/{tests} PASSED ===");
 }
 catch (Exception ex)
@@ -501,6 +601,17 @@ catch (Exception ex)
 finally
 {
     if (!debuggee.HasExited) debuggee.Kill();
+}
+
+async Task WaitForGapSleep(Process debuggee)
+{
+    string? line = null;
+    while (line is null || !line.Contains("sleeping 5s"))
+    {
+        line = await debuggee.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(15));
+        Assert(line is not null, "Debuggee stdout ended unexpectedly");
+    }
+    Thread.Sleep(5300);
 }
 
 void Assert(bool condition, string msg)

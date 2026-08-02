@@ -19,7 +19,10 @@ public class ExecutionTools(DebugSessionManager manager)
         "auto-capture variables and continue silently — use get_captures afterwards. " +
         "When a break-action breakpoint or non-breakpoint stop occurs, returns the stop event. " +
         "On timeout, returns status 'running' without pausing — use debug_wait to keep " +
-        "waiting for a breakpoint, or debug_pause to interrupt and inspect state.")]
+        "waiting for a breakpoint, or debug_pause to interrupt and inspect state. " +
+        "If the program stopped while you were not waiting (e.g. after a previous timeout), " +
+        "the pending stop is returned immediately and the program is NOT resumed — " +
+        "inspect it, then call debug_continue again to resume.")]
     public async Task<string> DebugContinue(
         [Description("Maximum seconds to wait before auto-pausing (default: 30). " +
             "Set to 0 for no timeout (NOT recommended if no breakpoints are set!)")] int timeout = 30,
@@ -35,7 +38,9 @@ public class ExecutionTools(DebugSessionManager manager)
     [McpServerTool]
     [AllowedState(SessionState.Stopped)]
     [Description("Step through code: 'over' (next line, don't enter calls), " +
-        "'in' (step into method calls), or 'out' (run until current method returns).")]
+        "'in' (step into method calls), or 'out' (run until current method returns). " +
+        "If the program stopped while you were not waiting, the pending stop is returned " +
+        "instead (nothing is stepped) — call debug_step again to proceed.")]
     public async Task<string> DebugStep(
         [Description("Step type: 'over', 'in', or 'out'")] string type = "over",
         [Description("Thread ID from threads_list. Defaults to the thread that triggered the current stop.")] int? threadId = null,
@@ -67,11 +72,13 @@ public class ExecutionTools(DebugSessionManager manager)
     }
 
     [McpServerTool]
-    [AllowedState(SessionState.Running)]
+    [AllowedState(SessionState.Running, SessionState.Stopped)]
     [Description("Wait for the program to stop (breakpoint hit, exception, exit) " +
         "without sending any execution command. Use when the process is already running " +
         "(e.g. after debug_continue timed out). Returns stop event on break/exit, " +
-        "or running status on timeout.")]
+        "or running status on timeout. " +
+        "If the program already stopped while you were not waiting, returns that stop " +
+        "immediately without waiting.")]
     public async Task<string> DebugWait(
         [Description("Maximum seconds to wait (default: 30)")] int timeout = 30,
         [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,

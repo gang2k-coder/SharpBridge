@@ -98,6 +98,11 @@ public class SessionTools(DebugSessionManager manager)
     {
         var session = ResolveSession(processId, processName);
 
+        // The client has now seen the session state — acknowledge any stop
+        // that occurred while no tool call was waiting, so the next
+        // debug_continue resumes normally instead of re-delivering it.
+        session.ObserveStopState();
+
         return JsonSerializer.Serialize(new
         {
             processId = session.ProcessId,

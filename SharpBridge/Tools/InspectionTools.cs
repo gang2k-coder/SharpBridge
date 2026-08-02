@@ -48,6 +48,7 @@ public class InspectionTools(DebugSessionManager manager)
         [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
         var session = ResolveSession(processId, processName);
+        session.ObserveStopState();
         var threads = session.GetThreads();
 
         return JsonSerializer.Serialize(new
@@ -76,6 +77,7 @@ public class InspectionTools(DebugSessionManager manager)
         [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
         var session = ResolveSession(processId, processName);
+        session.ObserveStopState();
         var frames = session.GetStackTrace(threadId, startFrame, levels);
 
         return JsonSerializer.Serialize(new
@@ -116,6 +118,7 @@ public class InspectionTools(DebugSessionManager manager)
         [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
         var session = ResolveSession(processId, processName);
+        session.ObserveStopState();
         var expandSet = expand is { Length: > 0 } ? new HashSet<string>(expand) : null;
         var variables = session.GetVariablesForFrame(frameId, scope, depth, expandSet);
 
@@ -133,6 +136,7 @@ public class InspectionTools(DebugSessionManager manager)
         [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
         var session = ResolveSession(processId, processName);
+        session.ObserveStopState();
         var variables = session.ExpandVariables(variablesReference);
 
         return FormatVariables(variables, variablesReference);
@@ -150,6 +154,7 @@ public class InspectionTools(DebugSessionManager manager)
         [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
         var session = ResolveSession(processId, processName);
+        session.ObserveStopState();
         var result = await session.EvaluateAsync(expression, frameId);
 
         return JsonSerializer.Serialize(new
@@ -174,6 +179,7 @@ public class InspectionTools(DebugSessionManager manager)
         [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
         var session = ResolveSession(processId, processName);
+        session.ObserveStopState();
         var ex = session.GetExceptionInfo(threadId);
 
         if (ex is null)
@@ -265,6 +271,7 @@ public class InspectionTools(DebugSessionManager manager)
         [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
         var session = ResolveSession(processId, processName);
+        session.ObserveStopState();
         var snapshot = session.CaptureState(scope, depth);
 
         return JsonSerializer.Serialize(new

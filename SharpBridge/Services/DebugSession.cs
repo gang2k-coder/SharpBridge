@@ -41,6 +41,12 @@ public class DebugSession : IDisposable
     private TaskCompletionSource<StoppedEvent> _pendingStopTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     // ===================================================================
+    // Stop ledger — detects stops that occur while no tool call is waiting
+    // ===================================================================
+    private long _stopSequence;
+    private long _lastObservedSeq;
+
+    // ===================================================================
     // Session state
     // ===================================================================
     public SessionState CurrentState => _stateMachine.Current;
@@ -161,6 +167,10 @@ public class DebugSession : IDisposable
 
         ProcessName = Path.GetFileNameWithoutExtension(program);
 
+        // New process lifecycle — drop any stop ledger state from a previous
+        // process so its stops cannot surface in this session.
+        ResetStopLedger();
+
         var launchArgs = new Dictionary<string, JToken>
         {
             ["program"] = program,
@@ -195,6 +205,7 @@ public class DebugSession : IDisposable
             {
                 await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
                 _logger.LogInformation("Launch: stopped at entry.");
+                ObserveStopState();
                 // The wait may have been resolved by the process exiting
                 // (fast-exiting debuggees) — do not force Stopped in that case.
                 if (_stateMachine.Current == SessionState.Exited)
@@ -230,6 +241,7 @@ public class DebugSession : IDisposable
             {
                 await pauseTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
                 _logger.LogInformation("Pause succeeded.");
+                ObserveStopState();
                 // The pause wait may have been resolved by the process exiting.
                 if (_stateMachine.Current is SessionState.Exited or SessionState.Stopped) return;
                 _stateMachine.TransitionTo(SessionState.Stopped);
@@ -254,6 +266,10 @@ public class DebugSession : IDisposable
     {
         // if (CurrentState != State.NotStarted)
         //     throw new InvalidOperationException("Session not in correct state for attach.");
+
+        // New process lifecycle — drop any stop ledger state from a previous
+        // process so its stops cannot surface in this session.
+        ResetStopLedger();
 
         ProcessId = processId;
         try
@@ -610,6 +626,32 @@ public class DebugSession : IDisposable
     }
 
     // ===================================================================
+    // Stop ledger — detects stops that occur while no tool call is waiting
+    // ===================================================================
+
+    /// <summary>
+    /// True when a stop (breakpoint, exception, pause) occurred after the
+    /// last time the client could have observed the session state — i.e.
+    /// during the gap between a timed-out/cancelled wait and the next tool call.
+    /// </summary>
+    public bool HasUnobservedStop
+        => Interlocked.Read(ref _stopSequence) > Interlocked.Read(ref _lastObservedSeq);
+
+    /// <summary>
+    /// Mark the current stop sequence as observed by the client. Called when a
+    /// stop is delivered to the client (all delivery paths) and when
+    /// state-revealing tools (debug_state, inspection) return.
+    /// </summary>
+    public void ObserveStopState()
+        => Interlocked.Exchange(ref _lastObservedSeq, Interlocked.Read(ref _stopSequence));
+
+    private void ResetStopLedger()
+    {
+        Interlocked.Exchange(ref _stopSequence, 0);
+        Interlocked.Exchange(ref _lastObservedSeq, 0);
+    }
+
+    // ===================================================================
     // Execution Control
     // ===================================================================
 
@@ -634,9 +676,13 @@ public class DebugSession : IDisposable
 
         var completed = await Task.WhenAny(stopTcs.Task, timeoutTask, cancelTask);
 
-        if (completed == stopTcs.Task)
+        // Tie-safe: a stop completing at the same instant as the timeout still
+        // counts as a delivered stop — never report "running" when a stop
+        // event is already available.
+        if (completed == stopTcs.Task || stopTcs.Task.IsCompleted)
         {
             _logger.LogInformation("WaitForStop: stop event received");
+            ObserveStopState();
             if (_stateMachine.Current == SessionState.Exited) return LastStop;
             return BuildStopEvent(stopTcs.Task.Result);
         }
@@ -684,6 +730,22 @@ public class DebugSession : IDisposable
         var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
 
+        // The debuggee may have stopped while no tool call was waiting (e.g.
+        // after a timed-out continue). Deliver the stop instead of resuming
+        // past it — the client decides whether to resume with another call.
+        if (HasUnobservedStop && _lastStop is { } missedStop)
+        {
+            ObserveStopState();
+            _logger.LogInformation("Continue: delivering stop that occurred while not waiting (line={Line})",
+                missedStop.Line);
+            return missedStop with
+            {
+                Note = "The debuggee stopped while you were not waiting; it has NOT been resumed. " +
+                       "Inspect with debug_state / stacktrace_get / variables_get, " +
+                       "then call debug_continue again to resume."
+            };
+        }
+
         // Send the right command to get the process running
         if (_stateMachine.Current == SessionState.Attaching)
         {
@@ -718,11 +780,26 @@ public class DebugSession : IDisposable
         int timeoutSeconds = 30,
         CancellationToken ct = default)
     {
-        if (_stateMachine.Current != SessionState.Running)
+        // Waiting is also valid when a stop already occurred while no tool
+        // call was waiting — the client asked to wait for a stop, and one is
+        // already there. Otherwise the debuggee must be running.
+        if (_stateMachine.Current != SessionState.Running && !HasUnobservedStop)
             throw new InvalidOperationException($"Cannot wait: debugger state is {_stateMachine.Current}.");
 
         var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+
+        if (HasUnobservedStop && _lastStop is { } missedStop)
+        {
+            ObserveStopState();
+            _logger.LogInformation("Wait: delivering stop that occurred while not waiting (line={Line})",
+                missedStop.Line);
+            return missedStop with
+            {
+                Note = "The debuggee stopped while you were not waiting; it has NOT been resumed. " +
+                       "Call debug_continue to resume."
+            };
+        }
 
         // A stop may have arrived between the state guard and the swap —
         // report it instead of waiting for the next stop.
@@ -738,11 +815,25 @@ public class DebugSession : IDisposable
         if (_stateMachine.Current != SessionState.Stopped)
             throw new InvalidOperationException($"Cannot step: debugger state is {_stateMachine.Current}.");
 
-        _stateMachine.TransitionTo(SessionState.Running);
-        var tid = threadId ?? _lastStop?.ThreadId ?? 1;
-
         var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+
+        // The debuggee may have stopped while no tool call was waiting —
+        // deliver the stop instead of stepping past it.
+        if (HasUnobservedStop && _lastStop is { } missedStop)
+        {
+            ObserveStopState();
+            _logger.LogInformation("Step: delivering stop that occurred while not waiting (line={Line})",
+                missedStop.Line);
+            return missedStop with
+            {
+                Note = "The debuggee stopped while you were not waiting; nothing was stepped. " +
+                       "Call debug_step again to proceed, or debug_continue to resume."
+            };
+        }
+
+        _stateMachine.TransitionTo(SessionState.Running);
+        var tid = threadId ?? _lastStop?.ThreadId ?? 1;
 
         switch (type)
         {
@@ -752,6 +843,7 @@ public class DebugSession : IDisposable
         }
 
         var stopEvent = await stopTcs.Task.WaitAsync(ct);
+        ObserveStopState();
         if (_stateMachine.Current == SessionState.Exited) return LastStop;
         return BuildStopEvent(stopEvent);
     }
@@ -764,6 +856,19 @@ public class DebugSession : IDisposable
         var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
 
+        // The debuggee may have stopped on its own while no tool call was
+        // waiting — pausing is then unnecessary; deliver the stop instead.
+        if (HasUnobservedStop && _lastStop is { } missedStop)
+        {
+            ObserveStopState();
+            _logger.LogInformation("Pause: delivering stop that occurred while not waiting (line={Line})",
+                missedStop.Line);
+            return missedStop with
+            {
+                Note = "The debuggee stopped on its own while you were not waiting; no pause was sent."
+            };
+        }
+
         // A breakpoint stop may have arrived before the pause was processed.
         if (stopTcs.Task.IsCompleted)
             return LastStop;
@@ -771,6 +876,7 @@ public class DebugSession : IDisposable
         _host!.SendRequestSync(new PauseRequest());
 
         var stopEvent = await stopTcs.Task.WaitAsync(ct);
+        ObserveStopState();
         if (_stateMachine.Current == SessionState.Exited) return LastStop;
         return BuildStopEvent(stopEvent);
     }
@@ -1099,7 +1205,11 @@ public class DebugSession : IDisposable
             }
         }
 
-        // Break-action or non-breakpoint stop: stay stopped, wake caller
+        // Break-action or non-breakpoint stop: stay stopped, wake caller.
+        // Bump the stop ledger — every non-capture stop counts (capture stops
+        // return earlier and stay silent by design).
+        Interlocked.Increment(ref _stopSequence);
+
         var newTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         var old = Interlocked.Exchange(ref _pendingStopTcs, newTcs);
         old.TrySetResult(e);

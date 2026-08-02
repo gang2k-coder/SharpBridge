@@ -5,6 +5,7 @@ using System.Diagnostics;
 // Check for --throw mode and --no-wait (skip ReadLine for launch tests)
 bool throwMode = args.Length > 0 && args[0] == "--throw";
 bool noWait = args.Length > 0 && args[0] == "--no-wait";
+bool gapMode = args.Length > 0 && args[0] == "--gap";
 
 // Show PID for attach and pause to give time to connect
 Console.WriteLine($"PID: {Environment.ProcessId}");
@@ -22,6 +23,14 @@ string message = "Hello from debuggee!";
 var numbers = new List<int> { 10, 20, 30, 40, 50 };
 
 Console.WriteLine($"Starting loop with {numbers.Count} items...");
+
+// Gap mode: sleep before the loop so a breakpoint hit falls into the
+// "no tool call waiting" window (used by the stop-ledger tests).
+if (gapMode)
+{
+    Console.WriteLine("Gap mode: sleeping 5s before the loop...");
+    Thread.Sleep(5000);
+}
 
 // Loop — set breakpoints here to test continue/step
 for (int i = 0; i < numbers.Count; i++)

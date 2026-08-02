@@ -58,9 +58,9 @@ try
     Console.WriteLine();
 
     // === Step 2: Set breakpoint ===
-    Console.WriteLine("2. Setting breakpoint on line 23 (for loop)...");
+    Console.WriteLine("2. Setting breakpoint on line 24 (blank → adjusted to 25, before the loop)...");
     var bps = session.SetBreakpoints(sourceFile,
-        (Line: 23, Column: null, Condition: null, HitCondition: null,
+        (Line: 24, Column: null, Condition: null, HitCondition: null,
          Action: "break", CaptureScope: null, CaptureDepth: 0));
     var bp = bps[0];
     Console.WriteLine($"   ID={bp.Id}, Verified={bp.Verified}, Line={bp.Line}");
@@ -312,7 +312,7 @@ try
 
     // === Step 15: Capture breakpoint on a non-executable line ===
     // A capture breakpoint set before the module loads binds at an ADJUSTED
-    // line (blank 23 -> executable 24). The BreakpointEvent handler must
+    // line (blank 24 -> executable 25). The BreakpointEvent handler must
     // re-key the capture config, otherwise the auto-capture silently
     // degrades to a plain break (blind spot ④).
     Console.WriteLine("15. Capture bp on blank line (adjusted-line auto-capture)...");
@@ -328,7 +328,7 @@ try
     using var session2 = new DebugSession(loggerFactory.CreateLogger<DebugSession>());
     await session2.AttachAsync(pid2);
     var capBps = session2.SetBreakpoints(sourceFile,
-        (Line: 23, Column: null, Condition: null, HitCondition: null,
+        (Line: 24, Column: null, Condition: null, HitCondition: null,
          Action: "capture", CaptureScope: "all", CaptureDepth: 0));
     var capBp = capBps[0];
     Assert(!capBp.Verified && capBp.IsPending,
@@ -343,7 +343,7 @@ try
     // BreakpointEvent sync: verified + adjusted line
     var boundBp = session2.GetAllBreakpoints()[0];
     Assert(boundBp.Verified, "Expected verified after module load");
-    Assert(boundBp.Line == 24, $"Expected adjusted line 24, got {boundBp.Line}");
+    Assert(boundBp.Line == 25, $"Expected adjusted line 25, got {boundBp.Line}");
     Assert(DebugSession.BreakpointStatus(boundBp) == "verified", "Expected status 'verified'");
 
     // Capture fired at the ADJUSTED line (the blind-spot fix)
@@ -351,12 +351,140 @@ try
     Assert(capCaps2.Count == 1, $"Expected 1 capture, got {capCaps2.Count}");
     Assert(capCaps2[0].FilePath is not null && capCaps2[0].FilePath.Contains("TestDebuggee"),
         "Capture missing source path");
-    Assert(capCaps2[0].Line == 24, $"Expected capture at adjusted line 24, got {capCaps2[0].Line}");
+    Assert(capCaps2[0].Line == 25, $"Expected capture at adjusted line 25, got {capCaps2[0].Line}");
     var counterVar = capCaps2[0].Variables.FirstOrDefault(v => v.Name == "counter");
     Assert(counterVar is not null && counterVar.Value == "0",
         $"Expected counter=0 at line 24, got {counterVar?.Value}");
-    Console.WriteLine("   ✅ PASS (pending → verified at line 24, capture fired, auto-continued to exit)");
+    Console.WriteLine("   ✅ PASS (pending → verified at line 25, capture fired, auto-continued to exit)");
     Console.WriteLine();
+
+    // === Step 16: Gap stop — stop-ledger delivers on the next continue ===
+    // A breakpoint hit while NO tool call is waiting (after a timed-out
+    // continue) must be delivered on the next continue WITHOUT resuming.
+    Console.WriteLine("16. Gap stop (stop-ledger delivery)...");
+    var psi3 = new ProcessStartInfo("dotnet", [debuggeeDll, "--gap"])
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    psi3.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var debuggee3 = Process.Start(psi3)!;
+    int pid3 = debuggee3.Id;
+
+    using var session3 = new DebugSession(loggerFactory.CreateLogger<DebugSession>());
+    await session3.AttachAsync(pid3);
+    const int gapLine = 38;   // counter++ inside the loop, after the 5s gap sleep
+    session3.SetBreakpoints(sourceFile,
+        (Line: gapLine, Column: null, Condition: null, HitCondition: null,
+         Action: "break", CaptureScope: null, CaptureDepth: 0));
+
+    await debuggee3.StandardInput.WriteLineAsync();
+    var gapRun = await session3.ContinueAndWaitAsync(timeoutSeconds: 1);
+    Assert(gapRun.Status == "running", $"Expected running after 1s timeout, got {gapRun.Status}");
+
+    // Poll the ledger itself — deterministic, no timing guesses.
+    var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+    while (!session3.HasUnobservedStop && DateTime.UtcNow < deadline)
+        await Task.Delay(100);
+    Assert(session3.HasUnobservedStop, "Gap stop never arrived");
+
+    var gapStop = await session3.ContinueAndWaitAsync(timeoutSeconds: 5);
+    Assert(gapStop.Status == "stopped", $"Expected stopped (gap delivery), got {gapStop.Status}");
+    Assert(gapStop.Line == gapLine, $"Expected gap delivery at line {gapLine}, got {gapStop.Line}");
+    Assert(gapStop.Note is not null && gapStop.Note.Contains("NOT been resumed"),
+        "Gap delivery must state the process was not resumed");
+    Assert(!session3.HasUnobservedStop, "Gap delivery must consume the ledger");
+    Assert(session3.CurrentState == SessionState.Stopped, "State must be Stopped after gap delivery");
+
+    // Second continue actually resumes → normal stop at the next iteration.
+    var gapNext = await session3.ContinueAndWaitAsync(timeoutSeconds: 10);
+    Assert(gapNext.Status == "stopped", $"Expected normal stop, got {gapNext.Status}");
+    Assert(gapNext.Line == gapLine, $"Expected line {gapLine}, got {gapNext.Line}");
+    Assert(string.IsNullOrEmpty(gapNext.Note), "Normal stop must not carry the gap note");
+    Console.WriteLine("   ✅ PASS (delivered without resuming; next continue resumed)");
+    Console.WriteLine();
+
+    // === Step 17: Gap stop via debug_wait (returns it instead of throwing) ===
+    Console.WriteLine("17. Gap stop via debug_wait...");
+    var psi4 = new ProcessStartInfo("dotnet", [debuggeeDll, "--gap"])
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    psi4.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var debuggee4 = Process.Start(psi4)!;
+    int pid4 = debuggee4.Id;
+
+    using var session4 = new DebugSession(loggerFactory.CreateLogger<DebugSession>());
+    await session4.AttachAsync(pid4);
+    session4.SetBreakpoints(sourceFile,
+        (Line: gapLine, Column: null, Condition: null, HitCondition: null,
+         Action: "break", CaptureScope: null, CaptureDepth: 0));
+    await debuggee4.StandardInput.WriteLineAsync();
+    var waitRun = await session4.ContinueAndWaitAsync(timeoutSeconds: 1);
+    Assert(waitRun.Status == "running", $"Expected running after 1s timeout, got {waitRun.Status}");
+
+    var deadline4 = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+    while (!session4.HasUnobservedStop && DateTime.UtcNow < deadline4)
+        await Task.Delay(100);
+    Assert(session4.HasUnobservedStop, "Gap stop never arrived");
+
+    // debug_wait must return the pending stop instead of throwing (the old
+    // guard required Running and rejected Stopped).
+    var waitStop = await session4.WaitAndWaitAsync(timeoutSeconds: 5);
+    Assert(waitStop.Status == "stopped", $"Expected stopped from debug_wait, got {waitStop.Status}");
+    Assert(waitStop.Line == gapLine, $"Expected line {gapLine}, got {waitStop.Line}");
+    Assert(waitStop.Note is not null && waitStop.Note.Contains("NOT been resumed"),
+        "debug_wait delivery must state the process was not resumed");
+    Assert(!session4.HasUnobservedStop, "debug_wait delivery must consume the ledger");
+    // Resume to finish cleanly.
+    await session4.ContinueAndWaitAsync(timeoutSeconds: 10);
+    Console.WriteLine("   ✅ PASS (debug_wait returned the pending stop)");
+    Console.WriteLine();
+
+    // === Step 18: Gap stop acknowledged via ObserveStopState (debug_state) ===
+    Console.WriteLine("18. Gap stop acknowledged by state observation...");
+    var psi5 = new ProcessStartInfo("dotnet", [debuggeeDll, "--gap"])
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    psi5.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var debuggee5 = Process.Start(psi5)!;
+    int pid5 = debuggee5.Id;
+
+    using var session5 = new DebugSession(loggerFactory.CreateLogger<DebugSession>());
+    await session5.AttachAsync(pid5);
+    session5.SetBreakpoints(sourceFile,
+        (Line: gapLine, Column: null, Condition: null, HitCondition: null,
+         Action: "break", CaptureScope: null, CaptureDepth: 0));
+    await debuggee5.StandardInput.WriteLineAsync();
+    var ackRun = await session5.ContinueAndWaitAsync(timeoutSeconds: 1);
+    Assert(ackRun.Status == "running", $"Expected running after 1s timeout, got {ackRun.Status}");
+
+    var deadline5 = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+    while (!session5.HasUnobservedStop && DateTime.UtcNow < deadline5)
+        await Task.Delay(100);
+    Assert(session5.HasUnobservedStop, "Gap stop never arrived");
+
+    // Simulate the client checking debug_state (which calls ObserveStopState).
+    session5.ObserveStopState();
+    Assert(!session5.HasUnobservedStop, "ObserveStopState must consume the ledger");
+
+    // Next continue resumes normally — no gap note.
+    var ackStop = await session5.ContinueAndWaitAsync(timeoutSeconds: 10);
+    Assert(ackStop.Status == "stopped", $"Expected normal stop, got {ackStop.Status}");
+    Assert(string.IsNullOrEmpty(ackStop.Note), "No gap note after acknowledgment");
+    Console.WriteLine("   ✅ PASS (next continue resumed normally)");
+    Console.WriteLine();
+
+    // Cleanup gap sessions
+    session3.Disconnect(terminateDebuggee: true);
+    session4.Disconnect(terminateDebuggee: true);
+    session5.Disconnect(terminateDebuggee: true);
+    if (!debuggee3.HasExited) debuggee3.Kill();
+    if (!debuggee4.HasExited) debuggee4.Kill();
+    if (!debuggee5.HasExited) debuggee5.Kill();
 
     Console.WriteLine("=== ALL TESTS PASSED ✅ ===");
 }
