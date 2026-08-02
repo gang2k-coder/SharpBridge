@@ -199,8 +199,11 @@ public class DebugSession : IDisposable
 
         if (stopAtEntry)
         {
-            // SharpDbg 0.1.4 does NOT send StoppedEvent after launch.
-            // Try a brief wait in case a future version adds this, then fall back.
+            // SharpDbg does NOT implement stopAtEntry (no entry StoppedEvent is
+            // sent after ConfigurationDone). Wait briefly in case a future
+            // version adds the event, then return the HONEST state: if a stop
+            // arrived → Stopped (OnStopped already transitioned); otherwise the
+            // process is running. Never fabricate a stopped state.
             try
             {
                 await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
@@ -216,49 +219,10 @@ public class DebugSession : IDisposable
                 _stateMachine.TransitionTo(SessionState.Stopped);
                 return;
             }
-            catch (TimeoutException) { }
-
-            _logger.LogInformation("Launch: no StoppedEvent — trying pause to force stopAtEntry.");
-            await ForceStopAfterLaunch(ct);
-        }
-    }
-
-    private async Task ForceStopAfterLaunch(CancellationToken ct)
-    {
-        var delays = new[] { 0, 200, 500 };
-        for (int i = 0; i < delays.Length; i++)
-        {
-            if (i > 0) await Task.Delay(delays[i], ct);
-
-            if (_stateMachine.Current is SessionState.Exited or SessionState.Stopped) return;
-
-            var pauseTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
-            Interlocked.Exchange(ref _pendingStopTcs, pauseTcs);
-
-            _host!.SendRequestSync(new PauseRequest());
-
-            try
+            catch (TimeoutException)
             {
-                await pauseTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
-                _logger.LogInformation("Pause succeeded.");
-                ObserveStopState();
-                // The pause wait may have been resolved by the process exiting.
-                if (_stateMachine.Current is SessionState.Exited or SessionState.Stopped) return;
-                _stateMachine.TransitionTo(SessionState.Stopped);
-                return;
+                _logger.LogInformation("Launch: no entry StoppedEvent — returning with the process running.");
             }
-            catch (TimeoutException) { }
-        }
-
-        if (_stateMachine.Current == SessionState.Running)
-        {
-            _logger.LogInformation("Pause did not respond — synthesizing stopped state.");
-            _stateMachine.TransitionTo(SessionState.Stopped);
-            _lastStop = new StopEvent("stopped", null, true, "entry", null, 0, 0)
-            {
-                Note = "Process is running (did not respond to pause). " +
-                       "Set breakpoints and use debug_continue to reach them."
-            };
         }
     }
 
@@ -327,6 +291,11 @@ public class DebugSession : IDisposable
     private readonly Dictionary<(string File, int Line), BreakpointEntry> _bpConfigs = [];
     private readonly Dictionary<int, BreakpointEntry> _bpsByAdapterId = [];
 
+    /// <summary>Normalized path → the FIRST path form used to set breakpoints in that file.
+    /// SharpDbg keys breakpoint sets per source path string, so every re-send must use the
+    /// same form — otherwise the adapter keeps parallel sets for the same file."</summary>
+    private readonly Dictionary<string, string> _canonicalPaths = [];
+
     /// <summary>Modules reported by SharpDbg via ModuleEvent, keyed by module id (the module path).
     /// Populated from LoadModule callbacks — empty while the CLR is frozen (Attaching) and cleared on cleanup.</summary>
     private readonly Dictionary<string, LoadedModule> _modules = [];
@@ -336,11 +305,22 @@ public class DebugSession : IDisposable
         params (int Line, int? Column, string? Condition, string? HitCondition,
                 string Action, string? CaptureScope, int CaptureDepth)[] breakpoints)
     {
-        _breakpointsByFile.Remove(filePath);
+        var normalizedFile = NormalizePath(filePath);
+        // The FIRST path form wins for the adapter: re-sends must target the
+        // same source-path key, otherwise SharpDbg keeps parallel breakpoint
+        // sets for the same file (e.g. relative vs absolute, case differences).
+        if (!_canonicalPaths.TryGetValue(normalizedFile, out var canonicalPath))
+        {
+            canonicalPath = filePath;
+            _canonicalPaths[normalizedFile] = canonicalPath;
+        }
+
+        // Key the file registry by the NORMALIZED path so relative vs absolute
+        // or differently-cased paths for the same file never produce two entries.
+        _breakpointsByFile.Remove(normalizedFile);
 
         // Drop stale capture configs for this file — the set below replaces
         // all breakpoints in it, so old configs must not survive.
-        var normalizedFile = NormalizePath(filePath);
         foreach (var staleKey in _bpConfigs.Keys.Where(k => k.File == normalizedFile).ToList())
             _bpConfigs.Remove(staleKey);
 
@@ -351,7 +331,7 @@ public class DebugSession : IDisposable
         {
             var entry = new BreakpointEntry(
                 Id: _nextBreakpointId++,
-                FilePath: filePath,
+                FilePath: canonicalPath,
                 Line: line,
                 Column: col,
                 Condition: cond,
@@ -384,11 +364,11 @@ public class DebugSession : IDisposable
             sourceBreakpoints.Add(sbp);
         }
 
-        _breakpointsByFile[filePath] = entries;
+        _breakpointsByFile[normalizedFile] = entries;
 
         var response = _host!.SendRequestSync(new SetBreakpointsRequest
         {
-            Source = new Source { Path = filePath },
+            Source = new Source { Path = canonicalPath },
             Breakpoints = sourceBreakpoints
         });
 
@@ -534,18 +514,23 @@ public class DebugSession : IDisposable
                 // Drop any capture config for this breakpoint so a stale
                 // auto-continue doesn't fire if the line is re-set as "break".
                 _bpConfigs.Remove((NormalizePath(file), entry.Line));
+                // Re-send with the ORIGINAL path the breakpoints were set
+                // with: SharpDbg keys breakpoint sets per source path, so a
+                // normalized (lower-cased) path would be treated as a DIFFERENT
+                // file and the old set (including the removed bp) would linger.
+                var originalPath = entry.FilePath;
                 if (entries.Count == 0)
                 {
                     _breakpointsByFile.Remove(file);
                     _host!.SendRequestSync(new SetBreakpointsRequest
                     {
-                        Source = new Source { Path = file },
+                        Source = new Source { Path = originalPath },
                         Breakpoints = new List<SourceBreakpoint>()
                     });
                 }
                 else
                 {
-                    SetBreakpoints(file, entries.Select(e =>
+                    SetBreakpoints(originalPath, entries.Select(e =>
                         (e.Line, e.Column, e.Condition, e.HitCondition,
                          e.Action, e.CaptureScope, e.CaptureDepth)).ToArray());
                 }
@@ -649,6 +634,9 @@ public class DebugSession : IDisposable
     {
         Interlocked.Exchange(ref _stopSequence, 0);
         Interlocked.Exchange(ref _lastObservedSeq, 0);
+        // New process lifecycle: drop canonical path forms from the previous
+        // process (the new process may live at a different path).
+        _canonicalPaths.Clear();
     }
 
     // ===================================================================
@@ -842,7 +830,19 @@ public class DebugSession : IDisposable
             default: _host!.SendRequestSync(new NextRequest(tid)); break;
         }
 
-        var stopEvent = await stopTcs.Task.WaitAsync(ct);
+        StoppedEvent stopEvent;
+        try
+        {
+            stopEvent = await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
+        }
+        catch (TimeoutException)
+        {
+            // The step command was sent and the process resumed — a stop that
+            // arrives later is caught by the stop ledger (gap delivery).
+            throw new TimeoutException(
+                "Step did not stop the process within 2s — the debuggee may be stuck. " +
+                "Use debug_state to check, debug_wait to keep waiting, or debug_pause to interrupt.");
+        }
         ObserveStopState();
         if (_stateMachine.Current == SessionState.Exited) return LastStop;
         return BuildStopEvent(stopEvent);
@@ -875,7 +875,19 @@ public class DebugSession : IDisposable
 
         _host!.SendRequestSync(new PauseRequest());
 
-        var stopEvent = await stopTcs.Task.WaitAsync(ct);
+        StoppedEvent stopEvent;
+        try
+        {
+            stopEvent = await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
+        }
+        catch (TimeoutException)
+        {
+            // The process keeps running — a stop that arrives later is caught
+            // by the stop ledger (gap delivery).
+            throw new TimeoutException(
+                "Pause did not stop the process within 2s — the debuggee may not respond to pause. " +
+                "Use debug_state to check, or debug_wait to keep waiting.");
+        }
         ObserveStopState();
         if (_stateMachine.Current == SessionState.Exited) return LastStop;
         return BuildStopEvent(stopEvent);

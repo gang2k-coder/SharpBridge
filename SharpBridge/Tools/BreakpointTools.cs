@@ -15,9 +15,14 @@ public class BreakpointTools(DebugSessionManager manager)
     [McpServerTool]
     [AllowedState(SessionState.Attaching, SessionState.Stopped, SessionState.Running)]
     [Description("Set a breakpoint at a specific file and line. " +
+        "Multiple breakpoints in the same file ACCUMULATE — each call adds a " +
+        "breakpoint and never replaces existing ones in that file. " +
         "Supports conditional breakpoints, hit count conditions, and capture action. " +
         "action='break' (default) stops and waits; action='capture' auto-captures " +
         "variables (per captureScope/captureDepth) and continues without stopping. " +
+        "NOTE: setting breakpoints re-sends the file's breakpoints to the adapter, which " +
+        "refreshes all breakpoint IDs in that file — always use the IDs from the latest " +
+        "response or breakpoint_list. " +
         "Returns the breakpoint ID for later removal.")]
     public string BreakpointSet(
         [Description("Path to the source file (absolute or relative to the debugged program)")] string filePath,
@@ -33,9 +38,19 @@ public class BreakpointTools(DebugSessionManager manager)
     {
         var session = ResolveSession(processId, processName);
 
-        var entries = session.SetBreakpoints(filePath,
-            (line, column, condition, hitCondition, action, captureScope, captureDepth));
-        var entry = entries.FirstOrDefault()!;
+        // DAP replaces all source breakpoints per file on each call — preserve
+        // existing breakpoints in the file (same pattern as function bps).
+        // Re-set with the CURRENT (possibly adapter-adjusted) line and keep the
+        // original action/conditions so nothing is silently dropped.
+        var existing = session.GetAllBreakpoints()
+            .Where(bp => bp.FunctionName is null && NormalizePath(bp.FilePath) == NormalizePath(filePath))
+            .Select(bp => (bp.Line, bp.Column, bp.Condition, bp.HitCondition,
+                           bp.Action, bp.CaptureScope, bp.CaptureDepth))
+            .ToList();
+        existing.Add((line, column, condition, hitCondition, action, captureScope, captureDepth));
+
+        var entries = session.SetBreakpoints(filePath, existing.ToArray());
+        var entry = entries.Last(); // the one just added
 
         var status = DebugSession.BreakpointStatus(entry);
         return JsonSerializer.Serialize(new
@@ -57,6 +72,7 @@ public class BreakpointTools(DebugSessionManager manager)
             action = entry.Action,
             captureScope = entry.CaptureScope,
             captureDepth = entry.CaptureDepth,
+            fileBreakpointCount = entries.Count,
             hint = status switch
             {
                 "pending" => "Breakpoint is pending: it will bind automatically when the module loads (verified will flip to true).",
@@ -84,6 +100,7 @@ public class BreakpointTools(DebugSessionManager manager)
         "Method name matches EXACTLY (case-sensitive, no wildcards); type segment matches exactly or by '.TypeName' suffix.\n" +
         "Requires the target module's PDB; binds at method entry. Set before the module loads → reported pending, binds automatically on load.\n" +
         "LIMITATION: local functions and lambdas cannot be targeted — the compiler mangles them (e.g. <<Main>$>g__SignalLoopEnd|0_0) and '<>'/'|' are reserved; use regular methods.\n" +
+        "NOTE: each call re-sends ALL function breakpoints, refreshing their IDs — use the returned ID.\n" +
         "Returns the breakpoint ID for later removal with breakpoint_remove.")]
     public string FunctionBreakpointSet(
         [Description("Function name pattern. Examples:\n" +
@@ -136,7 +153,10 @@ public class BreakpointTools(DebugSessionManager manager)
 
     [McpServerTool]
     [AllowedState(SessionState.Attaching, SessionState.Stopped, SessionState.Running)]
-    [Description("Remove a breakpoint by its ID (returned from breakpoint_set).")]
+    [Description("Remove a breakpoint by its ID (returned from breakpoint_set). " +
+        "Removing re-sends the remaining breakpoints in the same file (or all function " +
+        "breakpoints for a function bp), so their IDs refresh — use breakpoint_list " +
+        "for current IDs.")]
     public string BreakpointRemove(
         [Description("The breakpoint ID to remove")] int id,
         [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
@@ -199,5 +219,11 @@ public class BreakpointTools(DebugSessionManager manager)
         if (!string.IsNullOrWhiteSpace(processName))
             return _manager.Resolve(processName);
         return _manager.Resolve(processId: null);
+    }
+
+    private static string NormalizePath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        return OperatingSystem.IsWindows() ? full.ToLowerInvariant() : full;
     }
 }

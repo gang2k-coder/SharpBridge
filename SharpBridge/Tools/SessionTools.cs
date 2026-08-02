@@ -18,7 +18,9 @@ public class SessionTools(DebugSessionManager manager)
         [Description("Path to the .NET DLL to debug (e.g. bin/Debug/net10.0/MyApp.dll)")] string program,
         [Description("Command-line arguments for the program")] string[]? args = null,
         [Description("Working directory for the launched process")] string? cwd = null,
-        [Description("Whether to stop at the program entry point (default: true)")] bool stopAtEntry = true,
+        [Description("Whether to wait up to 2s for an entry-point stop (default: true). " +
+            "SharpDbg currently does not implement stopAtEntry, so launch usually returns " +
+            "running — set breakpoints and use debug_continue.")] bool stopAtEntry = true,
         [Description("Environment variables for the launched process")] Dictionary<string, string>? env = null)
     {
         var result = await _manager.CreateAndLaunchAsync(program, args, cwd, stopAtEntry, env);

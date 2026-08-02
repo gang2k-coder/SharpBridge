@@ -590,6 +590,57 @@ try
         new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid5 });
     Console.WriteLine("   ✅");
 
+    // Test 17: Incremental breakpoint_set — same-file bps accumulate
+    tests++; passed++;
+    Console.WriteLine("17. Incremental breakpoint_set (same-file accumulate)...");
+    var psi6 = new ProcessStartInfo("dotnet", [debuggeeDll])
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    psi6.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var debuggee6 = Process.Start(psi6)!;
+    int pid6 = debuggee6.Id;
+    var attach6Json = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = pid6 })));
+    Assert(attach6Json.RootElement.GetProperty("status").GetString() == "attached", "Attach #6 failed");
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid6 });
+
+    var bp6aJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_set",
+            new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 38 })));
+    var bp6aId = bp6aJson.RootElement.GetProperty("id").GetInt32();
+    var bp6bJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_set",
+            new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 40 })));
+    Assert(bp6bJson.RootElement.GetProperty("line").GetInt32() == 40, "Second bp must be at line 40");
+    Assert(bp6bJson.RootElement.GetProperty("fileBreakpointCount").GetInt32() == 2,
+        "fileBreakpointCount should be 2 after incremental set");
+
+    var list6Json = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_list", new Dictionary<string, object?>())));
+    Assert(list6Json.RootElement.GetProperty("count").GetInt32() == 2,
+        $"Expected 2 bps after incremental sets, got {list6Json.RootElement.GetProperty("count").GetInt32()}");
+    var list6Bps = list6Json.RootElement.GetProperty("breakpoints").EnumerateArray().ToList();
+    var bp6At38 = list6Bps.First(b => b.GetProperty("line").GetInt32() == 38);
+    Assert(bp6At38.GetProperty("id").GetInt32() != bp6aId,
+        "First bp's id must refresh after the incremental set");
+
+    await debuggee6.StandardInput.WriteLineAsync();
+    var cont6a = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 10 })));
+    Assert(cont6a.RootElement.GetProperty("status").GetString() == "stopped", "Continue #1 should stop");
+    Assert(cont6a.RootElement.GetProperty("source").GetProperty("line").GetInt32() == 38,
+        $"Expected stop at line 38 (first hit in iteration 0), got {cont6a.RootElement.GetProperty("source").GetProperty("line").GetInt32()}");
+    var cont6b = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 10 })));
+    Assert(cont6b.RootElement.GetProperty("status").GetString() == "stopped", "Continue #2 should stop");
+    Assert(cont6b.RootElement.GetProperty("source").GetProperty("line").GetInt32() == 40,
+        $"Expected stop at line 40 (second bp in iteration 0), got {cont6b.RootElement.GetProperty("source").GetProperty("line").GetInt32()}");
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid6 });
+    Console.WriteLine("   ✅");
+
     Console.WriteLine($"\n=== {passed}/{tests} PASSED ===");
 }
 catch (Exception ex)

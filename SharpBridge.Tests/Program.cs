@@ -486,6 +486,84 @@ try
     if (!debuggee4.HasExited) debuggee4.Kill();
     if (!debuggee5.HasExited) debuggee5.Kill();
 
+    // === Step 19: Path normalization + incremental pattern ===
+    // (a) Same file via relative vs absolute path must share ONE registry key
+    //     (keys are normalized) — a re-set REPLACES, it does not duplicate.
+    // (b) The tool layer's incremental pattern (BreakpointSet preserves
+    //     existing same-file bps) is exercised directly; the MCP-level
+    //     behavior is covered by E2E test 17.
+    Console.WriteLine("19. Path normalization + incremental pattern...");
+    var psi6 = new ProcessStartInfo("dotnet", debuggeeDll)
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    psi6.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var debuggee6 = Process.Start(psi6)!;
+    int pid6 = debuggee6.Id;
+
+    using var session6 = new DebugSession(loggerFactory.CreateLogger<DebugSession>());
+    await session6.AttachAsync(pid6);
+
+    // (a) normalization: absolute path, then the same file via a relative path
+    var bpA = session6.SetBreakpoints(sourceFile,
+        (Line: 38, Column: null, Condition: null, HitCondition: null,
+         Action: "capture", CaptureScope: "all", CaptureDepth: 0))[0];
+    Assert(bpA.Action == "capture", "bpA should be a capture breakpoint");
+
+    var relSource = Path.GetRelativePath(repoRoot, sourceFile);   // TestDebuggee/Program.cs
+    var bpRel = session6.SetBreakpoints(relSource,
+        (Line: 40, Column: null, Condition: null, HitCondition: null,
+         Action: "break", CaptureScope: null, CaptureDepth: 0))[0];
+    var afterRel = session6.GetAllBreakpoints();
+    Assert(afterRel.Count(b => b.FunctionName is null) == 1,
+        $"Normalized re-set must not duplicate the file entry, got {afterRel.Count(b => b.FunctionName is null)}");
+    Assert(afterRel[0].Line == 40, $"Expected the re-set breakpoint at line 40, got {afterRel[0].Line}");
+
+    // (b) incremental pattern: collect existing (line 40, break) and ADD line 38
+    var existing = session6.GetAllBreakpoints()
+        .Where(b => b.FunctionName is null
+                 && string.Equals(Path.GetFullPath(b.FilePath).ToLowerInvariant(),
+                                  Path.GetFullPath(sourceFile).ToLowerInvariant(),
+                                  StringComparison.Ordinal))
+        .Select(b => (b.Line, b.Column, b.Condition, b.HitCondition,
+                      b.Action, b.CaptureScope, b.CaptureDepth))
+        .ToList();
+    existing.Add((38, null, null, null, "capture", "all", 0));
+    var entries6 = session6.SetBreakpoints(sourceFile, existing.ToArray());
+    var bpB = entries6.Last(); // the just-added line 38
+    Assert(bpB.Line == 38 && bpB.Action == "capture", "Incremental add must create the line-38 capture bp");
+
+    var allBps6 = session6.GetAllBreakpoints();
+    Assert(allBps6.Count == 2, $"Expected 2 breakpoints, got {allBps6.Count}");
+    var bp38 = allBps6.First(b => b.Line == 38);
+    var bp40 = allBps6.First(b => b.Line == 40);
+    Assert(bp40.Action == "break" && bp40.Condition is null, "Existing bp must keep its action");
+    Assert(bp38.Id != bpA.Id,
+        $"Expected refreshed id after re-set (was {bpA.Id}, now {bp38.Id})");
+
+    await debuggee6.StandardInput.WriteLineAsync();
+
+    // Continue: iteration 0's line 38 is captured silently, then we stop at 40.
+    var incStop = await session6.ContinueAndWaitAsync(timeoutSeconds: 10);
+    Assert(incStop.Status == "stopped", $"Expected stopped at 40, got {incStop.Status}");
+    Assert(incStop.Line == 40, $"Expected stop at line 40, got {incStop.Line}");
+    var incCaps = session6.GetCaptures();
+    Assert(incCaps.Count == 1 && incCaps[0].Line == 38,
+        $"Expected 1 capture at line 38, got {incCaps.Count} at {incCaps.FirstOrDefault()?.Line}");
+
+    // Remove the break bp; the capture bp keeps auto-continuing to exit.
+    Assert(session6.RemoveBreakpoint(bp40.Id), "Remove line-40 bp failed");
+    var incFinal = await session6.ContinueAndWaitAsync(timeoutSeconds: 10);
+    Assert(incFinal.Status == "exited", $"Expected exited after capture loop, got {incFinal.Status}");
+    incCaps = session6.GetCaptures();
+    Assert(incCaps.Count == 5, $"Expected 5 captures (one per iteration), got {incCaps.Count}");
+
+    session6.Disconnect(terminateDebuggee: true);
+    if (!debuggee6.HasExited) debuggee6.Kill();
+    Console.WriteLine("   ✅ PASS (normalized key, incremental pattern, capture preserved, IDs refreshed)");
+    Console.WriteLine();
+
     Console.WriteLine("=== ALL TESTS PASSED ✅ ===");
 }
 catch (Exception ex)
