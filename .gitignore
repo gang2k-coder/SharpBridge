@@ -15,3 +15,7 @@ obj/
 .DS_Store
 Thumbs.db
 artifacts/
+nupkg/
+
+# Superpowers planning docs — never published to GitHub
+docs/superpowers/
