@@ -5,6 +5,10 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Embedded PDB: keep the debuggee self-contained and permanently in
+         sync with its assembly (also regression-tests SharpDbg symbol
+         loading for embedded portable PDBs on every suite run). -->
+    <DebugType>embedded</DebugType>
   </PropertyGroup>
 
 </Project>
