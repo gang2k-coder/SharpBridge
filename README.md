@@ -17,11 +17,12 @@ SharpBridge translates MCP tool calls into DAP debug commands, giving AI coding 
 - **Target validation**: `debug_launch` verifies the file is a .NET assembly (PE CorHeader, with AppHost `.exe`→`.dll` fallback); `debug_attach` verifies the process has the CLR loaded — non-.NET targets are rejected with a clear error before any debugger work starts
 - **Smart attach**: auto-detect single vs. multiple process instances by name
 - **Session management**: `debug_select` to switch default session, `debug_list` to see all active sessions
-- **24 MCP tools**: session management, breakpoints (source + function, with auto-capture), exception breakpoints, execution control, state inspection, and capture snapshots
+- **25 MCP tools**: session management, breakpoints (source + function, with auto-capture), exception breakpoints, execution control, state inspection, and capture snapshots
 - **Module introspection**: `modules_list` shows the modules (assemblies) loaded into the debugged process with their paths — useful for diagnosing pending breakpoints or verifying which assembly was loaded
 - **Smart inspect**: `variables_get` supports scope selection (locals/arguments/all), auto-expand depth, and targeted expansion by name — one call replaces multiple round-trips
 - **Exception breakpoints**: `exception_breakpoints` lists available filters and configures which exceptions cause breaks
 - **Auto-capture**: breakpoints with `action="capture"` auto-capture variables and continue (per `captureScope`/`captureDepth`), accumulating snapshots. `capture_state` / `get_captures` / `clear_captures` manage state snapshots
+- **No missed stops**: if the program stops (breakpoint or exception) while no tool call is waiting — e.g. after a `debug_continue` timed out — the pending stop is delivered on the next `debug_continue` / `debug_wait` **without resuming**, so an agent never loses a stop opportunity. `debug_state` and inspection tools acknowledge a seen stop; launch/attach reset the tracking per process
 - **Single STDIO transport** — zero-config MCP integration
 
 ## Quick Start
@@ -189,8 +190,7 @@ Rules:
 - The module must have a **PDB**; the breakpoint binds to the method entry IL.
 - Set before the module loads → reported `pending`, binds automatically when
   the module loads (`verified` flips to `true`).
-- Repeated calls **accumulate** (existing function breakpoints are preserved),
-  unlike `breakpoint_set` which replaces a file's set.
+- Repeated calls **accumulate** for both `breakpoint_set` (same file) and `function_breakpoint_set`: existing breakpoints are preserved and new ones are added. Note that every re-send refreshes the breakpoint IDs in that scope — use the IDs from the latest response or `breakpoint_list`.
 - **Local functions and lambdas cannot be targeted**: the compiler mangles their
   names (e.g. `<<Main>$>g__SignalLoopEnd|0_0`) and `<>`/`|` cannot appear in a
   pattern. Use regular methods instead.
@@ -258,13 +258,15 @@ Each `DebugSession` runs a `DebugProtocolHost` on a background thread that reads
 
 - **Attach validation waits up to 2s for young processes**: `debug_attach` gives a freshly-started process up to 2 seconds to load its CLR before the module check (a .NET process loads the CLR within ~1s of start; a non-.NET process is rejected as soon as it is 2s old). Attaching to a process you just launched may therefore take a moment.
 
+- **stopAtEntry not implemented by SharpDbg**: `debug_launch` waits briefly for an entry-point stop; SharpDbg does not send one, so launch returns `running` (honest state). Set breakpoints and use `debug_continue`; the stop ledger delivers any stop that occurs while no tool call is waiting.
+
 - **Launch PID extraction**: PID is extracted from SharpDbg log output via regex (`Process created suspended with PID: (\d+)`). This depends on SharpDbg's log format, which is not a stable API. If SharpDbg changes its log format, launch will fail with "Could not determine PID." Long-term fix: use DAP `ProcessEvent` if SharpDbg adds PID support, or manage process creation ourselves.
 
 - **Exception filter support incomplete**: SharpDbg advertises `"all"` and `"user-unhandled"` exception breakpoint filters but hardcodes `breakOnAllExceptions = true` regardless of filter selection. Both filters currently behave identically (break on every exception). Per-exception-type configuration (`ExceptionOptions`) is not supported by SharpDbg. `exception_breakpoints` works correctly for stopping on exceptions, but fine-grained filtering requires future SharpDbg improvements.
 
 - **Function breakpoints cannot target local functions or lambdas**: C# compiles these to compiler-generated names — e.g. `static void SignalLoopEnd()` in top-level statements becomes `<<Main>$>g__SignalLoopEnd|0_0` (the `<>`/`|` characters are reserved and cannot appear in a typed identifier). SharpDbg matches the method name **exactly** against the CLR metadata name (short name only — no namespace/type prefix), while type names support exact or `.TypeName` suffix matching, so a `function_breakpoint_set` for a local function never binds. Use regular methods instead (e.g. `LoopEnd.Signal`). Note that a function breakpoint set before the target module is loaded is reported as unverified and binds automatically when the module loads — `verified=false` at set time is normal in that case.
 
-- **breakpoint_set replaces all breakpoints in a file**: DAP `SetBreakpointsRequest` replaces the entire breakpoint set of a source file, and the `breakpoint_set` MCP tool sends one request per call — setting a second breakpoint in the same file removes the first. For multiple breakpoints in one file they must be sent in a single `SetBreakpointsRequest` (the underlying API supports it, but the MCP tool currently exposes a single breakpoint per call), or spread across different files.
+- **breakpoint_set accumulates within a file**: multiple breakpoints in the same file are preserved across calls (each call adds one). Re-sends refresh the file's breakpoint IDs — use the IDs from the latest response or `breakpoint_list`.
 
 - **Module list reflects LoadModule events only**: `modules_list` is populated from SharpDbg's LoadModule callbacks — modules are only added (no unload tracking), and the list is empty while the CLR is frozen (during `Attaching`, i.e. before the first `debug_continue`). Only id/name/path are available; PDB/symbol status is not exposed by SharpDbg yet.
 
