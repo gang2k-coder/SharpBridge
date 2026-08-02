@@ -8,7 +8,7 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>sharpbridge</ToolCommandName>
     <PackageId>SharpBridge</PackageId>
-    <Version>0.3.71</Version>
+    <Version>0.3.75</Version>
     <Authors>gang2k-coder</Authors>
     <Description>MCP debug server for .NET programs. Launch, attach, set breakpoints, inspect variables, and step through .NET code from AI agents via the Model Context Protocol.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
