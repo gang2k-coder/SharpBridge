@@ -76,7 +76,9 @@ public class BreakpointTools(DebugSessionManager manager)
             hint = status switch
             {
                 "pending" => "Breakpoint is pending: it will bind automatically when the module loads (verified will flip to true).",
-                "failed" => "Breakpoint could not be bound. Check that the source path matches the debuggee's PDB and the line is executable.",
+                "failed" => session.HasAnySymbols
+                    ? "Breakpoint could not be bound. Modules with PDB symbols are loaded, but this file/line did not resolve — check that filePath matches the path recorded in the PDB and the line is executable."
+                    : "Breakpoint could not be bound. No loaded module has PDB symbols — build in Debug (or <DebugType>embedded</DebugType>) and keep the .pdb next to the .dll.",
                 _ => entry.Action == "capture"
                     ? "Capture-action: will auto-capture variables and continue."
                     : null

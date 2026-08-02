@@ -637,6 +637,18 @@ try
     Assert(cont6b.RootElement.GetProperty("status").GetString() == "stopped", "Continue #2 should stop");
     Assert(cont6b.RootElement.GetProperty("source").GetProperty("line").GetInt32() == 40,
         $"Expected stop at line 40 (second bp in iteration 0), got {cont6b.RootElement.GetProperty("source").GetProperty("line").GetInt32()}");
+
+    // PDB symbol diagnosis: modules are loaded by now, so a bogus path must
+    // fail with the symbol-aware hint (TestDebuggee has symbols).
+    var bogusJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_set",
+            new Dictionary<string, object?> { ["filePath"] = "C:/definitely/not/here/File.cs", ["line"] = 10 })));
+    Assert(bogusJson.RootElement.GetProperty("status").GetString() == "failed",
+        $"Bogus path must fail, got {bogusJson.RootElement.GetProperty("status").GetString()}");
+    var bogusHint = bogusJson.RootElement.GetProperty("hint").GetString() ?? "";
+    Assert(bogusHint.Contains("Modules with PDB symbols"),
+        $"Hint must attribute the failure to path resolution, got: {bogusHint}");
+
     await client.CallToolAsync("debug_disconnect",
         new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid6 });
     Console.WriteLine("   ✅");

@@ -81,6 +81,12 @@ public class DebugSession : IDisposable
         @"Process created suspended with PID:\s*(\d+)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+    /// <summary>Parses SharpDbg's per-module symbol-load log lines, e.g.
+    /// "  Symbols loaded for TestDebuggee.dll" / "  No symbols found for X.dll".</summary>
+    private static readonly Regex SymbolStatusRegex = new(
+        @"^\s*(No symbols found|Symbols loaded) for (.+)\.dll$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     // ===================================================================
     // Construction (initialization is implicit)
     // ===================================================================
@@ -104,6 +110,13 @@ public class DebugSession : IDisposable
                 if (m.Success && int.TryParse(m.Groups[1].Value, out var pid))
                     ProcessId = pid;
             }
+
+            // Track per-module symbol state from SharpDbg's log lines, so
+            // breakpoint failures can be attributed (missing vs stale PDB).
+            var sym = SymbolStatusRegex.Match(msg);
+            if (sym.Success)
+                _moduleSymbols[sym.Groups[2].Value] = !sym.Groups[1].Value.StartsWith("No");
+
             _logger.LogDebug("SharpDbg: {Message}", msg);
         });
         _adapter = disposable;
@@ -313,6 +326,21 @@ public class DebugSession : IDisposable
     /// <summary>Modules reported by SharpDbg via ModuleEvent, keyed by module id (the module path).
     /// Populated from LoadModule callbacks — empty while the CLR is frozen (Attaching) and cleared on cleanup.</summary>
     private readonly Dictionary<string, LoadedModule> _modules = [];
+
+    /// <summary>Module file name → whether SharpDbg loaded PDB symbols for it (parsed from
+    /// SharpDbg's log lines). Used to attribute breakpoint bind failures.</summary>
+    private readonly Dictionary<string, bool> _moduleSymbols = [];
+
+    /// <summary>True when at least one loaded module has PDB symbols — distinguishes
+    /// "no PDB anywhere" from "PDB exists but this path/line did not resolve".</summary>
+    public bool HasAnySymbols
+    {
+        get
+        {
+            lock (_moduleSymbols)
+                return _moduleSymbols.Values.Any(v => v);
+        }
+    }
 
     public IReadOnlyList<BreakpointEntry> SetBreakpoints(
         string filePath,

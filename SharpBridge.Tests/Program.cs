@@ -548,6 +548,9 @@ try
     var incStop = await session6.ContinueAndWaitAsync(timeoutSeconds: 10);
     Assert(incStop.Status == "stopped", $"Expected stopped at 40, got {incStop.Status}");
     Assert(incStop.Line == 40, $"Expected stop at line 40, got {incStop.Line}");
+    // Symbol-state tracking: after the first continue the module is loaded and
+    // SharpDbg's log lines must have been parsed (embedded PDB → Symbols loaded).
+    Assert(session6.HasAnySymbols, "Expected HasAnySymbols=true from SharpDbg log parsing");
     var incCaps = session6.GetCaptures();
     Assert(incCaps.Count == 1 && incCaps[0].Line == 38,
         $"Expected 1 capture at line 38, got {incCaps.Count} at {incCaps.FirstOrDefault()?.Line}");
