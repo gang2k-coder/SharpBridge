@@ -192,9 +192,23 @@ public class DebugSession : IDisposable
         var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
 
-        _host.SendRequestSync(new ConfigurationDoneRequest());
-
+        // Declare Running BEFORE ConfigurationDone: a stop (e.g. a breakpoint
+        // hit right after resume) can arrive while the command is in flight,
+        // and OnStopped must never see the session as Attaching.
         _stateMachine.TransitionTo(SessionState.Running);
+        try
+        {
+            _host.SendRequestSync(new ConfigurationDoneRequest());
+        }
+        catch
+        {
+            // Only roll back when no event changed the state — the debuggee
+            // may already be running, stopped, or exited (real states that
+            // must not be overwritten).
+            if (_stateMachine.Current == SessionState.Running)
+                _stateMachine.TransitionTo(SessionState.Attaching);
+            throw;
+        }
 
 
         if (stopAtEntry)
@@ -734,28 +748,48 @@ public class DebugSession : IDisposable
             };
         }
 
-        // Send the right command to get the process running
-        if (_stateMachine.Current == SessionState.Attaching)
+        // Declare Running BEFORE sending the resume command: a stop can
+        // arrive while the command is in flight (e.g. a breakpoint hit right
+        // after resume), and OnStopped must never see the session as Attaching.
+        var previousState = _stateMachine.Current;
+        _stateMachine.TransitionTo(SessionState.Running);
+        try
         {
-            _host!.SendRequestSync(new ConfigurationDoneRequest());
-            if (ProcessId.HasValue)
+            if (previousState == SessionState.Attaching)
             {
-                try { await DiagnosticClientHelper.DiagnosticClientResumeRuntime(ProcessId.Value); }
-                catch (ServerNotAvailableException) { }
+                _host!.SendRequestSync(new ConfigurationDoneRequest());
+                if (ProcessId.HasValue)
+                {
+                    try { await DiagnosticClientHelper.DiagnosticClientResumeRuntime(ProcessId.Value); }
+                    catch (ServerNotAvailableException) { }
+                }
+            }
+            else
+            {
+                _host!.SendRequestSync(new ContinueRequest { ThreadId = _lastStop?.ThreadId ?? 0 });
             }
         }
-        else
+        catch
         {
-            _host!.SendRequestSync(new ContinueRequest { ThreadId = _lastStop?.ThreadId ?? 0 });
+            // Only roll back when no event has changed the state since — the
+            // debuggee may already be running, stopped, or exited; those are
+            // real states and must not be overwritten.
+            if (_stateMachine.Current == SessionState.Running)
+                _stateMachine.TransitionTo(previousState);
+            throw;
         }
 
         // A stop may have arrived while the command was in flight (e.g. a
         // breakpoint hit immediately after resume). The TCS check is exact:
         // OnStopped resolves exactly the TCS swapped in above.
         if (stopTcs.Task.IsCompleted)
+        {
+            // The TCS may have been resolved by an exit (synthetic event) —
+            // never overwrite the real Exited state.
+            if (_stateMachine.Current != SessionState.Exited)
+                _stateMachine.TransitionTo(SessionState.Stopped);
             return LastStop;
-
-        _stateMachine.TransitionTo(SessionState.Running);
+        }
 
         return await WaitForStopInTimespanAsync(timeoutSeconds, ct, stopTcs);
     }
