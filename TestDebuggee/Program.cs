@@ -22,6 +22,18 @@ Console.WriteLine("=== SharpBridge Test Debuggee ===");
 int counter = 0;
 string message = "Hello from debuggee!";
 var numbers = new List<int> { 10, 20, 30, 40, 50 };
+// Extra variable forms for the variable-forms test (all visible at the
+// counter++ breakpoint — declare BEFORE the loop, never reordered).
+int[] arr = [1, 2, 3];
+string? maybeNull = null;
+ExceptionToThrow enumVar = ExceptionToThrow.Normal;
+Person person = new("Ada", 36);
+Dictionary<string, int> dict = new() { ["a"] = 1, ["b"] = 2 };
+string multiLine = "line1\nline2\t\"quoted\"";
+double ratio = 0.5;
+decimal price = 19.99m;
+char letter = 'A';
+DateTime when = new(2026, 8, 3);
 
 Console.WriteLine($"Starting loop with {numbers.Count} items...");
 
@@ -110,3 +122,14 @@ class GenericProcessor<T>
         return $"Processed: {item}";
     }
 }
+
+// === Variable-form test targets (declared after Main — line numbers in
+// Main stay stable; these only move if you edit this section) ===
+
+enum ExceptionToThrow
+{
+    None,
+    Normal
+}
+
+record Person(string Name, int Age);

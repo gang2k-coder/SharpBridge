@@ -91,6 +91,18 @@ try
         return ((TextContentBlock)r.Content[0]).Text;
     }
 
+    // Fresh debuggee with diagnostic suspend, ready for attach.
+    static ProcessStartInfo NewSuspendPsi(string dll, params string[] extraArgs)
+    {
+        var psi = new ProcessStartInfo("dotnet", [dll, .. extraArgs])
+        {
+            RedirectStandardOutput = true, RedirectStandardInput = true,
+            RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+        };
+        psi.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+        return psi;
+    }
+
     // Test 1: List tools
     tests++; passed++;
     Console.WriteLine("1. List tools...");
@@ -114,7 +126,7 @@ try
     var sourceFile = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
         "../../../../TestDebuggee/Program.cs"));
     await client.CallToolAsync("breakpoint_set",
-        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 25 });
+        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 37 });
     await debuggee.StandardInput.WriteLineAsync();
     var contJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
@@ -133,8 +145,8 @@ try
     var bpCheck = bpCheckJson.RootElement.GetProperty("breakpoints")[0];
     Assert(bpCheck.GetProperty("status").GetString() == "verified",
         $"Expected verified after module load, got {bpCheck.GetProperty("status").GetString()}");
-    Assert(bpCheck.GetProperty("line").GetInt32() == 26,
-        $"Expected adjusted line 26, got {bpCheck.GetProperty("line").GetInt32()}");
+    Assert(bpCheck.GetProperty("line").GetInt32() == 38,
+        $"Expected adjusted line 38, got {bpCheck.GetProperty("line").GetInt32()}");
     Console.WriteLine($"   threadId={threadId}, alive ✅");
 
     // Test 3b: Modules list (populated after the first continue loaded modules)
@@ -372,7 +384,7 @@ try
     Assert(attach3Json.RootElement.GetProperty("status").GetString() == "attached", "Attach #3 failed");
     await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid3 });
 
-    const int counterLine = 39;   // counter++ inside the loop
+    const int counterLine = 51;   // counter++ inside the loop
     var capSetJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
         {
@@ -509,7 +521,7 @@ try
     Assert(attach4Json.RootElement.GetProperty("status").GetString() == "attached", "Attach #4 failed");
     await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid4 });
 
-    const int gapCounterLine = 39;   // counter++ inside the loop (after the 5s gap sleep)
+    const int gapCounterLine = 51;   // counter++ inside the loop (after the 5s gap sleep)
     var gapBpJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("breakpoint_set",
             new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = gapCounterLine })));
@@ -608,12 +620,12 @@ try
 
     var bp6aJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("breakpoint_set",
-            new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 39 })));
+            new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 51 })));
     var bp6aId = bp6aJson.RootElement.GetProperty("id").GetInt32();
     var bp6bJson = JsonDocument.Parse(GetText(
         await client.CallToolAsync("breakpoint_set",
-            new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 41 })));
-    Assert(bp6bJson.RootElement.GetProperty("line").GetInt32() == 41, "Second bp must be at line 41");
+            new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 53 })));
+    Assert(bp6bJson.RootElement.GetProperty("line").GetInt32() == 53, "Second bp must be at line 53");
     Assert(bp6bJson.RootElement.GetProperty("fileBreakpointCount").GetInt32() == 2,
         "fileBreakpointCount should be 2 after incremental set");
 
@@ -622,7 +634,7 @@ try
     Assert(list6Json.RootElement.GetProperty("count").GetInt32() == 2,
         $"Expected 2 bps after incremental sets, got {list6Json.RootElement.GetProperty("count").GetInt32()}");
     var list6Bps = list6Json.RootElement.GetProperty("breakpoints").EnumerateArray().ToList();
-    var bp6At38 = list6Bps.First(b => b.GetProperty("line").GetInt32() == 39);
+    var bp6At38 = list6Bps.First(b => b.GetProperty("line").GetInt32() == 51);
     Assert(bp6At38.GetProperty("id").GetInt32() != bp6aId,
         "First bp's id must refresh after the incremental set");
 
@@ -630,13 +642,13 @@ try
     var cont6a = JsonDocument.Parse(GetText(
         await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 10 })));
     Assert(cont6a.RootElement.GetProperty("status").GetString() == "stopped", "Continue #1 should stop");
-    Assert(cont6a.RootElement.GetProperty("source").GetProperty("line").GetInt32() == 39,
-        $"Expected stop at line 39 (first hit in iteration 0), got {cont6a.RootElement.GetProperty("source").GetProperty("line").GetInt32()}");
+    Assert(cont6a.RootElement.GetProperty("source").GetProperty("line").GetInt32() == 51,
+        $"Expected stop at line 51 (first hit in iteration 0), got {cont6a.RootElement.GetProperty("source").GetProperty("line").GetInt32()}");
     var cont6b = JsonDocument.Parse(GetText(
         await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 10 })));
     Assert(cont6b.RootElement.GetProperty("status").GetString() == "stopped", "Continue #2 should stop");
-    Assert(cont6b.RootElement.GetProperty("source").GetProperty("line").GetInt32() == 41,
-        $"Expected stop at line 41 (second bp in iteration 0), got {cont6b.RootElement.GetProperty("source").GetProperty("line").GetInt32()}");
+    Assert(cont6b.RootElement.GetProperty("source").GetProperty("line").GetInt32() == 53,
+        $"Expected stop at line 53 (second bp in iteration 0), got {cont6b.RootElement.GetProperty("source").GetProperty("line").GetInt32()}");
 
     // PDB symbol diagnosis: modules are loaded by now, so a bogus path must
     // fail with the symbol-aware hint (TestDebuggee has symbols).
@@ -671,7 +683,7 @@ try
 
     // Complete the attach so the session is in a normal Stopped state
     await client.CallToolAsync("breakpoint_set",
-        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 39 });
+        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 51 });
     await debuggee7.StandardInput.WriteLineAsync();
     var cont7 = JsonDocument.Parse(GetText(
         await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
@@ -798,7 +810,7 @@ try
     Assert(attach9bJson.RootElement.GetProperty("status").GetString() == "attached", "Re-attach failed");
     await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid9 });
     await client.CallToolAsync("breakpoint_set",
-        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 39 });
+        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 51 });
     await debuggee9.StandardInput.WriteLineAsync();
     var cont9 = JsonDocument.Parse(GetText(
         await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
@@ -826,7 +838,7 @@ try
     Assert(attach10Json.RootElement.GetProperty("status").GetString() == "attached", "Attach #10 failed");
     await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid10 });
     await client.CallToolAsync("breakpoint_set",
-        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 39 });
+        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 51 });
     await debuggee10.StandardInput.WriteLineAsync();
     var cont10a = JsonDocument.Parse(GetText(
         await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
@@ -846,7 +858,276 @@ try
         new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid10 });
     Console.WriteLine("   ✅");
 
+    // Test 23: Conditional breakpoint — condition "counter == 3" fires only
+    // on the 4th loop iteration, so the FIRST continue must stop there.
+    tests++; passed++;
+    Console.WriteLine("23. Conditional breakpoint (counter == 3)...");
+    var psi11 = NewSuspendPsi(debuggeeDll);
+    using var debuggee11 = Process.Start(psi11)!;
+    int pid11 = debuggee11.Id;
+    var attach11 = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = pid11 })));
+    Assert(attach11.RootElement.GetProperty("status").GetString() == "attached", "Attach #11 failed");
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid11 });
+    var condBp = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
+        {
+            ["filePath"] = sourceFile, ["line"] = 51, ["condition"] = "counter == 3"
+        })));
+    var condStatus = condBp.RootElement.GetProperty("status").GetString();
+    Assert(condStatus is "pending" or "verified", $"Cond bp status: {condStatus}");
+    await debuggee11.StandardInput.WriteLineAsync();
+    var condStop = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
+    Assert(condStop.RootElement.GetProperty("status").GetString() == "stopped", "Cond bp should stop");
+    var condSt = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("stacktrace_get", new Dictionary<string, object?> { ["threadId"] = condStop.RootElement.GetProperty("threadId").GetInt32() })));
+    var condFrame = condSt.RootElement.GetProperty("frames")[0].GetProperty("id").GetInt32();
+    var condEval = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("evaluate", new Dictionary<string, object?> { ["expression"] = "counter", ["frameId"] = condFrame })));
+    Assert(condEval.RootElement.GetProperty("result").GetString() == "3",
+        $"Expected counter=3 at 4th iteration, got {condEval.RootElement.GetProperty("result").GetString()}");
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid11 });
+    Console.WriteLine("   ✅");
+
+    // Test 24: Hit-condition breakpoint — hitCondition "2" stops on the 2nd hit
+    tests++; passed++;
+    Console.WriteLine("24. Hit-condition breakpoint (hitCondition=2)...");
+    var psi12 = NewSuspendPsi(debuggeeDll);
+    using var debuggee12 = Process.Start(psi12)!;
+    int pid12 = debuggee12.Id;
+    var attach12 = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = pid12 })));
+    Assert(attach12.RootElement.GetProperty("status").GetString() == "attached", "Attach #12 failed");
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid12 });
+    var hitBp = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
+        {
+            ["filePath"] = sourceFile, ["line"] = 51, ["hitCondition"] = "2"
+        })));
+    var hitStatus = hitBp.RootElement.GetProperty("status").GetString();
+    Assert(hitStatus is "pending" or "verified", $"Hit bp status: {hitStatus}");
+    await debuggee12.StandardInput.WriteLineAsync();
+    var hitStop = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
+    Assert(hitStop.RootElement.GetProperty("status").GetString() == "stopped", "Hit bp should stop");
+    var hitSt = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("stacktrace_get", new Dictionary<string, object?> { ["threadId"] = hitStop.RootElement.GetProperty("threadId").GetInt32() })));
+    var hitFrame = hitSt.RootElement.GetProperty("frames")[0].GetProperty("id").GetInt32();
+    var hitEval = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("evaluate", new Dictionary<string, object?> { ["expression"] = "counter", ["frameId"] = hitFrame })));
+    Assert(hitEval.RootElement.GetProperty("result").GetString() == "1",
+        $"Expected counter=1 (2nd hit), got {hitEval.RootElement.GetProperty("result").GetString()}");
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid12 });
+    Console.WriteLine("   ✅");
+
+    // Test 25: Variable forms — int/string/List/array/null/enum/record/dict/
+    // multi-line string/double/decimal/char/DateTime visible at line 51
+    tests++; passed++;
+    Console.WriteLine("25. Variable forms...");
+    var psi13 = NewSuspendPsi(debuggeeDll);
+    using var debuggee13 = Process.Start(psi13)!;
+    int pid13 = debuggee13.Id;
+    var attach13 = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = pid13 })));
+    Assert(attach13.RootElement.GetProperty("status").GetString() == "attached", "Attach #13 failed");
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid13 });
+    await client.CallToolAsync("breakpoint_set",
+        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 51 });
+    await debuggee13.StandardInput.WriteLineAsync();
+    var vfStop = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
+    Assert(vfStop.RootElement.GetProperty("status").GetString() == "stopped", "Var-forms stop failed");
+    var vfSt = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("stacktrace_get", new Dictionary<string, object?> { ["threadId"] = vfStop.RootElement.GetProperty("threadId").GetInt32() })));
+    var vfFrame = vfSt.RootElement.GetProperty("frames")[0].GetProperty("id").GetInt32();
+    var vfVars = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("variables_get", new Dictionary<string, object?> { ["frameId"] = vfFrame })));
+    var vfList = vfVars.RootElement.GetProperty("variables").EnumerateArray().ToList();
+    string? GetVar(string name) =>
+        vfList.FirstOrDefault(v => v.GetProperty("name").GetString() == name) is { } v
+            ? v.GetProperty("value").GetString() : null;
+    int? GetRef(string name) =>
+        vfList.FirstOrDefault(v => v.GetProperty("name").GetString() == name) is { } v
+            ? v.GetProperty("variablesReference").GetInt32() : null;
+
+    Assert(GetVar("counter") == "0", $"counter: {GetVar("counter")}");
+    // SharpDbg 0.1.8+ escapes string values (quotes/escapes) — use Contains.
+    Assert((GetVar("message") ?? "").Contains("Hello from debuggee"), $"message: {GetVar("message")}");
+    Assert(GetVar("maybeNull") == "null", $"maybeNull: {GetVar("maybeNull")}");
+    Assert((GetVar("enumVar") ?? "").Contains("Normal"), $"enumVar: {GetVar("enumVar")}");
+    Assert((GetVar("multiLine") ?? "").Contains("line1"), $"multiLine: {GetVar("multiLine")}");
+    Assert(GetVar("ratio") is not null && GetVar("price") is not null
+        && GetVar("letter") is not null && GetVar("when") is not null,
+        $"missing primitives: ratio={GetVar("ratio")} price={GetVar("price")} letter={GetVar("letter")} when={GetVar("when")}");
+
+    // numbers list and arr array expand
+    Assert(GetRef("numbers") is > 0, "numbers must be expandable");
+    Assert(GetRef("arr") is > 0, "arr must be expandable");
+    var arrExp = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("variables_expand",
+            new Dictionary<string, object?> { ["variablesReference"] = GetRef("arr")!.Value })));
+    Assert(arrExp.RootElement.GetProperty("count").GetInt32() >= 3, "arr should have 3 elements");
+
+    // record person expands to Name/Age
+    Assert(GetRef("person") is > 0, "person must be expandable");
+    var personExp = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("variables_expand",
+            new Dictionary<string, object?> { ["variablesReference"] = GetRef("person")!.Value })));
+    var personChildren = personExp.RootElement.GetProperty("variables").EnumerateArray().ToList();
+    Assert(personChildren.Any(c => c.GetProperty("name").GetString() == "Name"
+        && (c.GetProperty("value").GetString() ?? "").Contains("Ada")), "record Name missing");
+    Assert(personChildren.Any(c => c.GetProperty("name").GetString() == "Age"
+        && (c.GetProperty("value").GetString() ?? "").Contains("36")), "record Age missing");
+
+    // dict expands to a/b entries
+    Assert(GetRef("dict") is > 0, "dict must be expandable");
+    var dictExp = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("variables_expand",
+            new Dictionary<string, object?> { ["variablesReference"] = GetRef("dict")!.Value })));
+    Assert(dictExp.RootElement.GetProperty("count").GetInt32() >= 2, "dict should have 2 entries");
+
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid13 });
+    Console.WriteLine("   ✅");
+
+    // Test 26: Exception full chain — --throw stops on the 3rd iteration,
+    // exception_info reports details, $exception is inspectable, continue exits
+    tests++; passed++;
+    Console.WriteLine("26. Exception full chain...");
+    var psi14 = NewSuspendPsi(debuggeeDll, "--throw");
+    using var debuggee14 = Process.Start(psi14)!;
+    int pid14 = debuggee14.Id;
+    var attach14 = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = pid14 })));
+    Assert(attach14.RootElement.GetProperty("status").GetString() == "attached", "Attach #14 failed");
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid14 });
+    await debuggee14.StandardInput.WriteLineAsync();
+    var exStop = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
+    Assert(exStop.RootElement.GetProperty("status").GetString() == "stopped", "Exception stop failed");
+    var exReason = exStop.RootElement.GetProperty("reason").GetString() ?? "";
+    Assert(exReason.Equals("exception", StringComparison.OrdinalIgnoreCase),
+        $"Expected reason=exception, got {exReason}");
+
+    var exInfo = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("exception_info", new Dictionary<string, object?>())));
+    Assert(exInfo.RootElement.GetProperty("hasException").GetBoolean() == true, "No exception reported");
+    Assert((exInfo.RootElement.GetProperty("exceptionId").GetString() ?? "").Contains("InvalidOperationException"),
+        $"exceptionId: {exInfo.RootElement.GetProperty("exceptionId").GetString()}");
+    Assert((exInfo.RootElement.GetProperty("details").GetProperty("message").GetString() ?? "")
+        .Contains("Test exception from debuggee"), "Exception message missing");
+
+    var exSt = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("stacktrace_get", new Dictionary<string, object?> { ["threadId"] = exStop.RootElement.GetProperty("threadId").GetInt32() })));
+    var exFrame = exSt.RootElement.GetProperty("frames")[0].GetProperty("id").GetInt32();
+    var exVars = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("variables_get", new Dictionary<string, object?> { ["frameId"] = exFrame })));
+    var exVarList = exVars.RootElement.GetProperty("variables").EnumerateArray().ToList();
+    var exVar = exVarList.FirstOrDefault(v => v.GetProperty("name").GetString() == "$exception");
+    Assert(exVar.ValueKind != JsonValueKind.Undefined, "$exception variable missing");
+    Assert((exVar.GetProperty("value").GetString() ?? "").Contains("InvalidOperationException"),
+        $"$exception value: {exVar.GetProperty("value").GetString()}");
+
+    // Unhandled exception: CLR may stop once more (unhandled callback) before
+    // the process dies — keep continuing until exited.
+    var exStatus = "stopped";
+    for (int i = 0; i < 4 && exStatus != "exited"; i++)
+    {
+        var c = JsonDocument.Parse(GetText(
+            await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
+        exStatus = c.RootElement.GetProperty("status").GetString()!;
+    }
+    Assert(exStatus == "exited", $"Expected exited after unhandled exception, got {exStatus}");
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid14 });
+    Console.WriteLine("   ✅");
+
+    // Test 27: Evaluation — method calls, enum, string, invalid expression
+    tests++; passed++;
+    Console.WriteLine("27. Evaluation forms...");
+    var psi15 = NewSuspendPsi(debuggeeDll);
+    using var debuggee15 = Process.Start(psi15)!;
+    int pid15 = debuggee15.Id;
+    var attach15 = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = pid15 })));
+    Assert(attach15.RootElement.GetProperty("status").GetString() == "attached", "Attach #15 failed");
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid15 });
+    await client.CallToolAsync("breakpoint_set",
+        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 51 });
+    await debuggee15.StandardInput.WriteLineAsync();
+    var evStop = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
+    Assert(evStop.RootElement.GetProperty("status").GetString() == "stopped", "Eval stop failed");
+    var evSt = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("stacktrace_get", new Dictionary<string, object?> { ["threadId"] = evStop.RootElement.GetProperty("threadId").GetInt32() })));
+    var evFrame = evSt.RootElement.GetProperty("frames")[0].GetProperty("id").GetInt32();
+
+    async Task<string> Eval(string expr)
+    {
+        var r = await client.CallToolAsync("evaluate",
+            new Dictionary<string, object?> { ["expression"] = expr, ["frameId"] = evFrame });
+        var text = ((TextContentBlock)r.Content[0]).Text;
+        var j = JsonDocument.Parse(text);
+        return j.RootElement.GetProperty("result").GetString() ?? "";
+    }
+
+    Assert(await Eval("counter + 100") == "100", "arith eval");
+    Assert(await Eval("Calculator.Add(counter, 2)") == "2", $"method call eval: {await Eval("Calculator.Add(counter, 2)")}");
+    Assert(await Eval("enumVar") == "Normal", $"enum eval: {await Eval("enumVar")}");
+    Assert((await Eval("message")).Contains("Hello from debuggee"), $"string eval: {await Eval("message")}");
+    // Invalid expression must produce an error result, not a crash
+    var badEval = await client.CallToolAsync("evaluate",
+        new Dictionary<string, object?> { ["expression"] = "this_is_not_a_variable_xyz", ["frameId"] = evFrame });
+    var badText = ((TextContentBlock)badEval.Content[0]).Text;
+    Assert(badEval.IsError == true || badText.Contains("error", StringComparison.OrdinalIgnoreCase)
+        || badText.Contains("not", StringComparison.OrdinalIgnoreCase),
+        $"Invalid eval must error gracefully: {badText}");
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid15 });
+    Console.WriteLine("   ✅");
+
+    // Test 28: Step out — step in to DoubleValue, then step out back to Main
+    tests++; passed++;
+    Console.WriteLine("28. Step out...");
+    var psi16 = NewSuspendPsi(debuggeeDll);
+    using var debuggee16 = Process.Start(psi16)!;
+    int pid16 = debuggee16.Id;
+    var attach16 = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = pid16 })));
+    Assert(attach16.RootElement.GetProperty("status").GetString() == "attached", "Attach #16 failed");
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = pid16 });
+    await client.CallToolAsync("breakpoint_set",
+        new Dictionary<string, object?> { ["filePath"] = sourceFile, ["line"] = 53 });
+    await debuggee16.StandardInput.WriteLineAsync();
+    var soStop = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
+    Assert(soStop.RootElement.GetProperty("status").GetString() == "stopped", "Step-out bp stop failed");
+    var soThread = soStop.RootElement.GetProperty("threadId").GetInt32();
+    // step in → inside DoubleValue
+    var inStop = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_step", new Dictionary<string, object?> { ["type"] = "in" })));
+    Assert(inStop.RootElement.GetProperty("status").GetString() == "stopped", "Step in failed");
+    var inSt = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("stacktrace_get", new Dictionary<string, object?> { ["threadId"] = soThread })));
+    Assert(inSt.RootElement.GetProperty("frames")[0].GetProperty("name").GetString()?.Contains("DoubleValue") == true,
+        $"Expected inside DoubleValue, got {inSt.RootElement.GetProperty("frames")[0].GetProperty("name").GetString()}");
+    // step out → back in Main at the call site
+    var outStop = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_step", new Dictionary<string, object?> { ["type"] = "out" })));
+    Assert(outStop.RootElement.GetProperty("status").GetString() == "stopped", "Step out failed");
+    var outSt = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("stacktrace_get", new Dictionary<string, object?> { ["threadId"] = soThread })));
+    Assert(outSt.RootElement.GetProperty("frames")[0].GetProperty("name").GetString()?.Contains("Main") == true,
+        $"Expected back in Main, got {outSt.RootElement.GetProperty("frames")[0].GetProperty("name").GetString()}");
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid16 });
+    Console.WriteLine("   ✅");
+
     Console.WriteLine($"\n=== {passed}/{tests} PASSED ===");
+
 }
 catch (Exception ex)
 {

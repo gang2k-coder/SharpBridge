@@ -58,9 +58,9 @@ try
     Console.WriteLine();
 
     // === Step 2: Set breakpoint ===
-    Console.WriteLine("2. Setting breakpoint on line 25 (blank → adjusted to 26, before the loop)...");
+    Console.WriteLine("2. Setting breakpoint on line 37 (blank → adjusted to 38, before the loop)...");
     var bps = session.SetBreakpoints(sourceFile,
-        (Line: 25, Column: null, Condition: null, HitCondition: null,
+        (Line: 37, Column: null, Condition: null, HitCondition: null,
          Action: "break", CaptureScope: null, CaptureDepth: 0));
     var bp = bps[0];
     Console.WriteLine($"   ID={bp.Id}, Verified={bp.Verified}, Line={bp.Line}");
@@ -328,7 +328,7 @@ try
     using var session2 = new DebugSession(loggerFactory.CreateLogger<DebugSession>());
     await session2.AttachAsync(pid2);
     var capBps = session2.SetBreakpoints(sourceFile,
-        (Line: 25, Column: null, Condition: null, HitCondition: null,
+        (Line: 37, Column: null, Condition: null, HitCondition: null,
          Action: "capture", CaptureScope: "all", CaptureDepth: 0));
     var capBp = capBps[0];
     Assert(!capBp.Verified && capBp.IsPending,
@@ -343,7 +343,7 @@ try
     // BreakpointEvent sync: verified + adjusted line
     var boundBp = session2.GetAllBreakpoints()[0];
     Assert(boundBp.Verified, "Expected verified after module load");
-    Assert(boundBp.Line == 26, $"Expected adjusted line 26, got {boundBp.Line}");
+    Assert(boundBp.Line == 38, $"Expected adjusted line 38, got {boundBp.Line}");
     Assert(DebugSession.BreakpointStatus(boundBp) == "verified", "Expected status 'verified'");
 
     // Capture fired at the ADJUSTED line (the blind-spot fix)
@@ -351,11 +351,11 @@ try
     Assert(capCaps2.Count == 1, $"Expected 1 capture, got {capCaps2.Count}");
     Assert(capCaps2[0].FilePath is not null && capCaps2[0].FilePath.Contains("TestDebuggee"),
         "Capture missing source path");
-    Assert(capCaps2[0].Line == 26, $"Expected capture at adjusted line 26, got {capCaps2[0].Line}");
+    Assert(capCaps2[0].Line == 38, $"Expected capture at adjusted line 38, got {capCaps2[0].Line}");
     var counterVar = capCaps2[0].Variables.FirstOrDefault(v => v.Name == "counter");
     Assert(counterVar is not null && counterVar.Value == "0",
-        $"Expected counter=0 at line 25, got {counterVar?.Value}");
-    Console.WriteLine("   ✅ PASS (pending → verified at line 26, capture fired, auto-continued to exit)");
+        $"Expected counter=0 at line 37, got {counterVar?.Value}");
+    Console.WriteLine("   ✅ PASS (pending → verified at line 38, capture fired, auto-continued to exit)");
     Console.WriteLine();
 
     // === Step 16: Gap stop — stop-ledger delivers on the next continue ===
@@ -373,7 +373,7 @@ try
 
     using var session3 = new DebugSession(loggerFactory.CreateLogger<DebugSession>());
     await session3.AttachAsync(pid3);
-    const int gapLine = 39;   // counter++ inside the loop, after the 5s gap sleep
+    const int gapLine = 51;   // counter++ inside the loop, after the 5s gap sleep
     session3.SetBreakpoints(sourceFile,
         (Line: gapLine, Column: null, Condition: null, HitCondition: null,
          Action: "break", CaptureScope: null, CaptureDepth: 0));
@@ -507,18 +507,18 @@ try
 
     // (a) normalization: absolute path, then the same file via a relative path
     var bpA = session6.SetBreakpoints(sourceFile,
-        (Line: 39, Column: null, Condition: null, HitCondition: null,
+        (Line: 51, Column: null, Condition: null, HitCondition: null,
          Action: "capture", CaptureScope: "all", CaptureDepth: 0))[0];
     Assert(bpA.Action == "capture", "bpA should be a capture breakpoint");
 
     var relSource = Path.GetRelativePath(repoRoot, sourceFile);   // TestDebuggee/Program.cs
     var bpRel = session6.SetBreakpoints(relSource,
-        (Line: 41, Column: null, Condition: null, HitCondition: null,
+        (Line: 53, Column: null, Condition: null, HitCondition: null,
          Action: "break", CaptureScope: null, CaptureDepth: 0))[0];
     var afterRel = session6.GetAllBreakpoints();
     Assert(afterRel.Count(b => b.FunctionName is null) == 1,
         $"Normalized re-set must not duplicate the file entry, got {afterRel.Count(b => b.FunctionName is null)}");
-    Assert(afterRel[0].Line == 41, $"Expected the re-set breakpoint at line 41, got {afterRel[0].Line}");
+    Assert(afterRel[0].Line == 53, $"Expected the re-set breakpoint at line 53, got {afterRel[0].Line}");
 
     // (b) incremental pattern: collect existing (line 40, break) and ADD line 38
     var existing = session6.GetAllBreakpoints()
@@ -529,15 +529,15 @@ try
         .Select(b => (b.Line, b.Column, b.Condition, b.HitCondition,
                       b.Action, b.CaptureScope, b.CaptureDepth))
         .ToList();
-    existing.Add((39, null, null, null, "capture", "all", 0));
+    existing.Add((51, null, null, null, "capture", "all", 0));
     var entries6 = session6.SetBreakpoints(sourceFile, existing.ToArray());
-    var bpB = entries6.Last(); // the just-added line 38
-    Assert(bpB.Line == 39 && bpB.Action == "capture", "Incremental add must create the line-39 capture bp");
+    var bpB = entries6.Last(); // the just-added line 50
+    Assert(bpB.Line == 51 && bpB.Action == "capture", "Incremental add must create the line-51 capture bp");
 
     var allBps6 = session6.GetAllBreakpoints();
     Assert(allBps6.Count == 2, $"Expected 2 breakpoints, got {allBps6.Count}");
-    var bp38 = allBps6.First(b => b.Line == 39);
-    var bp40 = allBps6.First(b => b.Line == 41);
+    var bp38 = allBps6.First(b => b.Line == 51);
+    var bp40 = allBps6.First(b => b.Line == 53);
     Assert(bp40.Action == "break" && bp40.Condition is null, "Existing bp must keep its action");
     Assert(bp38.Id != bpA.Id,
         $"Expected refreshed id after re-set (was {bpA.Id}, now {bp38.Id})");
@@ -547,16 +547,16 @@ try
     // Continue: iteration 0's line 38 is captured silently, then we stop at 40.
     var incStop = await session6.ContinueAndWaitAsync(timeoutSeconds: 10);
     Assert(incStop.Status == "stopped", $"Expected stopped at 40, got {incStop.Status}");
-    Assert(incStop.Line == 41, $"Expected stop at line 41, got {incStop.Line}");
+    Assert(incStop.Line == 53, $"Expected stop at line 53, got {incStop.Line}");
     // Symbol-state tracking: after the first continue the module is loaded and
     // SharpDbg's log lines must have been parsed (embedded PDB → Symbols loaded).
     Assert(session6.HasAnySymbols, "Expected HasAnySymbols=true from SharpDbg log parsing");
     var incCaps = session6.GetCaptures();
-    Assert(incCaps.Count == 1 && incCaps[0].Line == 39,
-        $"Expected 1 capture at line 39, got {incCaps.Count} at {incCaps.FirstOrDefault()?.Line}");
+    Assert(incCaps.Count == 1 && incCaps[0].Line == 51,
+        $"Expected 1 capture at line 51, got {incCaps.Count} at {incCaps.FirstOrDefault()?.Line}");
 
     // Remove the break bp; the capture bp keeps auto-continuing to exit.
-    Assert(session6.RemoveBreakpoint(bp40.Id), "Remove line-40 bp failed");
+    Assert(session6.RemoveBreakpoint(bp40.Id), "Remove line-52 bp failed");
     var incFinal = await session6.ContinueAndWaitAsync(timeoutSeconds: 10);
     Assert(incFinal.Status == "exited", $"Expected exited after capture loop, got {incFinal.Status}");
     incCaps = session6.GetCaptures();
