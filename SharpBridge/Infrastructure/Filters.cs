@@ -19,6 +19,36 @@ public static class CallToolFilters
     {
         return async (context, cancellationToken) =>
         {
+            try
+            {
+                return await ExecuteAsync(context, cancellationToken, next);
+            }
+            catch (OperationCanceledException)
+            {
+                // Cancellation must propagate — the caller asked to stop.
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // The MCP SDK swallows tool exceptions into a generic
+                // "An error occurred invoking 'X'." message that carries no
+                // diagnostics. Catching here (inside the SDK's wrapper) lets
+                // the real message reach the agent, which is essential for
+                // self-correcting long-running sessions.
+                return new CallToolResult
+                {
+                    Content = [new TextContentBlock { Text = ex.Message }],
+                    IsError = true
+                };
+            }
+        };
+    }
+
+    private static async Task<CallToolResult> ExecuteAsync(
+        RequestContext<CallToolRequestParams> context,
+        CancellationToken cancellationToken,
+        McpRequestHandler<CallToolRequestParams, CallToolResult> next)
+    {
             var toolName = context.Params?.Name ?? "";
 
             // Look up the tool
@@ -80,8 +110,27 @@ public static class CallToolFilters
                 };
             }
 
-            return await next(context, cancellationToken);
-        };
+            // Serialize the whole tool invocation under the session gate so
+            // concurrent MCP calls cannot interleave DAP requests or race the
+            // state machine. The gate also fails fast with a clear error when
+            // the session was cleaned up underneath a caller.
+            try
+            {
+                return await session.WithSessionLockAsync<CallToolResult>(
+                    () => next(context, cancellationToken));
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return new CallToolResult
+                {
+                    Content = [new TextContentBlock { Text = ex.Message }],
+                    IsError = true
+                };
+            }
     }
 
     private static DebugSession ResolveSession(

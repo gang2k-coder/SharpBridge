@@ -36,6 +36,40 @@ public class DebugSession : IDisposable
     private IDisposable? _adapter;
 
     // ===================================================================
+    // Per-session gate — serializes all tool calls that touch the DAP
+    // connection so concurrent MCP calls cannot interleave requests or
+    // race the state machine. Capture auto-continue also takes this gate.
+    // ===================================================================
+    private readonly SemaphoreSlim _sessionGate = new(1, 1);
+
+    /// <summary>
+    /// Upper bound for buffered SharpDbg output lines. Prevents unbounded
+    /// memory growth on long-running sessions with chatty debuggees.
+    /// </summary>
+    public const int MaxOutputLogLines = 5000;
+
+    /// <summary>
+    /// Runs <paramref name="action"/> under the per-session gate so that at
+    /// most one tool call touches the DAP connection at a time. Also guards
+    /// against calling into a cleaned-up session (host already disposed).
+    /// </summary>
+    public async Task<T> WithSessionLockAsync<T>(Func<ValueTask<T>> action)
+    {
+        await _sessionGate.WaitAsync();
+        try
+        {
+            if (_host is null)
+                throw new InvalidOperationException(
+                    "The debug session is no longer active (process exited or disconnected). Start a new session.");
+            return await action().ConfigureAwait(false);
+        }
+        finally
+        {
+            _sessionGate.Release();
+        }
+    }
+
+    // ===================================================================
     // StoppedEvent TCS — swapped before each async operation
     // ===================================================================
     private TaskCompletionSource<StoppedEvent> _pendingStopTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -743,6 +777,8 @@ public class DebugSession : IDisposable
         int timeoutSeconds = 30,
         CancellationToken ct = default)
     {
+        if (timeoutSeconds < 0)
+            throw new ArgumentException("timeoutSeconds must be >= 0 (0 = no timeout).", nameof(timeoutSeconds));
         if (BreakpointCount == 0 && timeoutSeconds == 0)
         {
             throw new InvalidOperationException(
@@ -830,6 +866,8 @@ public class DebugSession : IDisposable
         int timeoutSeconds = 30,
         CancellationToken ct = default)
     {
+        if (timeoutSeconds < 0)
+            throw new ArgumentException("timeoutSeconds must be >= 0 (0 = no timeout).", nameof(timeoutSeconds));
         // Waiting is also valid when a stop already occurred while no tool
         // call was waiting — the client asked to wait for a stop, and one is
         // already there. Otherwise the debuggee must be running.
@@ -987,12 +1025,22 @@ public class DebugSession : IDisposable
             f.EndColumn ?? 0)).ToList();
     }
 
+    /// <summary>
+    /// Upper bound for recursive variable expansion (variables_get / capture
+    /// depth). Guards against request explosion on deep object graphs.
+    /// </summary>
+    public const int MaxExpandDepth = 10;
+
     public List<VariableInfo> GetVariablesForFrame(
         int frameId,
         string scope = "all",
         int depth = 0,
         IReadOnlySet<string>? expand = null)
     {
+        if (depth < 0)
+            throw new ArgumentException("depth must be >= 0.", nameof(depth));
+        if (depth > MaxExpandDepth)
+            throw new ArgumentException($"depth must be <= {MaxExpandDepth}.", nameof(depth));
         EnsureStopped();
         var scopes = GetScopes(frameId);
         if (scopes.Count == 0) return [];
@@ -1362,26 +1410,37 @@ public class DebugSession : IDisposable
 
     private void RunCaptureAndContinueAsync(int? threadId, string scope, int depth)
     {
-        try
+        // Deliberately does NOT take the session gate: this runs while a
+        // waiting tool call (debug_continue/debug_wait) holds the gate, and
+        // taking it here would deadlock — the waiting call only releases the
+        // gate after this capture's Continue makes progress. The race window
+        // with concurrent tool calls is tiny (capture only starts when a stop
+        // arrived with no waiting caller) and capture issues independent
+        // DAP requests, so worst case a concurrent query gets an error it
+        // can retry.
+        _ = Task.Run(() =>
         {
-            CaptureState(scope, depth);
-
-            var host = _host;
-            if (host is null || _stateMachine.Current is SessionState.Exited or SessionState.Detached)
+            try
             {
-                _logger.LogWarning("Capture recorded but the session is no longer active — skipping auto-continue.");
-                return;
-            }
+                CaptureState(scope, depth);
 
-            host.SendRequestSync(new ContinueRequest { ThreadId = threadId ?? 0 });
-            _stateMachine.TransitionTo(SessionState.Running);
-        }
-        catch (Exception ex)
-        {
-            // The debuggee may be left paused — log it so the hang is
-            // diagnosable instead of silent.
-            _logger.LogError(ex, "Capture auto-continue failed; the debuggee may remain paused");
-        }
+                var host = _host;
+                if (host is null || _stateMachine.Current is SessionState.Exited or SessionState.Detached)
+                {
+                    _logger.LogWarning("Capture recorded but the session is no longer active — skipping auto-continue.");
+                    return;
+                }
+
+                host.SendRequestSync(new ContinueRequest { ThreadId = threadId ?? 0 });
+                _stateMachine.TransitionTo(SessionState.Running);
+            }
+            catch (Exception ex)
+            {
+                // The debuggee may be left paused — log it so the hang is
+                // diagnosable instead of silent.
+                _logger.LogError(ex, "Capture auto-continue failed; the debuggee may remain paused");
+            }
+        });
     }
 
     private void OnExited(ExitedEvent e)
@@ -1417,6 +1476,12 @@ public class DebugSession : IDisposable
     private void OnOutput(OutputEvent e)
     {
         _outputLog.Add(e.Output ?? "");
+
+        // Bound the buffered log so chatty debuggees cannot grow memory
+        // without limit on long-running sessions. Trim in bulk (doubling
+        // threshold) so bursts of output stay amortized O(1) per line.
+        if (_outputLog.Count >= MaxOutputLogLines * 2)
+            _outputLog.RemoveRange(0, _outputLog.Count - MaxOutputLogLines);
     }
 
     // ===================================================================

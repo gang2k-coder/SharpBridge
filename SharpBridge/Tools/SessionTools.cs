@@ -76,13 +76,20 @@ public class SessionTools(DebugSessionManager manager)
     }
 
     [McpServerTool, Description("Disconnect the debugger from a session and optionally terminate the debuggee.")]
-    public string DebugDisconnect(
+    public async Task<string> DebugDisconnect(
         [Description("Whether to terminate the debugged process (default: true)")] bool terminateDebuggee = true,
         [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
         [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
         var session = ResolveSession(processId, processName);
-        _manager.DisconnectSession(session.ProcessId, terminateDebuggee);
+
+        // Take the session gate so a concurrent tool call cannot interleave
+        // DAP traffic with the DisconnectRequest.
+        await session.WithSessionLockAsync(() =>
+        {
+            _manager.DisconnectSession(session.ProcessId, terminateDebuggee);
+            return ValueTask.FromResult(true);
+        });
 
         return JsonSerializer.Serialize(new
         {

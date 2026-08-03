@@ -6,6 +6,7 @@ using System.Diagnostics;
 bool throwMode = args.Length > 0 && args[0] == "--throw";
 bool noWait = args.Length > 0 && args[0] == "--no-wait";
 bool gapMode = args.Length > 0 && args[0] == "--gap";
+bool spamMode = args.Contains("--spam");
 
 // Show PID for attach and pause to give time to connect
 Console.WriteLine($"PID: {Environment.ProcessId}");
@@ -57,6 +58,14 @@ Console.WriteLine($"\nFinal counter: {counter}");
 Console.WriteLine($"Message: {message}");
 Console.WriteLine("Done!");
 LoopEnd.Signal();
+
+// --spam mode: burst of output AFTER the loop so breakpoints on loop lines
+// keep their hardcoded line numbers. Exercises SharpBridge's output-log bounds.
+if (spamMode)
+{
+    for (int i = 0; i < 8000; i++)
+        Console.WriteLine($"spam line {i}");
+}
 
 static int DoubleValue(int x)
 {
