@@ -19,3 +19,4 @@ nupkg/
 
 # Superpowers planning docs — never published to GitHub
 docs/superpowers/
+.pi
