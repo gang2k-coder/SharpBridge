@@ -350,6 +350,16 @@ public class DebugSession : IDisposable
     }
 
     private readonly Dictionary<(string File, int Line), BreakpointEntry> _bpConfigs = [];
+
+    // Guards _bpConfigs: written by tool threads (breakpoint_set, inside the
+    // session gate) and read by the DAP reader thread (OnStopped capture
+    // resolution), which must never wait on the session gate (deadlock: a
+    // waiting tool holds it). A short dedicated lock keeps both sides safe.
+    private readonly object _bpConfigsLock = new();
+
+    // Guards _captures: written by tool threads and by the capture
+    // auto-continue task (deliberately outside the session gate).
+    private readonly object _capturesLock = new();
     private readonly Dictionary<int, BreakpointEntry> _bpsByAdapterId = [];
 
     /// <summary>Normalized path → the FIRST path form used to set breakpoints in that file.
@@ -397,8 +407,11 @@ public class DebugSession : IDisposable
 
         // Drop stale capture configs for this file — the set below replaces
         // all breakpoints in it, so old configs must not survive.
-        foreach (var staleKey in _bpConfigs.Keys.Where(k => k.File == normalizedFile).ToList())
-            _bpConfigs.Remove(staleKey);
+        lock (_bpConfigsLock)
+        {
+            foreach (var staleKey in _bpConfigs.Keys.Where(k => k.File == normalizedFile).ToList())
+                _bpConfigs.Remove(staleKey);
+        }
 
         var entries = new List<BreakpointEntry>();
         var sourceBreakpoints = new List<SourceBreakpoint>();
@@ -428,10 +441,13 @@ public class DebugSession : IDisposable
             // normalized to match the hit location SharpDbg reports in the
             // stopped event.
             var configKey = (normalizedFile, line);
-            if (action == "capture")
-                _bpConfigs[configKey] = entry;
-            else
-                _bpConfigs.Remove(configKey);
+            lock (_bpConfigsLock)
+            {
+                if (action == "capture")
+                    _bpConfigs[configKey] = entry;
+                else
+                    _bpConfigs.Remove(configKey);
+            }
 
             var sbp = new SourceBreakpoint { Line = line };
             if (col.HasValue) sbp.Column = col.Value;
@@ -464,8 +480,11 @@ public class DebugSession : IDisposable
                     // Re-key the capture config so hit-location lookups still
                     // match when the adapter adjusts the line (e.g. moved to
                     // the next executable statement).
-                    if (_bpConfigs.Remove(oldKey))
-                        _bpConfigs[(normalizedFile, entries[i].Line)] = entries[i];
+                    lock (_bpConfigsLock)
+                    {
+                        if (_bpConfigs.Remove(oldKey))
+                            _bpConfigs[(normalizedFile, entries[i].Line)] = entries[i];
+                    }
                 }
             }
         }
@@ -658,16 +677,25 @@ public class DebugSession : IDisposable
             Line: frame?.Line ?? 0,
             Variables: frame is null ? [] : GetVariablesForFrame(frame.Id, scope, depth),
             Timestamp: DateTime.UtcNow);
-        _captures.Add(snapshot);
+        lock (_capturesLock)
+            _captures.Add(snapshot);
         return snapshot;
     }
 
-    public IReadOnlyList<CaptureSnapshot> GetCaptures() => _captures;
+    public IReadOnlyList<CaptureSnapshot> GetCaptures()
+    {
+        // Snapshot copy: callers iterate outside the lock.
+        lock (_capturesLock)
+            return _captures.ToList();
+    }
 
     public void ClearCaptures()
     {
-        _captures.Clear();
-        _captureIndex = 0;
+        lock (_capturesLock)
+        {
+            _captures.Clear();
+            _captureIndex = 0;
+        }
     }
 
     // ===================================================================
@@ -730,15 +758,20 @@ public class DebugSession : IDisposable
         CancellationToken ct,
         TaskCompletionSource<StoppedEvent> stopTcs)
     {
-        var timeoutSpan = timeoutSeconds > 0
-            ? TimeSpan.FromSeconds(timeoutSeconds)
-            : Timeout.InfiniteTimeSpan;
-        var timeoutTask = Task.Delay(timeoutSpan);
-        var cancelTask = Task.Delay(Timeout.Infinite, ct);
+        // Single linked CTS drives both timeout and cancellation so the delay
+        // timer is always released when this method returns (no leaked
+        // Task.Delay timers on long sessions). CancelAfter(timeout) only
+        // arms when a positive timeout is given; otherwise the token just
+        // follows user cancellation.
+        using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        if (timeoutSeconds > 0)
+            waitCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+
+        var delayTask = Task.Delay(Timeout.InfiniteTimeSpan, waitCts.Token);
 
         _logger.LogInformation("WaitForStop: waiting (timeout={Timeout}s)...", timeoutSeconds);
 
-        var completed = await Task.WhenAny(stopTcs.Task, timeoutTask, cancelTask);
+        var completed = await Task.WhenAny(stopTcs.Task, delayTask);
 
         // Tie-safe: a stop completing at the same instant as the timeout still
         // counts as a delivered stop — never report "running" when a stop
@@ -757,7 +790,7 @@ public class DebugSession : IDisposable
             return LastStop;
         }
 
-        if (completed == cancelTask)
+        if (ct.IsCancellationRequested)
         {
             _logger.LogInformation("WaitForStop: cancelled by user");
             return new StopEvent("running", null, null, "cancelled", null, 0, 0)
@@ -1350,10 +1383,13 @@ public class DebugSession : IDisposable
         if (!TryGetHitLocation(e, out var file, out var line))
             return null;
 
-        return _bpConfigs.TryGetValue((NormalizePath(file), line), out var cfg)
-            && cfg.Action == "capture"
-            ? new CaptureResolution(cfg.CaptureScope ?? "all", cfg.CaptureDepth)
-            : null;
+        lock (_bpConfigsLock)
+        {
+            return _bpConfigs.TryGetValue((NormalizePath(file), line), out var cfg)
+                && cfg.Action == "capture"
+                ? new CaptureResolution(cfg.CaptureScope ?? "all", cfg.CaptureDepth)
+                : null;
+        }
     }
 
     /// <summary>
