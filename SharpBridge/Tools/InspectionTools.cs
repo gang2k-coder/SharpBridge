@@ -162,6 +162,7 @@ public class InspectionTools(DebugSessionManager manager)
             expression,
             result = result.Result,
             type = result.Type,
+            isError = result.IsError,
             variablesReference = result.VariablesReference,
             hint = result.VariablesReference > 0
                 ? "Result is a complex object. Use variables_expand to inspect its members."

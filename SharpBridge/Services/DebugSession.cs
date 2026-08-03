@@ -1076,7 +1076,10 @@ public class DebugSession : IDisposable
             throw new ArgumentException($"depth must be <= {MaxExpandDepth}.", nameof(depth));
         EnsureStopped();
         var scopes = GetScopes(frameId);
-        if (scopes.Count == 0) return [];
+        if (scopes.Count == 0)
+            throw new InvalidOperationException(
+                $"Frame {frameId} not found in the current stack. " +
+                "Re-fetch the stack with stacktrace_get after any step or continue.");
 
         List<ScopeInfo> selected = scope switch
         {
@@ -1162,7 +1165,9 @@ public class DebugSession : IDisposable
             FrameId = frameId,
             Context = EvaluateArguments.ContextValue.Repl
         });
-        return new EvalResult(response.Result, response.Type, response.VariablesReference);
+        var isError = response.PresentationHint?.Attributes?.HasFlag(
+            VariablePresentationHint.AttributesValue.FailedEvaluation) == true;
+        return new EvalResult(response.Result, response.Type, response.VariablesReference, isError);
     }
 
     public ExceptionDetail? GetExceptionInfo(int? threadId = null)
@@ -1544,7 +1549,7 @@ public class DebugSession : IDisposable
             "stopped",
             e.ThreadId,
             e.AllThreadsStopped,
-            e.Reason.ToString(),
+            e.Reason.ToString().ToLowerInvariant(),
             file,
             line,
             0)
@@ -1587,7 +1592,7 @@ public record VariableInfo(
 {
     public List<VariableInfo>? Children { get; init; }
 }
-public record EvalResult(string Result, string? Type, int VariablesReference);
+public record EvalResult(string Result, string? Type, int VariablesReference, bool IsError = false);
 public record ExceptionDetail(
     string ExceptionId, string Description, string BreakMode,
     string? Message, string? TypeName, string? FullTypeName,

@@ -726,6 +726,15 @@ try
             $"Scope error must carry the message: {((TextContentBlock)r18d.Content[0]).Text}");
     }
 
+    // Invalid frameId must fail loudly, not silently return empty variables
+    {
+        var r18e = await client.CallToolAsync("variables_get",
+            new Dictionary<string, object?> { ["frameId"] = 999999 });
+        Assert(r18e.IsError == true, "Invalid frameId must be rejected");
+        Assert(((TextContentBlock)r18e.Content[0]).Text.Contains("Frame"),
+            $"Frame error must carry the message: {((TextContentBlock)r18e.Content[0]).Text}");
+    }
+
     // Session must still be healthy after all rejections
     var state18 = JsonDocument.Parse(GetText(
         await client.CallToolAsync("debug_state", new Dictionary<string, object?>())));
@@ -1009,8 +1018,8 @@ try
         await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 20 })));
     Assert(exStop.RootElement.GetProperty("status").GetString() == "stopped", "Exception stop failed");
     var exReason = exStop.RootElement.GetProperty("reason").GetString() ?? "";
-    Assert(exReason.Equals("exception", StringComparison.OrdinalIgnoreCase),
-        $"Expected reason=exception, got {exReason}");
+    Assert(exReason == "exception",
+        $"Expected normalized reason=exception, got {exReason}");
 
     var exInfo = JsonDocument.Parse(GetText(
         await client.CallToolAsync("exception_info", new Dictionary<string, object?>())));
@@ -1078,13 +1087,13 @@ try
     Assert(await Eval("Calculator.Add(counter, 2)") == "2", $"method call eval: {await Eval("Calculator.Add(counter, 2)")}");
     Assert(await Eval("enumVar") == "Normal", $"enum eval: {await Eval("enumVar")}");
     Assert((await Eval("message")).Contains("Hello from debuggee"), $"string eval: {await Eval("message")}");
-    // Invalid expression must produce an error result, not a crash
+    // Invalid expression must carry isError=true (SharpDbg's FailedEvaluation
+    // PresentationHint is now surfaced), not look like a real value
     var badEval = await client.CallToolAsync("evaluate",
         new Dictionary<string, object?> { ["expression"] = "this_is_not_a_variable_xyz", ["frameId"] = evFrame });
-    var badText = ((TextContentBlock)badEval.Content[0]).Text;
-    Assert(badEval.IsError == true || badText.Contains("error", StringComparison.OrdinalIgnoreCase)
-        || badText.Contains("not", StringComparison.OrdinalIgnoreCase),
-        $"Invalid eval must error gracefully: {badText}");
+    var badJson = JsonDocument.Parse(((TextContentBlock)badEval.Content[0]).Text);
+    Assert(badJson.RootElement.GetProperty("isError").GetBoolean() == true,
+        $"Invalid eval must set isError=true: {((TextContentBlock)badEval.Content[0]).Text}");
     await client.CallToolAsync("debug_disconnect",
         new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid15 });
     Console.WriteLine("   ✅");
