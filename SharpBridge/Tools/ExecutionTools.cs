@@ -13,11 +13,16 @@ public class ExecutionTools(DebugSessionManager manager)
     private readonly DebugSessionManager _manager = manager;
 
     [McpServerTool]
-    [AllowedState(SessionState.Attaching, SessionState.Stopped)]
+    [AllowedState(SessionState.Attaching, SessionState.Stopped, SessionState.Running)]
     [Description("Continue program execution. Runs until a breakpoint, " +
-        "exception, or exit. If capture-action breakpoints are set, they will " +
+        "exception, or exit. If the program is ALREADY running (e.g. right after " +
+        "debug_launch, which returns running because the adapter has no " +
+        "stopAtEntry), this waits for the next stop instead of resuming. " +
+        "If capture-action breakpoints are set, they will " +
         "auto-capture variables and continue silently — use get_captures afterwards. " +
         "When a break-action breakpoint or non-breakpoint stop occurs, returns the stop event. " +
+        "If a capture auto-continue fails, the real stop is returned (status 'stopped') " +
+        "with a note — inspect it and call debug_continue again to resume. " +
         "On timeout, returns status 'running' without pausing — use debug_wait to keep " +
         "waiting for a breakpoint, or debug_pause to interrupt and inspect state. " +
         "If the program stopped while you were not waiting (e.g. after a previous timeout), " +

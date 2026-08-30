@@ -567,6 +567,58 @@ try
     Console.WriteLine("   ✅ PASS (normalized key, incremental pattern, capture preserved, IDs refreshed)");
     Console.WriteLine();
 
+    // === Step 20: Two adjacent capture breakpoints recover to exit ===
+    // A capture pair makes the debugger ping-pong between the two lines on
+    // every auto-continue — the tightest loop for the capture/state-machine
+    // race (stop-generation guard + truthful capture-failure delivery).
+    // Whatever interleaving occurs (capture succeeds, is superseded, or
+    // fails), the session must recover: repeated continues must drive the
+    // debuggee to exit. Regression for the capture-freeze bug.
+    Console.WriteLine("20. Two adjacent capture breakpoints recover to exit...");
+    var psi7 = new ProcessStartInfo("dotnet", debuggeeDll)
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    psi7.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var debuggee7 = Process.Start(psi7)!;
+    int pid7 = debuggee7.Id;
+
+    using var session7 = new DebugSession(loggerFactory.CreateLogger<DebugSession>());
+    await session7.AttachAsync(pid7);
+    session7.SetBreakpoints(sourceFile,
+        (Line: 51, Column: null, Condition: null, HitCondition: null,
+         Action: "capture", CaptureScope: "all", CaptureDepth: 0),
+        (Line: 53, Column: null, Condition: null, HitCondition: null,
+         Action: "capture", CaptureScope: "all", CaptureDepth: 0));
+    await debuggee7.StandardInput.WriteLineAsync();
+
+    StopEvent? last7 = null;
+    bool exited7 = false;
+    for (int round = 0; round < 6 && !exited7; round++)
+    {
+        last7 = await session7.ContinueAndWaitAsync(timeoutSeconds: 10);
+        if (last7.Status == "stopped")
+        {
+            // A capture failure must be delivered as a TRUTHFUL stop with an
+            // explanatory note — never a silent freeze behind a "running".
+            Assert(session7.CurrentState == SessionState.Stopped,
+                $"State must be Stopped when a stop is delivered, got {session7.CurrentState}");
+            Assert(last7.Note is not null && last7.Note.Contains("Capture auto-continue failed"),
+                $"Capture failure stop must carry the explanatory note, got: {last7.Note}");
+            Console.WriteLine($"   capture failure delivered truthfully (round {round}): {last7.Note[..Math.Min(60, last7.Note.Length)]}");
+        }
+        exited7 = last7.Status == "exited";
+    }
+    Assert(exited7,
+        $"Debuggee should reach exit through capture auto-continue; last status={last7?.Status}, state={session7.CurrentState}");
+    Assert(session7.GetCaptures().Count > 0, "Expected at least one capture snapshot");
+
+    session7.Disconnect(terminateDebuggee: true);
+    if (!debuggee7.HasExited) debuggee7.Kill();
+    Console.WriteLine($"   ✅ PASS (reached exit with {session7.GetCaptures().Count} captures)");
+    Console.WriteLine();
+
     Console.WriteLine("=== ALL TESTS PASSED ✅ ===");
 }
 catch (Exception ex)

@@ -38,9 +38,21 @@ public class DebugSession : IDisposable
     // ===================================================================
     // Per-session gate — serializes all tool calls that touch the DAP
     // connection so concurrent MCP calls cannot interleave requests or
-    // race the state machine. Capture auto-continue also takes this gate.
+    // race the state machine.
     // ===================================================================
     private readonly SemaphoreSlim _sessionGate = new(1, 1);
+
+    /// <summary>
+    /// Serializes capture auto-continue tasks: capture + resume must not run
+    /// concurrently (two captures interleave DAP round-trips — eval-driven
+    /// variable expansion even resumes the debuggee mid-capture — and race
+    /// the state machine; that was the capture-freeze bug). Deliberately NOT
+    /// the session gate: a waiting debug_continue holds that gate for its
+    /// whole timeout, and capture must be able to make progress underneath.
+    /// No deadlock cycle: capture tasks never wait on the session gate, and
+    /// tool calls never wait on this gate.
+    /// </summary>
+    private readonly SemaphoreSlim _captureGate = new(1, 1);
 
     /// <summary>
     /// Upper bound for buffered SharpDbg output lines. Prevents unbounded
@@ -79,6 +91,22 @@ public class DebugSession : IDisposable
     // ===================================================================
     private long _stopSequence;
     private long _lastObservedSeq;
+
+    /// <summary>
+    /// Monotonic id of the most recent stop. Capture tasks record the id of
+    /// the stop they were spawned for and refuse to resume/transition when a
+    /// newer stop has superseded theirs — this is what keeps the state
+    /// machine honest when capture auto-continue races with the next stop.
+    /// </summary>
+    private long _stopGeneration;
+
+    /// <summary>
+    /// Raw DAP stopped event of the most recent stop. Capture-failure delivery
+    /// reuses it so the client receives the real stop instead of a fabricated
+    /// one. Written on the reader thread (OnStopped), read by capture tasks —
+    /// reference read, benign if stale.
+    /// </summary>
+    private StoppedEvent? _lastDapStop;
 
     // ===================================================================
     // Session state
@@ -247,14 +275,14 @@ public class DebugSession : IDisposable
         {
             _host.SendRequestSync(new ConfigurationDoneRequest());
         }
-        catch
+        catch (Exception ex)
         {
-            // Only roll back when no event changed the state — the debuggee
-            // may already be running, stopped, or exited (real states that
-            // must not be overwritten).
-            if (_stateMachine.Current == SessionState.Running)
-                _stateMachine.TransitionTo(SessionState.Attaching);
-            throw;
+            // A failed ConfigurationDone means the launch/attach did not
+            // complete. Running→Attaching is not a valid state-machine
+            // transition (it would throw and MASK this error), so do not
+            // roll back — surface the real failure to the caller instead.
+            _logger.LogError(ex, "ConfigurationDone failed (state={State})", _stateMachine.Current);
+            throw new InvalidOperationException($"ConfigurationDone failed: {ex.GetType().Name}: {ex.Message}", ex);
         }
 
 
@@ -738,6 +766,8 @@ public class DebugSession : IDisposable
     {
         Interlocked.Exchange(ref _stopSequence, 0);
         Interlocked.Exchange(ref _lastObservedSeq, 0);
+        Interlocked.Exchange(ref _stopGeneration, 0);
+        _lastDapStop = null;
         // New process lifecycle: drop canonical path forms from the previous
         // process (the new process may live at a different path).
         _canonicalPaths.Clear();
@@ -781,7 +811,12 @@ public class DebugSession : IDisposable
             _logger.LogInformation("WaitForStop: stop event received");
             ObserveStopState();
             if (_stateMachine.Current == SessionState.Exited) return LastStop;
-            return BuildStopEvent(stopTcs.Task.Result);
+            var built = BuildStopEvent(stopTcs.Task.Result);
+            // Capture-failure delivery sets a note on _lastStop (the raw DAP
+            // event cannot carry one) — surface it to the waiting caller.
+            if (built.Note is null && _lastStop?.Note is { } note)
+                built = built with { Note = note };
+            return built;
         }
 
         if (_stateMachine.Current == SessionState.Exited)
@@ -819,6 +854,14 @@ public class DebugSession : IDisposable
                 "Set a breakpoint with breakpoint_set first, " +
                 "or specify a timeout value (e.g. timeout=30).");
         }
+
+        // Right after debug_launch the debuggee is already running (SharpDbg
+        // has no stopAtEntry, so launch returns honestly with state Running).
+        // "Continue" then means "wait for the next stop" — resuming a running
+        // process is superfluous and SharpDbg would reject the request.
+        // Delegate to the wait path, which swaps the TCS and waits.
+        if (_stateMachine.Current == SessionState.Running)
+            return await WaitAndWaitAsync(timeoutSeconds, ct).ConfigureAwait(false);
 
         if (_stateMachine.Current != SessionState.Stopped && _stateMachine.Current != SessionState.Attaching)
             throw new InvalidOperationException($"Cannot continue: debugger state is {_stateMachine.Current}.");
@@ -866,14 +909,18 @@ public class DebugSession : IDisposable
                 _host!.SendRequestSync(new ContinueRequest { ThreadId = _lastStop?.ThreadId ?? 0 });
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Only roll back when no event has changed the state since — the
-            // debuggee may already be running, stopped, or exited; those are
-            // real states and must not be overwritten.
-            if (_stateMachine.Current == SessionState.Running)
+            // A failed resume command. Rolling back is only valid when the
+            // prior state was Stopped (Running→Stopped is legal). For an
+            // Attaching resume, Running→Attaching is NOT a legal transition
+            // and the old rollback threw, MASKING the real failure — surface
+            // the original error instead.
+            if (_stateMachine.Current == SessionState.Running && previousState == SessionState.Stopped)
                 _stateMachine.TransitionTo(previousState);
-            throw;
+            _logger.LogError(ex, "Resume command failed (state={State}, previous={Previous})",
+                _stateMachine.Current, previousState);
+            throw new InvalidOperationException($"Resume failed: {ex.GetType().Name}: {ex.Message}", ex);
         }
 
         // A stop may have arrived while the command was in flight (e.g. a
@@ -1327,6 +1374,10 @@ public class DebugSession : IDisposable
         _logger.LogInformation("→ OnStopped: reason={Reason}, thread={ThreadId}, state={State}",
             e.Reason, e.ThreadId, _stateMachine.Current);
 
+        // Bump the stop generation FIRST: capture tasks compare against it to
+        // detect that a newer stop superseded the one they serve.
+        var generation = Interlocked.Increment(ref _stopGeneration);
+
         _activeThreadId = e.ThreadId;
         _stateMachine.TransitionTo(SessionState.Stopped);
 
@@ -1334,6 +1385,7 @@ public class DebugSession : IDisposable
         // step/pause re-checks all rely on _lastStop being set for every stop.
         // Assignments happen on the reader thread while the process is frozen
         // (no Continue has been sent), so there is no concurrent writer.
+        _lastDapStop = e;
         _lastStop = BuildStopEvent(e);
 
         // Capture-action breakpoints auto-capture and continue without waking
@@ -1347,7 +1399,7 @@ public class DebugSession : IDisposable
                 // Offload capture to thread pool — don't block the DAP reader.
                 // DO NOT touch _pendingStopTcs — the caller keeps waiting and
                 // the next stop (or exit) resolves it.
-                _ = Task.Run(() => RunCaptureAndContinueAsync(e.ThreadId, capture.Scope, capture.Depth));
+                _ = Task.Run(() => RunCaptureAndContinueAsync(e.ThreadId, generation, capture.Scope, capture.Depth));
                 _logger.LogInformation("← OnStopped: auto-continue (capture), TCS not touched, thread={ThreadId}", e.ThreadId);
                 return;
             }
@@ -1449,18 +1501,16 @@ public class DebugSession : IDisposable
 
     private readonly record struct CaptureResolution(string Scope, int Depth);
 
-    private void RunCaptureAndContinueAsync(int? threadId, string scope, int depth)
+    private void RunCaptureAndContinueAsync(int? threadId, long stopGeneration, string scope, int depth)
     {
-        // Deliberately does NOT take the session gate: this runs while a
-        // waiting tool call (debug_continue/debug_wait) holds the gate, and
-        // taking it here would deadlock — the waiting call only releases the
-        // gate after this capture's Continue makes progress. The race window
-        // with concurrent tool calls is tiny (capture only starts when a stop
-        // arrived with no waiting caller) and capture issues independent
-        // DAP requests, so worst case a concurrent query gets an error it
-        // can retry.
-        _ = Task.Run(() =>
+        _ = Task.Run(async () =>
         {
+            // Serialize capture tasks: two captures in flight would interleave
+            // DAP round-trips (and the adapter's variable evals even resume the
+            // debuggee mid-capture), racing the state machine. The generation
+            // guard below re-checks AFTER the gate so a superseded stop skips
+            // cleanly instead of double-resuming.
+            await _captureGate.WaitAsync().ConfigureAwait(false);
             try
             {
                 CaptureState(scope, depth);
@@ -1472,16 +1522,80 @@ public class DebugSession : IDisposable
                     return;
                 }
 
-                host.SendRequestSync(new ContinueRequest { ThreadId = threadId ?? 0 });
+                // A newer stop superseded this one while we were capturing —
+                // do NOT resume: that stop's own capture task owns the resume
+                // decision. Resuming here would race (and corrupt) the state
+                // machine, and the newest stop is frozen awaiting its task.
+                if (Interlocked.Read(ref _stopGeneration) != stopGeneration)
+                {
+                    _logger.LogInformation(
+                        "Capture auto-continue skipped: a newer stop superseded this one (gen {Served} -> {Current}).",
+                        stopGeneration, Interlocked.Read(ref _stopGeneration));
+                    return;
+                }
+
+                // Declare Running BEFORE sending the resume command (same
+                // pattern as ContinueAndWaitAsync): a stop that arrives while
+                // the request is in flight transitions Running->Stopped on the
+                // reader thread and is never overwritten by this task.
                 _stateMachine.TransitionTo(SessionState.Running);
+                host.SendRequestSync(new ContinueRequest { ThreadId = threadId ?? 0 });
             }
             catch (Exception ex)
             {
-                // The debuggee may be left paused — log it so the hang is
-                // diagnosable instead of silent.
-                _logger.LogError(ex, "Capture auto-continue failed; the debuggee may remain paused");
+                CaptureFailed(ex, stopGeneration);
+            }
+            finally
+            {
+                _captureGate.Release();
             }
         });
+    }
+
+    /// <summary>
+    /// Auto-continue did not happen (capture error, superseded-stop race,
+    /// adapter error) while the debuggee is still paused at the breakpoint.
+    /// Deliver the truth to any waiting caller instead of letting the wait
+    /// time out into a lying "running": bump the ledger, resolve the pending
+    /// stop TCS with the real stop event, and keep the state Stopped.
+    /// </summary>
+    private void CaptureFailed(Exception ex, long stopGeneration)
+    {
+        _logger.LogError(ex,
+            "Capture auto-continue failed; delivering the stop to the client instead of leaving the debuggee silently paused.");
+
+        // A newer stop already owns the delivery (OnStopped bumped the ledger
+        // and resolved the TCS) — do not double-deliver.
+        if (Interlocked.Read(ref _stopGeneration) != stopGeneration)
+        {
+            _logger.LogWarning("Capture failure superseded by a newer stop; the newer stop's delivery path owns the session.");
+            return;
+        }
+
+        // Exit/disconnect already owns the state and TCS — do not override.
+        if (_stateMachine.Current is SessionState.Exited or SessionState.Detached)
+            return;
+
+        // Running->Stopped (we declared Running before a failed send) and
+        // Stopped->Stopped are both valid — re-establish the truth.
+        _stateMachine.TransitionTo(SessionState.Stopped);
+
+        var note = "Capture auto-continue failed: " + ex.Message +
+                   " The debuggee is STOPPED at the breakpoint — inspect it, then call debug_continue to resume.";
+        _lastStop = _lastStop is { } last
+            ? last with { Note = note }
+            : new StopEvent("stopped", _lastDapStop?.ThreadId, _lastDapStop?.AllThreadsStopped,
+                "breakpoint", null, 0, 0) { Note = note };
+
+        // Same delivery order as OnStopped: bump the ledger BEFORE resolving
+        // the TCS, so the waking caller observes the sequence and the next
+        // debug_continue resumes normally instead of re-delivering the stop.
+        Interlocked.Increment(ref _stopSequence);
+        var newTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var old = Interlocked.Exchange(ref _pendingStopTcs, newTcs);
+        old.TrySetResult(_lastDapStop ?? new StoppedEvent(reason: StoppedEvent.ReasonValue.Breakpoint));
+        _logger.LogInformation("Capture failure delivered as a stop (reason=breakpoint, state={State})",
+            _stateMachine.Current);
     }
 
     private void OnExited(ExitedEvent e)
