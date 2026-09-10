@@ -10,6 +10,7 @@ var passed = 0;
 
 var serverProj = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../SharpBridge"));
 var debuggeeProj = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../TestDebuggee"));
+var captureDebuggeeProj = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../CaptureDebuggee"));
 
 // Build into an isolated artifacts directory: the C# extension in VS Code
 // (Roslyn / Dev Kit design-time builds) touches the default obj/ dirs, which
@@ -45,6 +46,7 @@ void BuildOrThrow(string project, string label)
 // Build
 BuildOrThrow(serverProj, "Server");
 BuildOrThrow(debuggeeProj, "Debuggee");
+BuildOrThrow(captureDebuggeeProj, "CaptureDebuggee");
 
 // Resolve outputs — the artifacts layout lower-cases the configuration
 // directory (bin/<Project>/debug/net10.0), so search by file name instead
@@ -58,6 +60,8 @@ static string FindOutputDll(string artifactsDir, string projectName)
 
 var serverDll = FindOutputDll(e2eArtifacts, "SharpBridge");
 var debuggeeDll = FindOutputDll(e2eArtifacts, "TestDebuggee");
+var captureDebuggeeDll = FindOutputDll(e2eArtifacts, "CaptureDebuggee");
+var captureDebuggeeSrc = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../CaptureDebuggee/Program.cs"));
 
 // Start debuggee with diagnostic suspend — CLR freezes until ResumeRuntime
 var psi = new ProcessStartInfo("dotnet", [debuggeeDll])
@@ -1133,6 +1137,204 @@ try
         $"Expected back in Main, got {outSt.RootElement.GetProperty("frames")[0].GetProperty("name").GetString()}");
     await client.CallToolAsync("debug_disconnect",
         new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = pid16 });
+    Console.WriteLine("   ✅");
+
+    // ===================================================================
+    // get_captures_v2 P0 tests — CaptureDebuggee (synthetic payloads).
+    // ===================================================================
+
+    // Test 37: v2 summary shape, breakpointId recording, filters, budget, full.
+    tests++; passed++;
+    Console.WriteLine("37. get_captures_v2 summary/filters/breakpointId/budget...");
+    var cpsi = new ProcessStartInfo("dotnet", [captureDebuggeeDll])
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    cpsi.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var cdbg = Process.Start(cpsi)!;
+    var cpid = cdbg.Id;
+    var cAttachJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = cpid })));
+    Assert(cAttachJson.RootElement.GetProperty("status").GetString() == "attached", "CaptureDebuggee attach failed");
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = cpid });
+
+    const int cdCounterLine = 24;   // counter++ inside the 4-iteration loop
+    var cBpJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
+        {
+            ["filePath"] = captureDebuggeeSrc, ["line"] = cdCounterLine, ["action"] = "capture"
+        })));
+    var cBpId = cBpJson.RootElement.GetProperty("id").GetInt32();
+
+    // Stop after the loop via a breakpoint in a second file (LoopEnd.Signal) —
+    // set while suspended at attach, binds when the module loads.
+    var cdLoopEndFile = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+        "../../../../CaptureDebuggee/LoopEnd.cs"));
+    const int cdLoopEndLine = 9;   // GC.KeepAlive(0); inside LoopEnd.Signal()
+    await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
+    {
+        ["filePath"] = cdLoopEndFile, ["line"] = cdLoopEndLine
+    });
+
+    await cdbg.StandardInput.WriteLineAsync();   // start the loop
+    var cContJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 30 })));
+    Assert(cContJson.RootElement.GetProperty("status").GetString() == "stopped",
+        $"Expected stopped at LoopEnd after the capture loop, got {cContJson.RootElement.GetProperty("status").GetString()}");
+    Assert(cContJson.RootElement.GetProperty("source").GetProperty("line").GetInt32() == cdLoopEndLine,
+        $"Expected stop at LoopEnd line {cdLoopEndLine}, got {cContJson.RootElement.GetProperty("source").GetProperty("line").GetInt32()}");
+
+    var cSumText = GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?> { ["format"] = "summary" }));
+    Assert(cSumText.Length < 8192, $"Summary over budget: {cSumText.Length} bytes");
+    var cSumJson = JsonDocument.Parse(cSumText);
+    Assert(cSumJson.RootElement.GetProperty("apiVersion").GetInt32() == 2, "apiVersion != 2");
+    Assert(cSumJson.RootElement.GetProperty("format").GetString() == "summary", "format != summary");
+    Assert(cSumJson.RootElement.GetProperty("totalCaptures").GetInt32() == 4,
+        $"Expected 4 captures, got {cSumJson.RootElement.GetProperty("totalCaptures").GetInt32()}");
+    Assert(cSumJson.RootElement.GetProperty("returned").GetInt32() == 4, "returned != 4");
+    Assert(cSumJson.RootElement.GetProperty("truncated").GetBoolean() == false, "truncated should be false");
+    var c0 = cSumJson.RootElement.GetProperty("captures")[0];
+    Assert(c0.GetProperty("index").GetInt32() == 1, "First capture index != 1");
+    Assert(c0.GetProperty("breakpointId").GetInt32() == cBpId,
+        $"breakpointId mismatch: {c0.GetProperty("breakpointId").GetInt32()} vs {cBpId}");
+    Assert(c0.GetProperty("source").GetProperty("file").GetString() == "Program.cs", "source.file wrong");
+    Assert(c0.GetProperty("source").GetProperty("line").GetInt32() == cdCounterLine, "source.line wrong");
+    var c0vars = c0.GetProperty("variables").EnumerateArray().ToList();
+    Assert(c0vars.First(v => v.GetProperty("name").GetString() == "payloadJson")
+        .GetProperty("value").GetString()!.StartsWith("<spilled:"), "payloadJson not spilled inline");
+    Assert(c0vars.First(v => v.GetProperty("name").GetString() == "referenceCurve")
+        .GetProperty("value").GetString()!.Contains("null"), "referenceCurve should be null");
+
+    // Filters: captureIndex whitelist, sourcePathContains+sourceLine, offset/limit.
+    var f1Json = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>
+        { ["captureIndex"] = new[] { 2, 3 } })));
+    Assert(f1Json.RootElement.GetProperty("totalCaptures").GetInt32() == 2, "captureIndex filter wrong");
+    Assert(f1Json.RootElement.GetProperty("captures")[0].GetProperty("index").GetInt32() == 2, "captureIndex first wrong");
+    var f2Json = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>
+        { ["sourcePathContains"] = "CaptureDebuggee", ["sourceLine"] = cdCounterLine })));
+    Assert(f2Json.RootElement.GetProperty("totalCaptures").GetInt32() == 4, "path/line filter wrong");
+    var f3Json = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>
+        { ["sourcePathContains"] = "CaptureDebuggee", ["sourceLine"] = cdCounterLine, ["offset"] = 1, ["limit"] = 2 })));
+    Assert(f3Json.RootElement.GetProperty("totalCaptures").GetInt32() == 4, "pagination total wrong");
+    Assert(f3Json.RootElement.GetProperty("returned").GetInt32() == 2, "pagination returned wrong");
+    Assert(f3Json.RootElement.GetProperty("captures")[0].GetProperty("index").GetInt32() == 2, "pagination first wrong");
+
+    // format=full: raw v1 shape (huge payloadJson value preserved) + apiVersion/format.
+    var cFullText = GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?> { ["format"] = "full" }));
+    var cFullJson = JsonDocument.Parse(cFullText);
+    Assert(cFullJson.RootElement.GetProperty("apiVersion").GetInt32() == 2, "full apiVersion != 2");
+    Assert(cFullJson.RootElement.GetProperty("format").GetString() == "full", "full format != full");
+    Assert(cFullJson.RootElement.GetProperty("count").GetInt32() == 4, "full count != 4");
+    var fullPayload = cFullJson.RootElement.GetProperty("captures")[0].GetProperty("variables")
+        .EnumerateArray().First(v => v.GetProperty("name").GetString() == "payloadJson")
+        .GetProperty("value").GetString()!;
+    Assert(fullPayload.Length > 50_000 && fullPayload.Contains("trackId"), "full payloadJson not raw");
+    Console.WriteLine("   ✅");
+
+    // Test 38: extract (JSON pick), not-json/variable-not-found errors, spillToFile.
+    tests++; passed++;
+    Console.WriteLine("38. get_captures_v2 extract + spill...");
+    var exText = GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>
+        {
+            ["extract"] = new Dictionary<string, object?>[]
+            {
+                new Dictionary<string, object?>
+                {
+                    ["variable"] = "payloadJson",
+                    ["type"] = "json",
+                    ["pick"] = new[] { "content.widget.tracks[0].channels[0].mnemonic", "content.widget.tracks[1].channels[4].mnemonic" }
+                }
+            }
+        }));
+    Assert(exText.Length < 8192, $"Extract summary over budget: {exText.Length} bytes");
+    var v2ExJson = JsonDocument.Parse(exText);
+    var v2ExCap = v2ExJson.RootElement.GetProperty("captures")[0];
+    var v2ExRes = v2ExCap.GetProperty("extracted")[0];
+    Assert(v2ExRes.GetProperty("variable").GetString() == "payloadJson", "extract variable wrong");
+    Assert(v2ExRes.GetProperty("picked").GetProperty("content.widget.tracks[0].channels[0].mnemonic").GetString() == "CH-00",
+        "pick CH-00 wrong");
+    Assert(v2ExRes.GetProperty("picked").GetProperty("content.widget.tracks[1].channels[4].mnemonic").GetString() == "CH-09",
+        "pick CH-09 wrong");
+    var v2ExPayload = v2ExCap.GetProperty("variables").EnumerateArray()
+        .First(v => v.GetProperty("name").GetString() == "payloadJson");
+    Assert(v2ExPayload.GetProperty("value").GetString()!.StartsWith("<json:"), "extracted payload not replaced inline");
+
+    var neJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>
+        {
+            ["extract"] = new Dictionary<string, object?>[]
+            {
+                new Dictionary<string, object?> { ["variable"] = "counter", ["type"] = "json", ["pick"] = new[] { "x" } },
+                new Dictionary<string, object?> { ["variable"] = "nope", ["type"] = "json", ["pick"] = new[] { "x" } }
+            }
+        })));
+    var ne0 = neJson.RootElement.GetProperty("captures")[0].GetProperty("extracted");
+    Assert(ne0[0].GetProperty("error").GetString() == "not-json", "counter should be not-json");
+    Assert(ne0[1].GetProperty("error").GetString() == "variable-not-found", "nope should be variable-not-found");
+
+    var spJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>
+        { ["captureIndex"] = new[] { 1 }, ["spillToFile"] = true })));
+    var sp0 = spJson.RootElement.GetProperty("captures")[0];
+    var spillPath = sp0.GetProperty("spillFile").GetString();
+    Assert(!string.IsNullOrEmpty(spillPath) && File.Exists(spillPath), $"spill file missing: {spillPath}");
+    var spillContent = File.ReadAllText(spillPath!);
+    Assert(spillContent.Contains("trackId"), "spill file lacks raw payload");
+    Assert(sp0.GetProperty("variables").EnumerateArray()
+        .First(v => v.GetProperty("name").GetString() == "payloadJson")
+        .GetProperty("value").GetString()!.StartsWith("<spilled:"), "spill inline not replaced");
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = cpid });
+    Console.WriteLine("   ✅");
+
+    // Test 39: debug_attach autoContinue — attach resumes; capture bps fire silently.
+    tests++; passed++;
+    Console.WriteLine("39. debug_attach autoContinue...");
+    var acpsi = new ProcessStartInfo("dotnet", [captureDebuggeeDll])
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    acpsi.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var acdbg = Process.Start(acpsi)!;
+    var acpid = acdbg.Id;
+    var acAttachJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_attach", new Dictionary<string, object?>
+        { ["processId"] = acpid, ["autoContinue"] = true })));
+    Assert(acAttachJson.RootElement.GetProperty("state").GetString() == "Running",
+        $"autoContinue state not Running: {acAttachJson.RootElement.GetProperty("state").GetString()}");
+    Assert(acAttachJson.RootElement.GetProperty("breakpointCount").GetInt32() == 0, "autoContinue breakpointCount != 0");
+    Assert(acAttachJson.RootElement.GetProperty("pendingBreakpoints").GetInt32() == 0, "autoContinue pending != 0");
+    Assert(acAttachJson.RootElement.GetProperty("note").GetString()!.Contains("resumed"), "autoContinue note wrong");
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = acpid });
+
+    await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
+    {
+        ["filePath"] = captureDebuggeeSrc, ["line"] = cdCounterLine, ["action"] = "capture"
+    });
+    await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
+    {
+        ["filePath"] = cdLoopEndFile, ["line"] = cdLoopEndLine
+    });
+    await acdbg.StandardInput.WriteLineAsync();   // start the loop (process already running)
+    var acWaitJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_wait", new Dictionary<string, object?> { ["timeout"] = 30 })));
+    Assert(acWaitJson.RootElement.GetProperty("status").GetString() == "stopped", "debug_wait should stop at LoopEnd");
+    Assert(acWaitJson.RootElement.GetProperty("source").GetProperty("line").GetInt32() == cdLoopEndLine,
+        $"Expected LoopEnd line {cdLoopEndLine}, got {acWaitJson.RootElement.GetProperty("source").GetProperty("line").GetInt32()}");
+    var acCapsJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>())));
+    Assert(acCapsJson.RootElement.GetProperty("totalCaptures").GetInt32() >= 4,
+        $"Expected >=4 captures via autoContinue, got {acCapsJson.RootElement.GetProperty("totalCaptures").GetInt32()}");
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = acpid });
     Console.WriteLine("   ✅");
 
     Console.WriteLine($"\n=== {passed}/{tests} PASSED ===");

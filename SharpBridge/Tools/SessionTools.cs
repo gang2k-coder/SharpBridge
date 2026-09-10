@@ -46,10 +46,13 @@ public class SessionTools(DebugSessionManager manager)
 
     [McpServerTool, Description("Attach the debugger to a running .NET process by PID or name. " +
         "Provide either processId or processName. If multiple processes match the given name, " +
-        "the call fails with a list of matching PIDs — pick one and retry with processId.")]
+        "the call fails with a list of matching PIDs — pick one and retry with processId. " +
+        "With autoContinue=true the attach completes and the process resumes immediately, " +
+        "so capture-action breakpoints fire silently from the first debug_continue.")]
     public async Task<string> DebugAttach(
         [Description("Process ID of the running .NET process")] int? processId = null,
-        [Description("Process name (e.g. 'TestDebuggee'). Only used if processId is not provided.")] string? processName = null)
+        [Description("Process name (e.g. 'TestDebuggee'). Only used if processId is not provided.")] string? processName = null,
+        [Description("Complete the attach and resume the process automatically instead of leaving it suspended (default: false)")] bool autoContinue = false)
     {
         if (processId is null && processName is null)
             throw new ArgumentException("Must provide either processId or processName.");
@@ -62,6 +65,24 @@ public class SessionTools(DebugSessionManager manager)
 
         if (result.Error is not null)
             throw new InvalidOperationException(result.Error);
+
+        if (!result.AlreadyAttached && autoContinue)
+        {
+            var session = _manager.Resolve(result.ProcessId!.Value);
+            await session.AttachAutoContinueAsync();
+
+            var breakpoints = session.GetAllBreakpoints();
+            return JsonSerializer.Serialize(new
+            {
+                status = "attached",
+                processId = result.ProcessId,
+                processName = result.ProcessName,
+                state = session.CurrentState.ToString(),
+                breakpointCount = breakpoints.Count,
+                pendingBreakpoints = breakpoints.Count(b => b.IsPending),
+                note = "Process resumed. Capture breakpoints active."
+            });
+        }
 
         return JsonSerializer.Serialize(new
         {

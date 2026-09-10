@@ -1,5 +1,7 @@
 using System.ComponentModel;
+using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using ModelContextProtocol.Server;
 using SharpBridge.Infrastructure.Attributes;
 using SharpBridge.Services;
@@ -328,6 +330,352 @@ public class InspectionTools(DebugSessionManager manager)
         session.ClearCaptures();
 
         return JsonSerializer.Serialize(new { status = "cleared" });
+    }
+
+    [McpServerTool]
+    [AllowedState(SessionState.Stopped, SessionState.Running)]
+    [Description("Get capture snapshots with v2 shaping: filtering, pagination, " +
+        "JSON-field extraction, and spill-to-file for huge payloads. " +
+        "format='full' returns the v1 get_captures payload (plus apiVersion/format keys). " +
+        "format='summary' (default) applies filters/pagination, renders variables with spill " +
+        "placeholders and extract results, and targets a <8 KB response.")]
+    public string GetCapturesV2(
+        [Description("Output shape: 'summary' or 'full' ('compact'/'markdown' arrive later)")] string format = "summary",
+        [Description("Skip this many captures after filtering")] int offset = 0,
+        [Description("Maximum captures to return (default 20, max 100)")] int limit = 20,
+        [Description("Only captures whose 1-based capture index is in this list")] int[]? captureIndex = null,
+        [Description("Only captures whose source path contains this substring")] string? sourcePathContains = null,
+        [Description("Only captures at exactly this source line")] int? sourceLine = null,
+        [Description("Extract fields from JSON-string variables, e.g. [{variable: 'payloadJson', type: 'json', pick: ['items[0].id']}]")] ExtractRule[]? extract = null,
+        [Description("Write the full capture payload to temp file(s) and return path(s) in spillFile; large inline values become placeholders")] bool spillToFile = false,
+        [Description("Per-variable byte threshold: larger values become '<spilled: N KB>' inline (default 8192)")] int? spillThresholdBytes = null,
+        [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
+        [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
+    {
+        if (format is not ("summary" or "full"))
+            throw new ArgumentException(
+                $"format '{format}' is not available yet — use 'summary' or 'full' (compact/markdown are planned).");
+        if (offset < 0) throw new ArgumentException("offset must be >= 0.");
+        var effectiveLimit = Math.Clamp(limit, 1, 100);
+        var threshold = spillThresholdBytes ?? 8192;
+        if (threshold < 0) throw new ArgumentException("spillThresholdBytes must be >= 0.");
+
+        var session = ResolveSession(processId, processName);
+        var captures = session.GetCaptures();
+
+        // === Filters (AND together, before pagination) ===
+        IEnumerable<CaptureSnapshot> filtered = captures;
+        if (captureIndex is { Length: > 0 })
+        {
+            var set = captureIndex.ToHashSet();
+            filtered = filtered.Where(c => set.Contains(c.Index));
+        }
+        if (!string.IsNullOrEmpty(sourcePathContains))
+            filtered = filtered.Where(c =>
+                c.FilePath is not null &&
+                c.FilePath.Contains(sourcePathContains, StringComparison.OrdinalIgnoreCase));
+        if (sourceLine.HasValue)
+            filtered = filtered.Where(c => c.Line == sourceLine.Value);
+        var filteredList = filtered.ToList();
+        var page = filteredList.Skip(offset).Take(effectiveLimit).ToList();
+
+        // === format=full: v1 payload + apiVersion/format at the top level ===
+        if (format == "full")
+        {
+            return JsonSerializer.Serialize(new
+            {
+                apiVersion = 2,
+                format = "full",
+                count = page.Count,
+                message = page.Count == 0
+                    ? "No captures recorded. Use capture_state to take snapshots, or set breakpoints with action='capture'."
+                    : null,
+                captures = page.Select(c => new
+                {
+                    index = c.Index,
+                    reason = c.Reason,
+                    source = c.FilePath is not null ? new { path = c.FilePath, line = c.Line } : null,
+                    timestamp = c.Timestamp,
+                    variables = c.Variables.Select(FormatVariable)
+                })
+            });
+        }
+
+        // === Extraction pass (original tree, before any rendering) ===
+        var extractedByCapture = new Dictionary<int, List<object>>();
+        var jsonReplacedPaths = new HashSet<string>(StringComparer.Ordinal);
+        if (extract is { Length: > 0 })
+        {
+            foreach (var c in page)
+            {
+                var results = new List<object>();
+                foreach (var rule in extract)
+                {
+                    var varName = rule.Variable ?? "";
+                    var node = FindVariable(c.Variables, varName);
+                    if (node is null)
+                    {
+                        results.Add(new { variable = varName, error = "variable-not-found" });
+                        continue;
+                    }
+                    if (rule.Type != "json")
+                    {
+                        results.Add(new { variable = varName, error = $"unsupported-type:{rule.Type}" });
+                        continue;
+                    }
+                    if (!TryParseJson(node.Value, out var doc))
+                    {
+                        results.Add(new { variable = varName, error = "not-json" });
+                        continue;
+                    }
+                    using (doc)
+                    {
+                        var picked = new JsonObject();
+                        foreach (var path in rule.Pick ?? [])
+                            picked[path] = TryPick(doc.RootElement, path, out var el)
+                                ? JsonNode.Parse(el.GetRawText())
+                                : null;
+                        results.Add(new { variable = varName, picked });
+                        jsonReplacedPaths.Add(varName);
+                    }
+                }
+                if (results.Count > 0)
+                    extractedByCapture[c.Index] = results;
+            }
+        }
+
+        // === Summary rendering with deterministic budget loop ===
+        var maxDepth = page.Select(c => MaxTreeDepth(c.Variables)).DefaultIfEmpty(0).Max();
+        string payload;
+        var depthCap = maxDepth;
+        var truncated = false;
+        while (true)
+        {
+            var rendered = page.Select(c => RenderSummaryCapture(
+                c, depthCap, threshold, extractedByCapture, jsonReplacedPaths, spillToFile)).ToList();
+            payload = JsonSerializer.Serialize(new
+            {
+                apiVersion = 2,
+                format = "summary",
+                session = new { processId = session.ProcessId, processName = session.ProcessName },
+                totalCaptures = filteredList.Count,
+                returned = page.Count,
+                offset,
+                truncated,
+                captures = rendered,
+                aggregate = (object?)null
+            });
+            if (payload.Length <= 8 * 1024 || depthCap == 0)
+                break;
+            depthCap--;
+            truncated = true;
+        }
+
+        return payload;
+    }
+
+    private object RenderSummaryCapture(
+        CaptureSnapshot c, int depthCap, int threshold,
+        Dictionary<int, List<object>> extractedByCapture,
+        HashSet<string> jsonReplacedPaths, bool spillToFile)
+    {
+        var rawVariables = c.Variables.ToList();
+
+        string? spillFile = null;
+        if (spillToFile)
+        {
+            spillFile = Path.Combine(Path.GetTempPath(),
+                $"sharpbridge-capture-{c.Index}-{Guid.NewGuid():N}.json");
+            File.WriteAllText(spillFile, JsonSerializer.Serialize(new
+            {
+                index = c.Index,
+                reason = c.Reason,
+                breakpointId = c.BreakpointId,
+                source = c.FilePath is not null ? new { path = c.FilePath, line = c.Line } : null,
+                timestamp = c.Timestamp,
+                variables = rawVariables.Select(FormatVariable)
+            }));
+        }
+
+        return new
+        {
+            index = c.Index,
+            timestamp = c.Timestamp,
+            reason = c.Reason,
+            breakpointId = c.BreakpointId,
+            source = c.FilePath is not null
+                ? new { path = c.FilePath, file = Path.GetFileName(c.FilePath), line = c.Line }
+                : null,
+            variables = rawVariables.Select(v => RenderVariableInline(v, v.Name, depthCap, threshold, jsonReplacedPaths)),
+            extracted = extractedByCapture.TryGetValue(c.Index, out var ex) ? ex : null,
+            spillFile
+        };
+    }
+
+    /// <summary>
+    /// Render one variable with inline transforms: json-extracted values become
+    /// placeholders, oversized values are spilled to placeholders, and children
+    /// are capped at the remaining depth budget.
+    /// </summary>
+    private object RenderVariableInline(
+        VariableInfo v, string path, int remainingDepth, int threshold,
+        HashSet<string> jsonReplacedPaths)
+    {
+        string value = v.Value;
+        if (jsonReplacedPaths.Contains(path))
+            value = $"<json: {FormatKb(value)} KB, see extracted>";
+        else if (value.Length > 0 && Encoding.UTF8.GetByteCount(value) > threshold)
+            value = $"<spilled: {FormatKb(value)} KB>";
+
+        return new
+        {
+            name = v.Name,
+            value,
+            type = v.Type,
+            variablesReference = v.VariablesReference,
+            evaluateName = v.EvaluateName,
+            indexedVariables = v.IndexedVariables,
+            namedVariables = v.NamedVariables,
+            expandable = v.VariablesReference > 0,
+            hint = v.VariablesReference > 0 && v.Children is null
+                ? $"Use variables_expand with variablesReference={v.VariablesReference} to see children."
+                : null,
+            children = remainingDepth > 0
+                ? v.Children?.Select(ch => RenderVariableInline(
+                    ch, path.Length == 0 ? ch.Name : $"{path}.{ch.Name}",
+                    remainingDepth - 1, threshold, jsonReplacedPaths))
+                : null
+        };
+    }
+
+    private static int MaxTreeDepth(IReadOnlyList<VariableInfo> vars)
+    {
+        var max = 0;
+        foreach (var v in vars)
+        {
+            if (v.Children is { Count: > 0 })
+                max = Math.Max(max, 1 + MaxTreeDepth(v.Children));
+        }
+        return max;
+    }
+
+    private static VariableInfo? FindVariable(IReadOnlyList<VariableInfo> variables, string dottedPath)
+    {
+        VariableInfo? current = null;
+        IReadOnlyList<VariableInfo> level = variables;
+        foreach (var seg in dottedPath.Split('.'))
+        {
+            current = level.FirstOrDefault(v => v.Name == seg);
+            if (current is null) return null;
+            level = current.Children ?? [];
+        }
+        return current;
+    }
+
+    private static bool TryParseJson(string value, out JsonDocument doc)
+    {
+        doc = null!;
+        var trimmed = value.Trim();
+        // SharpDbg renders string values C#-style: surrounding quotes and
+        // ALL inner quotes backslash-escaped. Strip the outer quotes and
+        // unescape before attempting a JSON parse.
+        if (trimmed.Length >= 2 && trimmed[0] == '"' && trimmed[^1] == '"')
+            trimmed = trimmed[1..^1];
+        trimmed = UnescapeSharpDbgString(trimmed);
+        if (trimmed.Length == 0 || (trimmed[0] != '{' && trimmed[0] != '['))
+            return false;
+        try
+        {
+            doc = JsonDocument.Parse(trimmed);
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Undo SharpDbg's C#-style escaping: \" -> ", \\ -> \, and the
+    /// standard \n \r \t escapes.</summary>
+    private static string UnescapeSharpDbgString(string s)
+    {
+        var sb = new StringBuilder(s.Length);
+        for (var i = 0; i < s.Length; i++)
+        {
+            var ch = s[i];
+            if (ch == '\\' && i + 1 < s.Length)
+            {
+                var next = s[i + 1];
+                switch (next)
+                {
+                    case '"': sb.Append('"'); i++; continue;
+                    case '\\': sb.Append('\\'); i++; continue;
+                    case 'n': sb.Append('\n'); i++; continue;
+                    case 'r': sb.Append('\r'); i++; continue;
+                    case 't': sb.Append('\t'); i++; continue;
+                    default: sb.Append(ch); continue;
+                }
+            }
+            sb.Append(ch);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Resolve a dot/index path ("items[0].id") against a parsed JSON document.</summary>
+    private static bool TryPick(JsonElement root, string path, out JsonElement result)
+    {
+        result = default;
+        JsonElement current = root;
+        foreach (var token in TokenizePickPath(path))
+        {
+            if (token.StartsWith('[') && token.EndsWith(']') && token.Length > 2)
+            {
+                if (!int.TryParse(token.AsSpan(1, token.Length - 2), out var idx))
+                    return false;
+                if (current.ValueKind != JsonValueKind.Array || idx < 0 || idx >= current.GetArrayLength())
+                    return false;
+                current = current[idx];
+            }
+            else
+            {
+                if (current.ValueKind != JsonValueKind.Object || !current.TryGetProperty(token, out var next))
+                    return false;
+                current = next;
+            }
+        }
+        result = current;
+        return true;
+    }
+
+    private static IEnumerable<string> TokenizePickPath(string path)
+    {
+        var i = 0;
+        while (i < path.Length)
+        {
+            if (path[i] == '.') { i++; continue; }
+            if (path[i] == '[')
+            {
+                var end = path.IndexOf(']', i);
+                if (end < 0) throw new ArgumentException($"Invalid pick path: {path}");
+                yield return path[i..(end + 1)];
+                i = end + 1;
+                continue;
+            }
+            var start = i;
+            while (i < path.Length && path[i] != '.' && path[i] != '[') i++;
+            yield return path[start..i];
+        }
+    }
+
+    private static string FormatKb(string value)
+        => Math.Max(1, (int)Math.Round(Encoding.UTF8.GetByteCount(value) / 1024.0)).ToString();
+
+    /// <summary>Inline extract rule for get_captures_v2.</summary>
+    public sealed class ExtractRule
+    {
+        public string? Variable { get; set; }
+        public string Type { get; set; } = "json";
+        public string[]? Pick { get; set; }
     }
 
     private static string FormatVariables(IReadOnlyList<VariableInfo> variables, int source)

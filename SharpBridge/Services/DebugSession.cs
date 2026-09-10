@@ -349,6 +349,45 @@ public class DebugSession : IDisposable
         _stateMachine.TransitionTo(SessionState.Attaching);
     }
 
+    /// <summary>
+    /// autoContinue after attach: complete the attach (ConfigurationDone +
+    /// runtime resume) WITHOUT waiting for a stop, so capture-action
+    /// breakpoints can fire silently from the very first debug_continue.
+    /// A subsequent real breakpoint stop goes to the stop ledger (gap
+    /// delivery with a "NOT been resumed" note) — same as any stop that
+    /// occurs while no tool call is waiting.
+    /// </summary>
+    public async Task AttachAutoContinueAsync(CancellationToken ct = default)
+    {
+        if (_stateMachine.Current != SessionState.Attaching)
+            throw new InvalidOperationException($"Cannot auto-continue: debugger state is {_stateMachine.Current}.");
+
+        // Swap in a fresh stop TCS BEFORE ConfigurationDone: any stop that
+        // arrives after the runtime resume resolves THIS TCS and surfaces
+        // through the normal ledger path instead of being lost.
+        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+
+        // Declare Running BEFORE the resume command (same pattern as
+        // ContinueAndWaitAsync): a stop arriving while the command is in
+        // flight transitions Running->Stopped on the reader thread.
+        _stateMachine.TransitionTo(SessionState.Running);
+        try
+        {
+            _host!.SendRequestSync(new ConfigurationDoneRequest());
+            if (ProcessId.HasValue)
+            {
+                try { await DiagnosticClientHelper.DiagnosticClientResumeRuntime(ProcessId.Value); }
+                catch (ServerNotAvailableException) { }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "autoContinue resume failed (state={State})", _stateMachine.Current);
+            throw new InvalidOperationException($"Auto-continue failed: {ex.GetType().Name}: {ex.Message}", ex);
+        }
+    }
+
     // ===================================================================
     // Breakpoint Management
     // ===================================================================
@@ -689,7 +728,7 @@ public class DebugSession : IDisposable
     // Capture System
     // ===================================================================
 
-    public CaptureSnapshot CaptureState(string scope = "all", int depth = 0)
+    public CaptureSnapshot CaptureState(string scope = "all", int depth = 0, int? breakpointId = null)
     {
         EnsureStopped();
 
@@ -705,7 +744,8 @@ public class DebugSession : IDisposable
             FilePath: frame?.Source,
             Line: frame?.Line ?? 0,
             Variables: frame is null ? [] : GetVariablesForFrame(frame.Id, scope, depth),
-            Timestamp: DateTime.UtcNow);
+            Timestamp: DateTime.UtcNow,
+            BreakpointId: breakpointId);
         lock (_capturesLock)
             _captures.Add(snapshot);
         return snapshot;
@@ -1402,7 +1442,7 @@ public class DebugSession : IDisposable
                 // Offload capture to thread pool — don't block the DAP reader.
                 // DO NOT touch _pendingStopTcs — the caller keeps waiting and
                 // the next stop (or exit) resolves it.
-                _ = Task.Run(() => RunCaptureAndContinueAsync(e.ThreadId, generation, capture.Scope, capture.Depth));
+                _ = Task.Run(() => RunCaptureAndContinueAsync(e.ThreadId, generation, capture.Scope, capture.Depth, capture.BreakpointId));
                 _logger.LogInformation("← OnStopped: auto-continue (capture), TCS not touched, thread={ThreadId}", e.ThreadId);
                 return;
             }
@@ -1447,7 +1487,7 @@ public class DebugSession : IDisposable
         {
             return _bpConfigs.TryGetValue((NormalizePath(file), line), out var cfg)
                 && cfg.Action == "capture"
-                ? new CaptureResolution(cfg.CaptureScope ?? "all", cfg.CaptureDepth)
+                ? new CaptureResolution(cfg.CaptureScope ?? "all", cfg.CaptureDepth, cfg.Id)
                 : null;
         }
     }
@@ -1502,9 +1542,9 @@ public class DebugSession : IDisposable
         return OperatingSystem.IsWindows() ? full.ToLowerInvariant() : full;
     }
 
-    private readonly record struct CaptureResolution(string Scope, int Depth);
+    private readonly record struct CaptureResolution(string Scope, int Depth, int BreakpointId);
 
-    private void RunCaptureAndContinueAsync(int? threadId, long stopGeneration, string scope, int depth)
+    private void RunCaptureAndContinueAsync(int? threadId, long stopGeneration, string scope, int depth, int breakpointId)
     {
         _ = Task.Run(async () =>
         {
@@ -1516,7 +1556,7 @@ public class DebugSession : IDisposable
             await _captureGate.WaitAsync().ConfigureAwait(false);
             try
             {
-                CaptureState(scope, depth);
+                CaptureState(scope, depth, breakpointId);
 
                 var host = _host;
                 if (host is null || _stateMachine.Current is SessionState.Exited or SessionState.Detached)
@@ -1722,4 +1762,5 @@ public record CaptureSnapshot(
     string? FilePath,
     int Line,
     IReadOnlyList<VariableInfo> Variables,
-    DateTime Timestamp);
+    DateTime Timestamp,
+    int? BreakpointId);
