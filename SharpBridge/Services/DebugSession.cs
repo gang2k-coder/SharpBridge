@@ -288,11 +288,12 @@ public class DebugSession : IDisposable
 
         if (stopAtEntry)
         {
-            // SharpDbg does NOT implement stopAtEntry (no entry StoppedEvent is
-            // sent after ConfigurationDone). Wait briefly in case a future
-            // version adds the event, then return the HONEST state: if a stop
+            // SharpDbg 0.1.17+ implements stopAtEntry (an entry breakpoint at
+            // Main delivers an Entry StoppedEvent after ConfigurationDone).
+            // Wait briefly for it, then return the HONEST state: if a stop
             // arrived → Stopped (OnStopped already transitioned); otherwise the
-            // process is running. Never fabricate a stopped state.
+            // process is running (older adapters without stopAtEntry).
+            // Never fabricate a stopped state.
             try
             {
                 await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
@@ -855,11 +856,13 @@ public class DebugSession : IDisposable
                 "or specify a timeout value (e.g. timeout=30).");
         }
 
-        // Right after debug_launch the debuggee is already running (SharpDbg
-        // has no stopAtEntry, so launch returns honestly with state Running).
+        // Right after debug_launch with stopAtEntry=false, the debuggee is
+        // already running and launch returns honestly with state Running.
         // "Continue" then means "wait for the next stop" — resuming a running
         // process is superfluous and SharpDbg would reject the request.
         // Delegate to the wait path, which swaps the TCS and waits.
+        // (With stopAtEntry=true the session is Stopped at the entry stop,
+        // so this branch is skipped.)
         if (_stateMachine.Current == SessionState.Running)
             return await WaitAndWaitAsync(timeoutSeconds, ct).ConfigureAwait(false);
 
