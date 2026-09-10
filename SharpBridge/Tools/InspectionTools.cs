@@ -335,26 +335,29 @@ public class InspectionTools(DebugSessionManager manager)
     [McpServerTool]
     [AllowedState(SessionState.Stopped, SessionState.Running)]
     [Description("Get capture snapshots with v2 shaping: filtering, pagination, " +
-        "JSON-field extraction, and spill-to-file for huge payloads. " +
-        "format='full' returns the v1 get_captures payload (plus apiVersion/format keys). " +
-        "format='summary' (default) applies filters/pagination, renders variables with spill " +
-        "placeholders and extract results, and targets a <8 KB response.")]
+        "JSON-field extraction, spill-to-file, deterministic aggregation, and paste-ready " +
+        "markdown export. format='full' returns the v1 get_captures payload (plus " +
+        "apiVersion/format keys); 'summary' (default) targets a <8 KB response; 'compact' " +
+        "drops variables; 'markdown' renders flat tables for issue reports.")]
     public string GetCapturesV2(
-        [Description("Output shape: 'summary' or 'full' ('compact'/'markdown' arrive later)")] string format = "summary",
+        [Description("Output shape: 'summary' (default), 'compact', 'full', or 'markdown'")] string format = "summary",
         [Description("Skip this many captures after filtering")] int offset = 0,
         [Description("Maximum captures to return (default 20, max 100)")] int limit = 20,
         [Description("Only captures whose 1-based capture index is in this list")] int[]? captureIndex = null,
         [Description("Only captures whose source path contains this substring")] string? sourcePathContains = null,
         [Description("Only captures at exactly this source line")] int? sourceLine = null,
+        [Description("Compute aggregate stats over these variable/extract-pick fields: " +
+            "bySourceLine (always), counts.<field>_null, and distinctValues for fields with <=5 distinct values. " +
+            "Omit for aggregate=null.")] string[]? aggregateFields = null,
         [Description("Extract fields from JSON-string variables, e.g. [{variable: 'payloadJson', type: 'json', pick: ['items[0].id']}]")] ExtractRule[]? extract = null,
         [Description("Write the full capture payload to temp file(s) and return path(s) in spillFile; large inline values become placeholders")] bool spillToFile = false,
         [Description("Per-variable byte threshold: larger values become '<spilled: N KB>' inline (default 8192)")] int? spillThresholdBytes = null,
         [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
         [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
-        if (format is not ("summary" or "full"))
+        if (format is not ("summary" or "full" or "compact" or "markdown"))
             throw new ArgumentException(
-                $"format '{format}' is not available yet — use 'summary' or 'full' (compact/markdown are planned).");
+                $"Unknown format '{format}' — use 'summary', 'full', 'compact', or 'markdown'.");
         if (offset < 0) throw new ArgumentException("offset must be >= 0.");
         var effectiveLimit = Math.Clamp(limit, 1, 100);
         var threshold = spillThresholdBytes ?? 8192;
@@ -402,30 +405,30 @@ public class InspectionTools(DebugSessionManager manager)
         }
 
         // === Extraction pass (original tree, before any rendering) ===
-        var extractedByCapture = new Dictionary<int, List<object>>();
+        var extractedByCapture = new Dictionary<int, List<ExtractedResult>>();
         var jsonReplacedPaths = new HashSet<string>(StringComparer.Ordinal);
         if (extract is { Length: > 0 })
         {
             foreach (var c in page)
             {
-                var results = new List<object>();
+                var results = new List<ExtractedResult>();
                 foreach (var rule in extract)
                 {
                     var varName = rule.Variable ?? "";
                     var node = FindVariable(c.Variables, varName);
                     if (node is null)
                     {
-                        results.Add(new { variable = varName, error = "variable-not-found" });
+                        results.Add(new ExtractedResult(varName, null, "variable-not-found"));
                         continue;
                     }
                     if (rule.Type != "json")
                     {
-                        results.Add(new { variable = varName, error = $"unsupported-type:{rule.Type}" });
+                        results.Add(new ExtractedResult(varName, null, $"unsupported-type:{rule.Type}"));
                         continue;
                     }
                     if (!TryParseJson(node.Value, out var doc))
                     {
-                        results.Add(new { variable = varName, error = "not-json" });
+                        results.Add(new ExtractedResult(varName, null, "not-json"));
                         continue;
                     }
                     using (doc)
@@ -435,13 +438,52 @@ public class InspectionTools(DebugSessionManager manager)
                             picked[path] = TryPick(doc.RootElement, path, out var el)
                                 ? JsonNode.Parse(el.GetRawText())
                                 : null;
-                        results.Add(new { variable = varName, picked });
+                        results.Add(new ExtractedResult(varName, picked, null));
                         jsonReplacedPaths.Add(varName);
                     }
                 }
                 if (results.Count > 0)
                     extractedByCapture[c.Index] = results;
             }
+        }
+
+        // === Deterministic aggregate (computed once, over the FILTERED set) ===
+        var aggregate = BuildAggregate(filteredList, aggregateFields ?? [], extractedByCapture);
+
+        // === compact: summary minus variables (and expressions) ===
+        if (format == "compact")
+        {
+            return JsonSerializer.Serialize(new
+            {
+                apiVersion = 2,
+                format = "compact",
+                session = new { processId = session.ProcessId, processName = session.ProcessName },
+                totalCaptures = filteredList.Count,
+                returned = page.Count,
+                offset,
+                truncated = false,
+                captures = page.Select(c => new
+                {
+                    index = c.Index,
+                    timestamp = c.Timestamp,
+                    reason = c.Reason,
+                    breakpointId = c.BreakpointId,
+                    source = c.FilePath is not null
+                        ? new { path = c.FilePath, file = Path.GetFileName(c.FilePath), line = c.Line }
+                        : null,
+                    extracted = RenderExtracted(extractedByCapture.TryGetValue(c.Index, out var ex) ? ex : null),
+                    spillFile = (string?)null
+                }),
+                aggregate
+            });
+        }
+
+        // === markdown: flat tables, no smart grouping ===
+        if (format == "markdown")
+        {
+            return RenderMarkdown(page, filteredList.Count,
+                session.ProcessId, session.ProcessName,
+                threshold, jsonReplacedPaths, extractedByCapture, spillToFile, aggregate);
         }
 
         // === Summary rendering with deterministic budget loop ===
@@ -463,7 +505,7 @@ public class InspectionTools(DebugSessionManager manager)
                 offset,
                 truncated,
                 captures = rendered,
-                aggregate = (object?)null
+                aggregate
             });
             if (payload.Length <= 8 * 1024 || depthCap == 0)
                 break;
@@ -476,26 +518,12 @@ public class InspectionTools(DebugSessionManager manager)
 
     private object RenderSummaryCapture(
         CaptureSnapshot c, int depthCap, int threshold,
-        Dictionary<int, List<object>> extractedByCapture,
+        Dictionary<int, List<ExtractedResult>> extractedByCapture,
         HashSet<string> jsonReplacedPaths, bool spillToFile)
     {
         var rawVariables = c.Variables.ToList();
 
-        string? spillFile = null;
-        if (spillToFile)
-        {
-            spillFile = Path.Combine(Path.GetTempPath(),
-                $"sharpbridge-capture-{c.Index}-{Guid.NewGuid():N}.json");
-            File.WriteAllText(spillFile, JsonSerializer.Serialize(new
-            {
-                index = c.Index,
-                reason = c.Reason,
-                breakpointId = c.BreakpointId,
-                source = c.FilePath is not null ? new { path = c.FilePath, line = c.Line } : null,
-                timestamp = c.Timestamp,
-                variables = rawVariables.Select(FormatVariable)
-            }));
-        }
+        string? spillFile = spillToFile ? WriteSpillFile(c) : null;
 
         return new
         {
@@ -507,16 +535,216 @@ public class InspectionTools(DebugSessionManager manager)
                 ? new { path = c.FilePath, file = Path.GetFileName(c.FilePath), line = c.Line }
                 : null,
             variables = rawVariables.Select(v => RenderVariableInline(v, v.Name, depthCap, threshold, jsonReplacedPaths)),
-            extracted = extractedByCapture.TryGetValue(c.Index, out var ex) ? ex : null,
+            extracted = RenderExtracted(extractedByCapture.TryGetValue(c.Index, out var ex) ? ex : null),
             spillFile
         };
     }
 
-    /// <summary>
-    /// Render one variable with inline transforms: json-extracted values become
-    /// placeholders, oversized values are spilled to placeholders, and children
-    /// are capped at the remaining depth budget.
-    /// </summary>
+    /// <summary>Extract result for one rule on one capture. Wire format stays
+    /// camelCase via RenderExtracted (anonymous projection).</summary>
+    private sealed record ExtractedResult(string Variable, JsonObject? Picked, string? Error);
+
+    private static object? RenderExtracted(List<ExtractedResult>? list)
+        => list?.Select(r => new { variable = r.Variable, picked = r.Picked, error = r.Error });
+
+    private static string WriteSpillFile(CaptureSnapshot c)
+    {
+        var path = Path.Combine(Path.GetTempPath(),
+            $"sharpbridge-capture-{c.Index}-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, JsonSerializer.Serialize(new
+        {
+            index = c.Index,
+            reason = c.Reason,
+            breakpointId = c.BreakpointId,
+            source = c.FilePath is not null ? new { path = c.FilePath, line = c.Line } : null,
+            timestamp = c.Timestamp,
+            variables = c.Variables.Select(FormatVariable)
+        }));
+        return path;
+    }
+
+    // ===================================================================
+    // Deterministic aggregate (spec 5.4): computed ONLY from fields the
+    // request names explicitly — input -> output is fixed and testable.
+    // ===================================================================
+
+    private static object? BuildAggregate(
+        IReadOnlyList<CaptureSnapshot> captures, string[] aggregateFields,
+        Dictionary<int, List<ExtractedResult>> extractedByCapture)
+    {
+        if (aggregateFields.Length == 0)
+            return null;
+
+        // bySourceLine is always computed (post-filter captures).
+        var bySourceLine = captures
+            .Where(c => c.FilePath is not null)
+            .GroupBy(c => $"{Path.GetFileName(c.FilePath!)}:{c.Line}")
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        var counts = new Dictionary<string, int>();
+        var distinctValues = new Dictionary<string, List<string>>();
+        foreach (var field in aggregateFields)
+        {
+            var values = new List<string>(captures.Count);
+            var nullCount = 0;
+            foreach (var c in captures)
+            {
+                var v = ResolveFieldValue(c, field, extractedByCapture)?.Trim();
+                if (string.IsNullOrEmpty(v) || v == "null")
+                    nullCount++;
+                values.Add(v ?? "null");
+            }
+            counts[$"{field}_null"] = nullCount;
+
+            // distinctValues: only low-cardinality fields whose values are
+            // display-sized (<=256 chars — a 61 KB distinct value would blow
+            // the G1 token budget and is useless to an agent).
+            var distinct = values.Distinct().ToList();
+            if (distinct.Count <= 5 && distinct.All(s => s.Length <= 256))
+                distinctValues[field] = distinct.Take(50).ToList();
+        }
+
+        return new { bySourceLine, counts, distinctValues };
+    }
+
+    /// <summary>Resolve an aggregate field: top-level variable first, then
+    /// extract pick paths. No deep search. String values are normalized to
+    /// display form (SharpDbg C#-style outer quotes stripped).</summary>
+    private static string? ResolveFieldValue(
+        CaptureSnapshot c, string field,
+        Dictionary<int, List<ExtractedResult>> extractedByCapture)
+    {
+        var v = c.Variables.FirstOrDefault(x => x.Name == field);
+        if (v is not null)
+            return NormalizeDisplayValue(v.Value);
+        if (extractedByCapture.TryGetValue(c.Index, out var results))
+            foreach (var r in results)
+                if (r.Picked is not null && r.Picked.TryGetPropertyValue(field, out var node))
+                    return NodeToDisplay(node);
+        return null;
+    }
+
+    private static string? NormalizeDisplayValue(string? raw)
+    {
+        if (raw is null)
+            return null;
+        var t = raw.Trim();
+        if (t.Length >= 2 && t[0] == '"' && t[^1] == '"')
+            t = UnescapeSharpDbgString(t[1..^1]);
+        return t;
+    }
+
+    private static string NodeToDisplay(JsonNode? node)
+    {
+        if (node is null)
+            return "null";
+        if (node is JsonValue value)
+        {
+            if (value.TryGetValue<string>(out var s))
+                return s;
+            return value.ToJsonString();
+        }
+        return node.ToJsonString();
+    }
+
+    // ===================================================================
+    // Markdown: flat tables only — no smart grouping (deterministic).
+    // ===================================================================
+
+    private static string RenderMarkdown(
+        List<CaptureSnapshot> page, int total,
+        int? processId, string? processName,
+        int threshold, HashSet<string> jsonReplacedPaths,
+        Dictionary<int, List<ExtractedResult>> extractedByCapture,
+        bool spillToFile, object? aggregate)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"## SharpBridge captures — {processName ?? "unknown"} (pid {processId})");
+        sb.AppendLine();
+        sb.AppendLine($"**Total:** {total} | **Shown:** {page.Count}");
+
+        var depthCap = page.Select(c => MaxTreeDepth(c.Variables)).DefaultIfEmpty(0).Max();
+        foreach (var c in page)
+        {
+            var srcName = c.FilePath is not null
+                ? $"{Path.GetFileName(c.FilePath)}:{c.Line}"
+                : "unknown location";
+            sb.AppendLine();
+            sb.AppendLine($"### Capture #{c.Index} — {srcName}");
+            sb.AppendLine();
+            sb.AppendLine("| variable | value |");
+            sb.AppendLine("|---|---|");
+            foreach (var (name, value) in FlattenVariables(c.Variables, depthCap, threshold, jsonReplacedPaths))
+                sb.AppendLine($"| {EscapeMarkdownCell(name)} | {EscapeMarkdownCell(value)} |");
+
+            if (extractedByCapture.TryGetValue(c.Index, out var ex))
+            {
+                sb.AppendLine();
+                sb.AppendLine("**Extracted:**");
+                sb.AppendLine();
+                sb.AppendLine("| path | value |");
+                sb.AppendLine("|---|---|");
+                foreach (var r in ex)
+                {
+                    if (r.Picked is not null)
+                    {
+                        foreach (var (path, node) in r.Picked)
+                            sb.AppendLine($"| {EscapeMarkdownCell(path)} | {EscapeMarkdownCell(NodeToDisplay(node))} |");
+                    }
+                    else
+                    {
+                        sb.AppendLine($"| {EscapeMarkdownCell(r.Variable)} | error: {EscapeMarkdownCell(r.Error ?? "")} |");
+                    }
+                }
+            }
+
+            if (spillToFile)
+            {
+                var spillPath = WriteSpillFile(c);
+                sb.AppendLine();
+                sb.AppendLine($"**Spill file:** {spillPath}");
+            }
+        }
+
+        if (aggregate is not null)
+        {
+            sb.AppendLine();
+            sb.AppendLine("**Aggregate:**");
+            sb.AppendLine();
+            sb.AppendLine("```json");
+            sb.AppendLine(JsonSerializer.Serialize(aggregate));
+            sb.AppendLine("```");
+        }
+
+        return sb.ToString();
+    }
+
+    private static List<(string Name, string Value)> FlattenVariables(
+        IReadOnlyList<VariableInfo> vars, int depthCap, int threshold,
+        HashSet<string> jsonReplacedPaths)
+    {
+        var rows = new List<(string, string)>();
+        void Walk(IReadOnlyList<VariableInfo> level, string prefix, int remaining)
+        {
+            foreach (var v in level)
+            {
+                var path = prefix.Length == 0 ? v.Name : $"{prefix}.{v.Name}";
+                var value = v.Value;
+                if (jsonReplacedPaths.Contains(path))
+                    value = $"<json: {FormatKb(value)} KB, see extracted>";
+                else if (value.Length > 0 && Encoding.UTF8.GetByteCount(value) > threshold)
+                    value = $"<spilled: {FormatKb(value)} KB>";
+                rows.Add((path, value));
+                if (remaining > 0 && v.Children is { Count: > 0 })
+                    Walk(v.Children, path, remaining - 1);
+            }
+        }
+        Walk(vars, "", depthCap);
+        return rows;
+    }
+
+    private static string EscapeMarkdownCell(string s)
+        => s.Replace("|", "\\|").Replace("\r", " ").Replace("\n", " ");
     private object RenderVariableInline(
         VariableInfo v, string path, int remainingDepth, int threshold,
         HashSet<string> jsonReplacedPaths)

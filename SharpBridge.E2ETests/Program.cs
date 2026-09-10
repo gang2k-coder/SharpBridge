@@ -1337,6 +1337,99 @@ try
         new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = acpid });
     Console.WriteLine("   ✅");
 
+    // Test 40: v2 aggregate (deterministic), compact, markdown.
+    tests++; passed++;
+    Console.WriteLine("40. get_captures_v2 aggregate/compact/markdown...");
+    var agpsi = new ProcessStartInfo("dotnet", [captureDebuggeeDll])
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    agpsi.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var agdbg = Process.Start(agpsi)!;
+    var agpid = agdbg.Id;
+    await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = agpid });
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = agpid });
+    await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
+    {
+        ["filePath"] = captureDebuggeeSrc, ["line"] = cdCounterLine, ["action"] = "capture"
+    });
+    await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
+    {
+        ["filePath"] = cdLoopEndFile, ["line"] = cdLoopEndLine
+    });
+    await agdbg.StandardInput.WriteLineAsync();
+    var agContJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 30 })));
+    Assert(agContJson.RootElement.GetProperty("status").GetString() == "stopped", "agg run did not stop at LoopEnd");
+
+    // aggregate over scalar locals — deterministic values.
+    var aggJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>
+        { ["aggregateFields"] = new[] { "counter", "referenceCurveId" } })));
+    var agg = aggJson.RootElement.GetProperty("aggregate");
+    Assert(agg.GetProperty("bySourceLine").GetProperty("Program.cs:24").GetInt32() == 4,
+        $"bySourceLine wrong: {agg.GetProperty("bySourceLine").GetRawText()}");
+    Assert(agg.GetProperty("counts").GetProperty("counter_null").GetInt32() == 0, "counter_null != 0");
+    Assert(agg.GetProperty("counts").GetProperty("referenceCurveId_null").GetInt32() == 0, "referenceCurveId_null != 0");
+    var counterDistinct = agg.GetProperty("distinctValues").GetProperty("counter")
+        .EnumerateArray().Select(e => e.GetString()).ToList();
+    Assert(counterDistinct.SequenceEqual(new[] { "0", "1", "2", "3" }),
+        $"counter distinct wrong: {string.Join(",", counterDistinct)}");
+    var refIdDistinct = agg.GetProperty("distinctValues").GetProperty("referenceCurveId")
+        .EnumerateArray().Select(e => e.GetString()).ToList();
+    // First capture fires BEFORE the assignment — still the initial value.
+    Assert(refIdDistinct.SequenceEqual(new[] { "REF-ALPHA (SIM)", "REF-A (SIM)", "REF-B (SIM)", "REF-C (SIM)" }),
+        $"referenceCurveId distinct wrong: {string.Join(",", refIdDistinct)}");
+
+    // null-tracking: referenceCurve is null in all 4 captures.
+    var aggNullJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>
+        { ["aggregateFields"] = new[] { "referenceCurve" } })));
+    var aggNull = aggNullJson.RootElement.GetProperty("aggregate");
+    Assert(aggNull.GetProperty("counts").GetProperty("referenceCurve_null").GetInt32() == 4,
+        "referenceCurve_null != 4");
+    Assert(aggNull.GetProperty("distinctValues").GetProperty("referenceCurve")[0].GetString() == "null",
+        "referenceCurve distinct != [null]");
+
+    // High-cardinality/oversized field: a 61 KB distinct value is omitted
+    // from distinctValues (size guard keeps aggregate within token budget).
+    var aggHiJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>
+        { ["aggregateFields"] = new[] { "payloadJson" } })));
+    var aggHi = aggHiJson.RootElement.GetProperty("aggregate");
+    Assert(aggHi.GetProperty("counts").GetProperty("payloadJson_null").GetInt32() == 0, "payloadJson_null != 0");
+    Assert(!aggHi.GetProperty("distinctValues").TryGetProperty("payloadJson", out _),
+        "payloadJson should be omitted from distinctValues (oversized distinct value)");
+
+    // aggregate is null when aggregateFields omitted.
+    var aggNoneJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>())));
+    Assert(aggNoneJson.RootElement.GetProperty("aggregate").ValueKind == JsonValueKind.Null,
+        "aggregate should be null without aggregateFields");
+
+    // compact: same as summary minus variables.
+    var compJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?> { ["format"] = "compact" })));
+    Assert(compJson.RootElement.GetProperty("format").GetString() == "compact", "format != compact");
+    Assert(compJson.RootElement.GetProperty("returned").GetInt32() == 4, "compact returned != 4");
+    var comp0 = compJson.RootElement.GetProperty("captures")[0];
+    Assert(comp0.GetProperty("index").GetInt32() == 1, "compact index wrong");
+    Assert(!comp0.TryGetProperty("variables", out _), "compact must not include variables");
+
+    // markdown: raw paste-ready text with flat tables.
+    var mdText = GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?> { ["format"] = "markdown" }));
+    Assert(!mdText.TrimStart().StartsWith('{'), "markdown should not be JSON");
+    Assert(mdText.Contains("## SharpBridge captures"), "markdown header missing");
+    Assert(mdText.Contains("| variable | value |"), "markdown variable table missing");
+    Assert(mdText.Contains("counter") && mdText.Contains("referenceCurve"), "markdown rows missing");
+    Assert(mdText.Contains("<spilled:") && mdText.Contains("payloadJson"), "markdown spill placeholder missing");
+
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = agpid });
+    Console.WriteLine("   ✅");
+
     Console.WriteLine($"\n=== {passed}/{tests} PASSED ===");
 
 }
