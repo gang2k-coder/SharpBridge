@@ -61,7 +61,7 @@ try
     Console.WriteLine("2. Setting breakpoint on line 37 (blank → adjusted to 38, before the loop)...");
     var bps = session.SetBreakpoints(sourceFile,
         (Line: 37, Column: null, Condition: null, HitCondition: null,
-         Action: "break", CaptureScope: null, CaptureDepth: 0));
+         Action: "break", CaptureScope: null, CaptureDepth: 0, CaptureExpressions: null));
     var bp = bps[0];
     Console.WriteLine($"   ID={bp.Id}, Verified={bp.Verified}, Line={bp.Line}");
     if (!bp.Verified) Console.WriteLine($"   Message: {bp.Message}");
@@ -329,7 +329,7 @@ try
     await session2.AttachAsync(pid2);
     var capBps = session2.SetBreakpoints(sourceFile,
         (Line: 37, Column: null, Condition: null, HitCondition: null,
-         Action: "capture", CaptureScope: "all", CaptureDepth: 0));
+         Action: "capture", CaptureScope: "all", CaptureDepth: 0, CaptureExpressions: null));
     var capBp = capBps[0];
     Assert(!capBp.Verified && capBp.IsPending,
         $"Expected pending before module load, got verified={capBp.Verified} pending={capBp.IsPending}");
@@ -376,7 +376,7 @@ try
     const int gapLine = 51;   // counter++ inside the loop, after the 5s gap sleep
     session3.SetBreakpoints(sourceFile,
         (Line: gapLine, Column: null, Condition: null, HitCondition: null,
-         Action: "break", CaptureScope: null, CaptureDepth: 0));
+         Action: "break", CaptureScope: null, CaptureDepth: 0, CaptureExpressions: null));
 
     await debuggee3.StandardInput.WriteLineAsync();
     var gapRun = await session3.ContinueAndWaitAsync(timeoutSeconds: 1);
@@ -419,7 +419,7 @@ try
     await session4.AttachAsync(pid4);
     session4.SetBreakpoints(sourceFile,
         (Line: gapLine, Column: null, Condition: null, HitCondition: null,
-         Action: "break", CaptureScope: null, CaptureDepth: 0));
+         Action: "break", CaptureScope: null, CaptureDepth: 0, CaptureExpressions: null));
     await debuggee4.StandardInput.WriteLineAsync();
     var waitRun = await session4.ContinueAndWaitAsync(timeoutSeconds: 1);
     Assert(waitRun.Status == "running", $"Expected running after 1s timeout, got {waitRun.Status}");
@@ -457,7 +457,7 @@ try
     await session5.AttachAsync(pid5);
     session5.SetBreakpoints(sourceFile,
         (Line: gapLine, Column: null, Condition: null, HitCondition: null,
-         Action: "break", CaptureScope: null, CaptureDepth: 0));
+         Action: "break", CaptureScope: null, CaptureDepth: 0, CaptureExpressions: null));
     await debuggee5.StandardInput.WriteLineAsync();
     var ackRun = await session5.ContinueAndWaitAsync(timeoutSeconds: 1);
     Assert(ackRun.Status == "running", $"Expected running after 1s timeout, got {ackRun.Status}");
@@ -508,13 +508,13 @@ try
     // (a) normalization: absolute path, then the same file via a relative path
     var bpA = session6.SetBreakpoints(sourceFile,
         (Line: 51, Column: null, Condition: null, HitCondition: null,
-         Action: "capture", CaptureScope: "all", CaptureDepth: 0))[0];
+         Action: "capture", CaptureScope: "all", CaptureDepth: 0, CaptureExpressions: null))[0];
     Assert(bpA.Action == "capture", "bpA should be a capture breakpoint");
 
     var relSource = Path.GetRelativePath(repoRoot, sourceFile);   // TestDebuggee/Program.cs
     var bpRel = session6.SetBreakpoints(relSource,
         (Line: 53, Column: null, Condition: null, HitCondition: null,
-         Action: "break", CaptureScope: null, CaptureDepth: 0))[0];
+         Action: "break", CaptureScope: null, CaptureDepth: 0, CaptureExpressions: null))[0];
     var afterRel = session6.GetAllBreakpoints();
     Assert(afterRel.Count(b => b.FunctionName is null) == 1,
         $"Normalized re-set must not duplicate the file entry, got {afterRel.Count(b => b.FunctionName is null)}");
@@ -527,9 +527,9 @@ try
                                   Path.GetFullPath(sourceFile).ToLowerInvariant(),
                                   StringComparison.Ordinal))
         .Select(b => (b.Line, b.Column, b.Condition, b.HitCondition,
-                      b.Action, b.CaptureScope, b.CaptureDepth))
+                      b.Action, b.CaptureScope, b.CaptureDepth, b.CaptureExpressions))
         .ToList();
-    existing.Add((51, null, null, null, "capture", "all", 0));
+    existing.Add((51, null, null, null, "capture", "all", 0, null));
     var entries6 = session6.SetBreakpoints(sourceFile, existing.ToArray());
     var bpB = entries6.Last(); // the just-added line 50
     Assert(bpB.Line == 51 && bpB.Action == "capture", "Incremental add must create the line-51 capture bp");
@@ -588,9 +588,9 @@ try
     await session7.AttachAsync(pid7);
     session7.SetBreakpoints(sourceFile,
         (Line: 51, Column: null, Condition: null, HitCondition: null,
-         Action: "capture", CaptureScope: "all", CaptureDepth: 0),
+         Action: "capture", CaptureScope: "all", CaptureDepth: 0, CaptureExpressions: null),
         (Line: 53, Column: null, Condition: null, HitCondition: null,
-         Action: "capture", CaptureScope: "all", CaptureDepth: 0));
+         Action: "capture", CaptureScope: "all", CaptureDepth: 0, CaptureExpressions: null));
     await debuggee7.StandardInput.WriteLineAsync();
 
     StopEvent? last7 = null;

@@ -402,6 +402,7 @@ public class DebugSession : IDisposable
         public string Action { get; set; } = "break";
         public string? CaptureScope { get; set; }
         public int CaptureDepth { get; set; }
+        public string[]? CaptureExpressions { get; set; }
         public string? FunctionName { get; set; }
 
         /// <summary>SharpDbg's breakpoint id — matches BreakpointEvent payloads.</summary>
@@ -457,7 +458,7 @@ public class DebugSession : IDisposable
     public IReadOnlyList<BreakpointEntry> SetBreakpoints(
         string filePath,
         params (int Line, int? Column, string? Condition, string? HitCondition,
-                string Action, string? CaptureScope, int CaptureDepth)[] breakpoints)
+                string Action, string? CaptureScope, int CaptureDepth, string[]? CaptureExpressions)[] breakpoints)
     {
         var normalizedFile = NormalizePath(filePath);
         // The FIRST path form wins for the adapter: re-sends must target the
@@ -484,7 +485,7 @@ public class DebugSession : IDisposable
         var entries = new List<BreakpointEntry>();
         var sourceBreakpoints = new List<SourceBreakpoint>();
 
-        foreach (var (line, col, cond, hitCond, action, captureScope, captureDepth) in breakpoints)
+        foreach (var (line, col, cond, hitCond, action, captureScope, captureDepth, captureExpressions) in breakpoints)
         {
             var entry = new BreakpointEntry(
                 Id: _nextBreakpointId++,
@@ -499,7 +500,8 @@ public class DebugSession : IDisposable
             {
                 Action = action,
                 CaptureScope = captureScope,
-                CaptureDepth = captureDepth
+                CaptureDepth = captureDepth,
+                CaptureExpressions = captureExpressions
             };
             entries.Add(entry);
 
@@ -695,7 +697,7 @@ public class DebugSession : IDisposable
                 {
                     SetBreakpoints(originalPath, entries.Select(e =>
                         (e.Line, e.Column, e.Condition, e.HitCondition,
-                         e.Action, e.CaptureScope, e.CaptureDepth)).ToArray());
+                         e.Action, e.CaptureScope, e.CaptureDepth, e.CaptureExpressions)).ToArray());
                 }
                 return true;
             }
@@ -728,7 +730,9 @@ public class DebugSession : IDisposable
     // Capture System
     // ===================================================================
 
-    public CaptureSnapshot CaptureState(string scope = "all", int depth = 0, int? breakpointId = null)
+    public CaptureSnapshot CaptureState(
+        string scope = "all", int depth = 0, int? breakpointId = null,
+        IReadOnlyList<CapturedExpression>? expressions = null)
     {
         EnsureStopped();
 
@@ -745,7 +749,8 @@ public class DebugSession : IDisposable
             Line: frame?.Line ?? 0,
             Variables: frame is null ? [] : GetVariablesForFrame(frame.Id, scope, depth),
             Timestamp: DateTime.UtcNow,
-            BreakpointId: breakpointId);
+            BreakpointId: breakpointId,
+            Expressions: expressions is { Count: > 0 } ? expressions : null);
         lock (_capturesLock)
             _captures.Add(snapshot);
         return snapshot;
@@ -1442,7 +1447,8 @@ public class DebugSession : IDisposable
                 // Offload capture to thread pool — don't block the DAP reader.
                 // DO NOT touch _pendingStopTcs — the caller keeps waiting and
                 // the next stop (or exit) resolves it.
-                _ = Task.Run(() => RunCaptureAndContinueAsync(e.ThreadId, generation, capture.Scope, capture.Depth, capture.BreakpointId));
+                _ = Task.Run(() => RunCaptureAndContinueAsync(
+                    e.ThreadId, generation, capture.Scope, capture.Depth, capture.BreakpointId, capture.Expressions));
                 _logger.LogInformation("← OnStopped: auto-continue (capture), TCS not touched, thread={ThreadId}", e.ThreadId);
                 return;
             }
@@ -1487,7 +1493,8 @@ public class DebugSession : IDisposable
         {
             return _bpConfigs.TryGetValue((NormalizePath(file), line), out var cfg)
                 && cfg.Action == "capture"
-                ? new CaptureResolution(cfg.CaptureScope ?? "all", cfg.CaptureDepth, cfg.Id)
+                ? new CaptureResolution(
+                    cfg.CaptureScope ?? "all", cfg.CaptureDepth, cfg.Id, cfg.CaptureExpressions ?? [])
                 : null;
         }
     }
@@ -1542,9 +1549,10 @@ public class DebugSession : IDisposable
         return OperatingSystem.IsWindows() ? full.ToLowerInvariant() : full;
     }
 
-    private readonly record struct CaptureResolution(string Scope, int Depth, int BreakpointId);
+    private readonly record struct CaptureResolution(string Scope, int Depth, int BreakpointId, string[] Expressions);
 
-    private void RunCaptureAndContinueAsync(int? threadId, long stopGeneration, string scope, int depth, int breakpointId)
+    private void RunCaptureAndContinueAsync(
+        int? threadId, long stopGeneration, string scope, int depth, int breakpointId, string[] expressions)
     {
         _ = Task.Run(async () =>
         {
@@ -1556,7 +1564,38 @@ public class DebugSession : IDisposable
             await _captureGate.WaitAsync().ConfigureAwait(false);
             try
             {
-                CaptureState(scope, depth, breakpointId);
+                // captureExpressions: evaluated at hit time while the frame is
+                // still alive — before CaptureState, before the auto-continue
+                // resume. Each failure is recorded per-expression and never
+                // fails the capture (mirrors the conditional-breakpoint
+                // skip-on-error semantics).
+                var expressionResults = new List<CapturedExpression>();
+                if (expressions.Length > 0)
+                {
+                    var frame = GetStackTrace(_activeThreadId ?? 1, 0, 1).FirstOrDefault();
+                    foreach (var expr in expressions)
+                    {
+                        if (frame is null)
+                        {
+                            expressionResults.Add(new CapturedExpression(expr, null, true));
+                            continue;
+                        }
+                        try
+                        {
+                            var r = await EvaluateAsync(expr, frame.Id).ConfigureAwait(false);
+                            expressionResults.Add(new CapturedExpression(
+                                expr, r.IsError ? null : r.Result, r.IsError));
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex,
+                                "captureExpressions: evaluation failed for '{Expression}'", expr);
+                            expressionResults.Add(new CapturedExpression(expr, null, true));
+                        }
+                    }
+                }
+
+                CaptureState(scope, depth, breakpointId, expressionResults);
 
                 var host = _host;
                 if (host is null || _stateMachine.Current is SessionState.Exited or SessionState.Detached)
@@ -1750,6 +1789,7 @@ public record VariableInfo(
     public List<VariableInfo>? Children { get; init; }
 }
 public record EvalResult(string Result, string? Type, int VariablesReference, bool IsError = false);
+public record CapturedExpression(string Expression, string? Value, bool IsError);
 public record ExceptionDetail(
     string ExceptionId, string Description, string BreakMode,
     string? Message, string? TypeName, string? FullTypeName,
@@ -1763,4 +1803,5 @@ public record CaptureSnapshot(
     int Line,
     IReadOnlyList<VariableInfo> Variables,
     DateTime Timestamp,
-    int? BreakpointId);
+    int? BreakpointId,
+    IReadOnlyList<CapturedExpression>? Expressions);

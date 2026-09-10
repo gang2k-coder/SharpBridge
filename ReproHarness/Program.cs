@@ -63,7 +63,7 @@ if (mode == "launch")
         var bps = session.SetBreakpoints(
             Path.Combine(repoRoot, "TestDebuggee/Program.cs"),
             (Line: 51, Column: null, Condition: null, HitCondition: null,
-             Action: "capture", CaptureScope: "all", CaptureDepth: 0));
+             Action: "capture", CaptureScope: "all", CaptureDepth: 0, CaptureExpressions: null));
         Console.WriteLine($"   -> verified={bps[0].Verified}, message={bps[0].Message}, line={bps[0].Line}");
 
         Console.WriteLine("3. debug_continue (agent)...");
@@ -120,9 +120,9 @@ else
         Console.WriteLine("2. breakpoint_set: TWO capture bps @ lines 11 and 12...");
         session.SetBreakpoints(reproDebuggeeSrc,
             (Line: 11, Column: null, Condition: null, HitCondition: null,
-             Action: "capture", CaptureScope: "all", CaptureDepth: 0),
+             Action: "capture", CaptureScope: "all", CaptureDepth: 0, CaptureExpressions: null),
             (Line: 12, Column: null, Condition: null, HitCondition: null,
-             Action: "capture", CaptureScope: "all", CaptureDepth: 0));
+             Action: "capture", CaptureScope: "all", CaptureDepth: 0, CaptureExpressions: null));
         Console.WriteLine("   -> set (pending until module loads)");
 
         Console.WriteLine("3. debuggee ENTER, then agent continues in rounds...");

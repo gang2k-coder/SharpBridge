@@ -33,6 +33,10 @@ public class BreakpointTools(DebugSessionManager manager)
         [Description("'break' = stop and wait (default), 'capture' = auto-snapshot variables and continue")] string action = "break",
         [Description("Capture scope (only when action='capture'): 'locals', 'arguments', or 'all' (default)")] string captureScope = "all",
         [Description("Capture expansion depth (only when action='capture'): 0=summary, 1+=expand children")] int captureDepth = 0,
+        [Description("C# expressions evaluated at HIT time and stored on each capture snapshot as expressions: {expr: value} " +
+            "(only when action='capture'). Reduces {TypeName} placeholders without full-tree expansion. " +
+            "Each failure is recorded as null and never fails the capture. " +
+            "NOTE: expressions add hit-time latency (evaluated per hit).")] string[]? captureExpressions = null,
         [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
         [Description("Process name. Uses the currently selected session if omitted.")] string? processName = null)
     {
@@ -45,9 +49,9 @@ public class BreakpointTools(DebugSessionManager manager)
         var existing = session.GetAllBreakpoints()
             .Where(bp => bp.FunctionName is null && NormalizePath(bp.FilePath) == NormalizePath(filePath))
             .Select(bp => (bp.Line, bp.Column, bp.Condition, bp.HitCondition,
-                           bp.Action, bp.CaptureScope, bp.CaptureDepth))
+                           bp.Action, bp.CaptureScope, bp.CaptureDepth, bp.CaptureExpressions))
             .ToList();
-        existing.Add((line, column, condition, hitCondition, action, captureScope, captureDepth));
+        existing.Add((line, column, condition, hitCondition, action, captureScope, captureDepth, captureExpressions));
 
         var entries = session.SetBreakpoints(filePath, existing.ToArray());
         var entry = entries.Last(); // the one just added
@@ -72,6 +76,7 @@ public class BreakpointTools(DebugSessionManager manager)
             action = entry.Action,
             captureScope = entry.CaptureScope,
             captureDepth = entry.CaptureDepth,
+            captureExpressions = entry.CaptureExpressions,
             fileBreakpointCount = entries.Count,
             hint = status switch
             {
@@ -203,6 +208,7 @@ public class BreakpointTools(DebugSessionManager manager)
                 action = bp.Action,
                 captureScope = bp.CaptureScope,
                 captureDepth = bp.CaptureDepth,
+                captureExpressions = bp.CaptureExpressions,
                 hint = bp.Action == "capture"
                     ? "Capture-action: auto-captures variables and continues."
                     : bp.Verified

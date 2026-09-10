@@ -97,7 +97,7 @@ try
 
         var bps = session2.SetBreakpoints(reproSrc,
             (Line: 11, Column: null, Condition: null, HitCondition: null,
-             Action: "break", CaptureScope: null, CaptureDepth: 0));
+             Action: "break", CaptureScope: null, CaptureDepth: 0, CaptureExpressions: null));
         Console.WriteLine($"   Breakpoint line 11: verified={bps[0].Verified} message={bps[0].Message}");
         Assert(bps[0].Verified, $"Expected verified breakpoint, got: {bps[0].Message}");
 
@@ -131,7 +131,7 @@ try
 
         var bps = session3.SetBreakpoints(reproSrc,
             (Line: 11, Column: null, Condition: null, HitCondition: null,
-             Action: "break", CaptureScope: null, CaptureDepth: 0));
+             Action: "break", CaptureScope: null, CaptureDepth: 0, CaptureExpressions: null));
         Console.WriteLine($"   Breakpoint line 11: verified={bps[0].Verified} message={bps[0].Message}");
 
         // No entry stop: the process resumes immediately, so the module may

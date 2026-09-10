@@ -1430,6 +1430,84 @@ try
         new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = agpid });
     Console.WriteLine("   ✅");
 
+    // Test 41: captureExpressions (hit-time eval) + extractProfiles (explicit paths).
+    tests++; passed++;
+    Console.WriteLine("41. captureExpressions + extractProfiles...");
+    var p2psi = new ProcessStartInfo("dotnet", [captureDebuggeeDll])
+    {
+        RedirectStandardOutput = true, RedirectStandardInput = true,
+        RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+    };
+    p2psi.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+    using var p2dbg = Process.Start(p2psi)!;
+    var p2pid = p2dbg.Id;
+    await client.CallToolAsync("debug_attach", new Dictionary<string, object?> { ["processId"] = p2pid });
+    await client.CallToolAsync("debug_select", new Dictionary<string, object?> { ["processId"] = p2pid });
+    await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
+    {
+        ["filePath"] = captureDebuggeeSrc,
+        ["line"] = cdCounterLine,
+        ["action"] = "capture",
+        ["captureExpressions"] = new[] { "counter + 1", "referenceCurveId", "thisVariableDoesNotExist" }
+    });
+    await client.CallToolAsync("breakpoint_set", new Dictionary<string, object?>
+    {
+        ["filePath"] = cdLoopEndFile, ["line"] = cdLoopEndLine
+    });
+    await p2dbg.StandardInput.WriteLineAsync();
+    var p2ContJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 30 })));
+    Assert(p2ContJson.RootElement.GetProperty("status").GetString() == "stopped", "p2 run did not stop at LoopEnd");
+
+    var p2SumJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>())));
+    var p2Exprs = p2SumJson.RootElement.GetProperty("captures")[0].GetProperty("expressions");
+    Assert(p2Exprs.GetProperty("counter + 1").GetString() == "1",
+        $"counter+1 eval wrong: {p2Exprs.GetProperty("counter + 1").GetRawText()}");
+    Assert(p2Exprs.GetProperty("referenceCurveId").GetString()!.Contains("REF-ALPHA"),
+        $"referenceCurveId eval wrong: {p2Exprs.GetProperty("referenceCurveId").GetRawText()}");
+    Assert(p2Exprs.GetProperty("thisVariableDoesNotExist").ValueKind == JsonValueKind.Null,
+        "failed expression should be null");
+
+    // v1 payload stays byte-compatible: no expressions key.
+    var p2v1Json = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures", new Dictionary<string, object?>())));
+    Assert(!p2v1Json.RootElement.GetProperty("captures")[0].TryGetProperty("expressions", out _),
+        "v1 payload must not include expressions");
+
+    // extractProfiles: explicit path, loaded in listed order before inline rules.
+    var profilePath = Path.Combine(Path.GetTempPath(), $"sharpbridge-profile-{Guid.NewGuid():N}.json");
+    File.WriteAllText(profilePath,
+        """
+        {
+          "name": "p2-test-profile",
+          "description": "synthetic fixture profile",
+          "extract": [
+            { "variable": "payloadJson", "type": "json", "pick": ["content.widget.tracks[1].channels[4].mnemonic"] }
+          ]
+        }
+        """);
+    var p2ProfJson = JsonDocument.Parse(GetText(
+        await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>
+        { ["extractProfiles"] = new[] { profilePath } })));
+    var p2ProfExt = p2ProfJson.RootElement.GetProperty("captures")[0].GetProperty("extracted")[0];
+    Assert(p2ProfExt.GetProperty("variable").GetString() == "payloadJson", "profile extract variable wrong");
+    Assert(p2ProfExt.GetProperty("picked")
+        .GetProperty("content.widget.tracks[1].channels[4].mnemonic").GetString() == "CH-09",
+        "profile pick wrong");
+    File.Delete(profilePath);
+
+    // Missing profile path fails loud with the path in the message.
+    var missingResult = await client.CallToolAsync("get_captures_v2", new Dictionary<string, object?>
+    { ["extractProfiles"] = new[] { Path.Combine(Path.GetTempPath(), "definitely-missing-profile.json") } });
+    var missingText = ((TextContentBlock)missingResult.Content[0]).Text;
+    Assert(missingResult.IsError == true && missingText.Contains("file not found"),
+        $"Expected missing-profile error, got: {missingText}");
+
+    await client.CallToolAsync("debug_disconnect",
+        new Dictionary<string, object?> { ["terminateDebuggee"] = true, ["processId"] = p2pid });
+    Console.WriteLine("   ✅");
+
     Console.WriteLine($"\n=== {passed}/{tests} PASSED ===");
 
 }

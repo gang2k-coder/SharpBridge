@@ -350,6 +350,8 @@ public class InspectionTools(DebugSessionManager manager)
             "bySourceLine (always), counts.<field>_null, and distinctValues for fields with <=5 distinct values. " +
             "Omit for aggregate=null.")] string[]? aggregateFields = null,
         [Description("Extract fields from JSON-string variables, e.g. [{variable: 'payloadJson', type: 'json', pick: ['items[0].id']}]")] ExtractRule[]? extract = null,
+        [Description("Explicit paths to extract-profile JSON files ({ extract: [{variable, type, pick}] }, optional name/description). " +
+            "Loaded in listed order, then inline extract rules are appended.")] string[]? extractProfiles = null,
         [Description("Write the full capture payload to temp file(s) and return path(s) in spillFile; large inline values become placeholders")] bool spillToFile = false,
         [Description("Per-variable byte threshold: larger values become '<spilled: N KB>' inline (default 8192)")] int? spillThresholdBytes = null,
         [Description("Process ID. Uses the currently selected session if omitted.")] int? processId = null,
@@ -365,6 +367,15 @@ public class InspectionTools(DebugSessionManager manager)
 
         var session = ResolveSession(processId, processName);
         var captures = session.GetCaptures();
+
+        // === Extract rules: explicit-path profiles (in order), then inline ===
+        var mergedRules = new List<ExtractRule>();
+        if (extractProfiles is { Length: > 0 })
+            foreach (var profilePath in extractProfiles)
+                mergedRules.AddRange(LoadExtractProfile(profilePath));
+        if (extract is { Length: > 0 })
+            mergedRules.AddRange(extract);
+        extract = mergedRules.ToArray();
 
         // === Filters (AND together, before pagination) ===
         IEnumerable<CaptureSnapshot> filtered = captures;
@@ -535,6 +546,9 @@ public class InspectionTools(DebugSessionManager manager)
                 ? new { path = c.FilePath, file = Path.GetFileName(c.FilePath), line = c.Line }
                 : null,
             variables = rawVariables.Select(v => RenderVariableInline(v, v.Name, depthCap, threshold, jsonReplacedPaths)),
+            expressions = c.Expressions is { Count: > 0 }
+                ? c.Expressions.ToDictionary(e => e.Expression, e => (object?)e.Value)
+                : null,
             extracted = RenderExtracted(extractedByCapture.TryGetValue(c.Index, out var ex) ? ex : null),
             spillFile
         };
@@ -676,6 +690,17 @@ public class InspectionTools(DebugSessionManager manager)
             sb.AppendLine("|---|---|");
             foreach (var (name, value) in FlattenVariables(c.Variables, depthCap, threshold, jsonReplacedPaths))
                 sb.AppendLine($"| {EscapeMarkdownCell(name)} | {EscapeMarkdownCell(value)} |");
+
+            if (c.Expressions is { Count: > 0 })
+            {
+                sb.AppendLine();
+                sb.AppendLine("**Expressions:**");
+                sb.AppendLine();
+                sb.AppendLine("| expression | value |");
+                sb.AppendLine("|---|---|");
+                foreach (var e in c.Expressions)
+                    sb.AppendLine($"| {EscapeMarkdownCell(e.Expression)} | {EscapeMarkdownCell(e.Value ?? "null")} |");
+            }
 
             if (extractedByCapture.TryGetValue(c.Index, out var ex))
             {
@@ -904,6 +929,29 @@ public class InspectionTools(DebugSessionManager manager)
         public string? Variable { get; set; }
         public string Type { get; set; } = "json";
         public string[]? Pick { get; set; }
+    }
+
+    /// <summary>Load an extract profile from an explicit path. Fails loud:
+    /// the agent passed the path, so a missing/invalid file is a caller error.
+    /// The file shape is { name?, description?, extract: [rules] }.</summary>
+    private static List<ExtractRule> LoadExtractProfile(string path)
+    {
+        if (!File.Exists(path))
+            throw new ArgumentException($"extractProfiles: file not found: {path}");
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            if (!doc.RootElement.TryGetProperty("extract", out var rulesElement))
+                throw new ArgumentException($"extractProfiles: missing 'extract' array in {path}");
+            // Profile files use the same lowercase field names as the inline
+            // MCP args (variable/type/pick) — match case-insensitively.
+            return rulesElement.Deserialize<List<ExtractRule>>(
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? [];
+        }
+        catch (JsonException ex)
+        {
+            throw new ArgumentException($"extractProfiles: invalid JSON in {path}: {ex.Message}");
+        }
     }
 
     private static string FormatVariables(IReadOnlyList<VariableInfo> variables, int source)
