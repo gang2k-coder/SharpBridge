@@ -138,7 +138,7 @@ public class SessionTools(DebugSessionManager manager)
             processId = session.ProcessId,
             processName = session.ProcessName,
             state = session.CurrentState.ToString(),
-            breakpointCount = session.BreakpointCount,
+            breakpointCount = session.GetBreakpointCount(),
             info = session.CurrentState switch
             {
                 SessionState.Detached => "No debug session. Use debug_launch or debug_attach to start.",

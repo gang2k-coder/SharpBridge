@@ -28,10 +28,11 @@ namespace SharpBridge.Services;
 ///   and must only enqueue (rule R3); the stop-generation bump stays on that
 ///   thread (rule R4).
 ///
-///   Migration status: S0 ships the plumbing plus one migrated op (GetThreads).
-///   Every DAP request goes through SendDap, which warns once per call site
-///   when it is not on the consumer thread — that warning list is the
-///   remaining S1-S3 worklist.
+///   Migration status (S1): every tool-facing inspection/breakpoint entry
+///   point and the capture path run as ops on the consumer. Still pending:
+///   execution control + the session gate (S2) and the DAP event handlers
+///   (S3). SendDap warns once per off-consumer call site — that list is the
+///   remaining work.
 ///
 ///   For async operations (continue/step/launch-stopAtEntry), we pre-register
 ///   a StoppedEvent handler whose TCS is swapped before each operation.
@@ -55,17 +56,9 @@ public class DebugSession : IDisposable
     // ===================================================================
     private readonly SemaphoreSlim _sessionGate = new(1, 1);
 
-    /// <summary>
-    /// Serializes capture auto-continue tasks: capture + resume must not run
-    /// concurrently (two captures interleave DAP round-trips — eval-driven
-    /// variable expansion even resumes the debuggee mid-capture — and race
-    /// the state machine; that was the capture-freeze bug). Deliberately NOT
-    /// the session gate: a waiting debug_continue holds that gate for its
-    /// whole timeout, and capture must be able to make progress underneath.
-    /// No deadlock cycle: capture tasks never wait on the session gate, and
-    /// tool calls never wait on this gate.
-    /// </summary>
-    private readonly SemaphoreSlim _captureGate = new(1, 1);
+    // (S1) The former _captureGate is gone: capture runs as a single op on the
+    // session consumer, so two captures can never interleave DAP round-trips —
+    // atomicity is structural now, not lock-based.
 
     // ===================================================================
     // Session actor (S0) — one consumer thread owns all DAP I/O and state
@@ -87,6 +80,14 @@ public class DebugSession : IDisposable
 
     private System.Threading.Thread? _consumer;
     private int _consumerThreadId = -1;
+
+    /// <summary>
+    /// Set when the consumer loop has exited (channel completed and drained).
+    /// From that point on session state is frozen — the reader thread was
+    /// stopped and _host disposed by Cleanup — so state-only reads may run
+    /// inline on the caller (see RunOnSessionState).
+    /// </summary>
+    private readonly ManualResetEventSlim _consumerStopped = new(false);
 
     /// <summary>
     /// Until the S1-S3 migration completes, off-consumer DAP calls are logged
@@ -126,6 +127,7 @@ public class DebugSession : IDisposable
                 break;
         }
 
+        _consumerStopped.Set();
         _logger.LogDebug("Session consumer thread exiting (id={ThreadId})", _consumerThreadId);
     }
 
@@ -139,9 +141,17 @@ public class DebugSession : IDisposable
         }
         catch (Exception ex)
         {
+            if (op.Completion is null)
+            {
+                // Fire-and-forget op (capture): nobody is waiting, so an
+                // escaping exception must not vanish silently (R5).
+                _logger.LogError(ex, "Background session op '{Name}' failed", op.Name);
+                return;
+            }
+
             // Exceptions travel back to the producer through the TCS (R5) so
             // Filters.cs can surface the real message to the agent.
-            op.Completion?.TrySetException(ex);
+            op.Completion.TrySetException(ex);
         }
         finally
         {
@@ -164,7 +174,6 @@ public class DebugSession : IDisposable
                 $"Session op '{name}' cannot be enqueued from the session consumer thread (self-deadlock).");
 
         ct.ThrowIfCancellationRequested();
-        EnsureActive();
 
         var completion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
         if (!_ops.Writer.TryWrite(new SessionOp(name, () => body(), completion)))
@@ -174,12 +183,50 @@ public class DebugSession : IDisposable
     }
 
     /// <summary>
+    /// Enqueue variant for ops that only READ session-owned state (breakpoint
+    /// list, captures, modules). While the session is alive they behave like
+    /// RunOnSession (ordering + no cross-thread reads). After the debuggee
+    /// exited they keep working by reading the frozen state inline: Cleanup
+    /// has already stopped the reader thread and disposed the host, and the
+    /// consumer has exited, so nothing can mutate session state any more.
+    /// The wait for the consumer is bounded — if it is stuck in a dead DAP
+    /// call we fail fast instead of hanging.
+    /// </summary>
+    public T RunOnSessionState<T>(string name, Func<T> body)
+    {
+        var completion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (_ops.Writer.TryWrite(new SessionOp(name, () => body(), completion)))
+            return (T)completion.Task.GetAwaiter().GetResult()!;
+
+        if (_consumer is null || !_consumerStopped.Wait(TimeSpan.FromSeconds(2)))
+            throw SessionNotActive();
+
+        return body();
+    }
+
+    /// <summary>
     /// Blocking variant for methods whose signatures must stay synchronous.
     /// Blocking the caller is equivalent to today's SendRequestSync behaviour:
     /// the caller already blocked on the very same DAP round trip.
     /// </summary>
     public T RunOnSession<T>(string name, Func<T> body)
         => RunOnSessionAsync(name, body).GetAwaiter().GetResult();
+
+    /// <summary>Void variant of <see cref="RunOnSession{T}"/>.</summary>
+    public void RunOnSession(string name, Action body)
+        => RunOnSessionAsync(name, () => { body(); return true; }).GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Fire-and-forget op for work triggered by the reader thread (R3: the
+    /// reader must never block). The body is expected to handle its own
+    /// exceptions; if one escapes, RunOp logs it — there is no producer to
+    /// deliver it to.
+    /// </summary>
+    private void EnqueueBackground(string name, Action body)
+    {
+        if (!_ops.Writer.TryWrite(new SessionOp(name, () => { body(); return null; }, null)))
+            _logger.LogDebug("Background op '{Name}' dropped: the session is closed.", name);
+    }
 
     /// <summary>
     /// Single funnel for every DAP request (except the constructor handshake).
@@ -299,6 +346,15 @@ public class DebugSession : IDisposable
     private int? _activeThreadId;
     private readonly List<CaptureSnapshot> _captures = [];
     private int _captureIndex;
+
+    /// <summary>
+    /// Cached breakpoint count, maintained on the session consumer by
+    /// RecountBreakpoints(). Read directly (plain int) by GetBreakpointCount —
+    /// tool threads must not enumerate the breakpoint dictionaries while the
+    /// consumer mutates them, and execution-control decision paths must not
+    /// pay a queue round-trip that widens their TOCTOU window.
+    /// </summary>
+    private int _breakpointCount;
 
     // ===================================================================
     // Session identity
@@ -606,9 +662,6 @@ public class DebugSession : IDisposable
     // waiting tool holds it). A short dedicated lock keeps both sides safe.
     private readonly object _bpConfigsLock = new();
 
-    // Guards _captures: written by tool threads and by the capture
-    // auto-continue task (deliberately outside the session gate).
-    private readonly object _capturesLock = new();
     private readonly Dictionary<int, BreakpointEntry> _bpsByAdapterId = [];
 
     /// <summary>Normalized path → the FIRST path form used to set breakpoints in that file.
@@ -636,6 +689,12 @@ public class DebugSession : IDisposable
     }
 
     public IReadOnlyList<BreakpointEntry> SetBreakpoints(
+        string filePath,
+        params (int Line, int? Column, string? Condition, string? HitCondition,
+                string Action, string? CaptureScope, int CaptureDepth, string[]? CaptureExpressions)[] breakpoints)
+        => RunOnSession("breakpoint_set", () => SetBreakpointsCore(filePath, breakpoints));
+
+    private IReadOnlyList<BreakpointEntry> SetBreakpointsCore(
         string filePath,
         params (int Line, int? Column, string? Condition, string? HitCondition,
                 string Action, string? CaptureScope, int CaptureDepth, string[]? CaptureExpressions)[] breakpoints)
@@ -741,6 +800,7 @@ public class DebugSession : IDisposable
 
         MarkPending(entries);
         RebuildAdapterIdMap();
+        RecountBreakpoints();
 
         return entries;
     }
@@ -749,6 +809,11 @@ public class DebugSession : IDisposable
     /// Set function breakpoints. DAP SetFunctionBreakpoints REPLACES ALL function breakpoints.
     /// </summary>
     public IReadOnlyList<BreakpointEntry> SetFunctionBreakpoints(
+        params (string Name, string? Condition, string? HitCondition,
+                string Action, string? CaptureScope, int CaptureDepth)[] breakpoints)
+        => RunOnSession("breakpoint_set_function", () => SetFunctionBreakpointsCore(breakpoints));
+
+    private IReadOnlyList<BreakpointEntry> SetFunctionBreakpointsCore(
         params (string Name, string? Condition, string? HitCondition,
                 string Action, string? CaptureScope, int CaptureDepth)[] breakpoints)
     {
@@ -801,6 +866,7 @@ public class DebugSession : IDisposable
 
         MarkPending(entries);
         RebuildAdapterIdMap();
+        RecountBreakpoints();
 
         return entries;
     }
@@ -849,6 +915,9 @@ public class DebugSession : IDisposable
     }
 
     public bool RemoveBreakpoint(int id)
+        => RunOnSession("breakpoint_remove", () => RemoveBreakpointCore(id));
+
+    private bool RemoveBreakpointCore(int id)
     {
         foreach (var (file, entries) in _breakpointsByFile)
         {
@@ -858,7 +927,8 @@ public class DebugSession : IDisposable
                 entries.Remove(entry);
                 // Drop any capture config for this breakpoint so a stale
                 // auto-continue doesn't fire if the line is re-set as "break".
-                _bpConfigs.Remove((NormalizePath(file), entry.Line));
+                lock (_bpConfigsLock)
+                    _bpConfigs.Remove((NormalizePath(file), entry.Line));
                 // Re-send with the ORIGINAL path the breakpoints were set
                 // with: SharpDbg keys breakpoint sets per source path, so a
                 // normalized (lower-cased) path would be treated as a DIFFERENT
@@ -875,10 +945,13 @@ public class DebugSession : IDisposable
                 }
                 else
                 {
-                    SetBreakpoints(originalPath, entries.Select(e =>
+                    // Core call, NOT the public wrapper: enqueueing from inside
+                    // an op would self-deadlock on the head of the queue (R2).
+                    SetBreakpointsCore(originalPath, entries.Select(e =>
                         (e.Line, e.Column, e.Condition, e.HitCondition,
                          e.Action, e.CaptureScope, e.CaptureDepth, e.CaptureExpressions)).ToArray());
                 }
+                RecountBreakpoints();
                 return true;
             }
         }
@@ -893,6 +966,7 @@ public class DebugSession : IDisposable
                 .Select(e => new FunctionBreakpoint { Name = e.FunctionName!, Condition = e.Condition, HitCondition = e.HitCondition })
                 .ToList();
             SendDap(new SetFunctionBreakpointsRequest { Breakpoints = remaining });
+            RecountBreakpoints();
             return true;
         }
 
@@ -900,11 +974,20 @@ public class DebugSession : IDisposable
     }
 
     public IReadOnlyList<BreakpointEntry> GetAllBreakpoints()
+        => RunOnSessionState("breakpoint_list", GetAllBreakpointsCore);
+
+    private IReadOnlyList<BreakpointEntry> GetAllBreakpointsCore()
         => _breakpointsByFile.Values.SelectMany(v => v)
             .Concat(_functionBreakpoints)
             .OrderBy(e => e.Id).ToList();
 
-    public int BreakpointCount => _breakpointsByFile.Values.Sum(v => v.Count) + _functionBreakpoints.Count;
+    public int GetBreakpointCount() => _breakpointCount;
+
+    private int BreakpointCountCore
+        => _breakpointsByFile.Values.Sum(v => v.Count) + _functionBreakpoints.Count;
+
+    /// <summary>Refresh <see cref="_breakpointCount"/>; call from every op that mutates breakpoints.</summary>
+    private void RecountBreakpoints() => _breakpointCount = BreakpointCountCore;
 
     // ===================================================================
     // Capture System
@@ -913,13 +996,22 @@ public class DebugSession : IDisposable
     public CaptureSnapshot CaptureState(
         string scope = "all", int depth = 0, int? breakpointId = null,
         IReadOnlyList<CapturedExpression>? expressions = null)
+        => RunOnSession("capture_state", () => CaptureStateCore(scope, depth, breakpointId, expressions));
+
+    /// <summary>
+    /// Runs on the session consumer. Manual (tool) captures and auto-captures
+    /// are both ops now, so they can never interleave their DAP round-trips.
+    /// </summary>
+    private CaptureSnapshot CaptureStateCore(
+        string scope, int depth, int? breakpointId,
+        IReadOnlyList<CapturedExpression>? expressions)
     {
         EnsureStopped();
 
         // Location comes from the actual top frame — the ground truth for
         // "where the snapshot was taken", and it works even when no stop
         // event was ever processed (e.g. launch with pause-success).
-        var frame = GetStackTrace(_activeThreadId ?? 1, 0, 1).FirstOrDefault();
+        var frame = GetStackTraceCore(_activeThreadId ?? 1, 0, 1).FirstOrDefault();
 
         var snapshot = new CaptureSnapshot(
             Index: ++_captureIndex,
@@ -927,30 +1019,23 @@ public class DebugSession : IDisposable
             ThreadId: _lastStop?.ThreadId,
             FilePath: frame?.Source,
             Line: frame?.Line ?? 0,
-            Variables: frame is null ? [] : GetVariablesForFrame(frame.Id, scope, depth),
+            Variables: frame is null ? [] : GetVariablesForFrameCore(frame.Id, scope, depth, expand: null),
             Timestamp: DateTime.UtcNow,
             BreakpointId: breakpointId,
             Expressions: expressions is { Count: > 0 } ? expressions : null);
-        lock (_capturesLock)
-            _captures.Add(snapshot);
+        _captures.Add(snapshot);
         return snapshot;
     }
 
     public IReadOnlyList<CaptureSnapshot> GetCaptures()
-    {
-        // Snapshot copy: callers iterate outside the lock.
-        lock (_capturesLock)
-            return _captures.ToList();
-    }
+        => RunOnSessionState("capture_list", () => _captures.ToList().AsReadOnly());
 
     public void ClearCaptures()
-    {
-        lock (_capturesLock)
+        => RunOnSession("capture_clear", () =>
         {
             _captures.Clear();
             _captureIndex = 0;
-        }
-    }
+        });
 
     // ===================================================================
     // Exception Breakpoints
@@ -960,13 +1045,14 @@ public class DebugSession : IDisposable
         => _exceptionFilters;
 
     public void SetExceptionBreakpoints(string[] filters)
-    {
-        SendDap(new SetExceptionBreakpointsRequest
+        => RunOnSession("exception_breakpoints_set", () =>
         {
-            Filters = filters.ToList()
+            SendDap(new SetExceptionBreakpointsRequest
+            {
+                Filters = filters.ToList()
+            });
+            _logger.LogInformation($"Exception breakpoints set: [{string.Join(", ", filters)}]");
         });
-        _logger.LogInformation($"Exception breakpoints set: [{string.Join(", ", filters)}]");
-    }
 
     // ===================================================================
     // Stop ledger — detects stops that occur while no tool call is waiting
@@ -1073,7 +1159,7 @@ public class DebugSession : IDisposable
     {
         if (timeoutSeconds < 0)
             throw new ArgumentException("timeoutSeconds must be >= 0 (0 = no timeout).", nameof(timeoutSeconds));
-        if (BreakpointCount == 0 && timeoutSeconds == 0)
+        if (_breakpointCount == 0 && timeoutSeconds == 0)
         {
             throw new InvalidOperationException(
                 "No breakpoints set and timeout is disabled (0 = infinite). " +
@@ -1321,6 +1407,9 @@ public class DebugSession : IDisposable
     }
 
     public List<StackFrameInfo> GetStackTrace(int threadId, int startFrame = 0, int? levels = null)
+        => RunOnSession("stacktrace_get", () => GetStackTraceCore(threadId, startFrame, levels));
+
+    private List<StackFrameInfo> GetStackTraceCore(int threadId, int startFrame, int? levels)
     {
         EnsureStopped();
         var response = SendDap(new StackTraceRequest
@@ -1351,13 +1440,17 @@ public class DebugSession : IDisposable
         string scope = "all",
         int depth = 0,
         IReadOnlySet<string>? expand = null)
+        => RunOnSession("variables_get", () => GetVariablesForFrameCore(frameId, scope, depth, expand));
+
+    private List<VariableInfo> GetVariablesForFrameCore(
+        int frameId, string scope, int depth, IReadOnlySet<string>? expand)
     {
         if (depth < 0)
             throw new ArgumentException("depth must be >= 0.", nameof(depth));
         if (depth > MaxExpandDepth)
             throw new ArgumentException($"depth must be <= {MaxExpandDepth}.", nameof(depth));
         EnsureStopped();
-        var scopes = GetScopes(frameId);
+        var scopes = GetScopesCore(frameId);
         if (scopes.Count == 0)
             throw new InvalidOperationException(
                 $"Frame {frameId} not found in the current stack. " +
@@ -1378,7 +1471,7 @@ public class DebugSession : IDisposable
         var allVariables = new List<VariableInfo>();
         foreach (var s in selected)
         {
-            var vars = ExpandVariables(s.VariablesReference);
+            var vars = ExpandVariablesCore(s.VariablesReference);
             allVariables.AddRange(vars);
         }
 
@@ -1402,7 +1495,7 @@ public class DebugSession : IDisposable
     private List<VariableInfo> ExpandVariablesRecursive(
         int variablesReference, int remainingDepth, IReadOnlySet<string>? expand)
     {
-        var children = ExpandVariables(variablesReference);
+        var children = ExpandVariablesCore(variablesReference);
         if (remainingDepth <= 0) return children;
 
         for (int i = 0; i < children.Count; i++)
@@ -1420,6 +1513,9 @@ public class DebugSession : IDisposable
     }
 
     public List<VariableInfo> ExpandVariables(int variablesReference)
+        => RunOnSession("variables_expand", () => ExpandVariablesCore(variablesReference));
+
+    private List<VariableInfo> ExpandVariablesCore(int variablesReference)
     {
         EnsureStopped();
         var response = SendDap(new VariablesRequest
@@ -1432,13 +1528,16 @@ public class DebugSession : IDisposable
             v.EvaluateName, v.IndexedVariables, v.NamedVariables)).ToList();
     }
 
-    private List<ScopeInfo> GetScopes(int frameId)
+    private List<ScopeInfo> GetScopesCore(int frameId)
     {
         var response = SendDap(new ScopesRequest { FrameId = frameId });
         return response.Scopes.Select(s => new ScopeInfo(s.Name, s.VariablesReference, s.Expensive)).ToList();
     }
 
     public async Task<EvalResult> EvaluateAsync(string expression, int? frameId = null)
+        => await RunOnSessionAsync("evaluate", () => EvaluateCore(expression, frameId)).ConfigureAwait(false);
+
+    private EvalResult EvaluateCore(string expression, int? frameId)
     {
         EnsureStopped();
         var response = SendDap(new EvaluateRequest
@@ -1453,6 +1552,9 @@ public class DebugSession : IDisposable
     }
 
     public ExceptionDetail? GetExceptionInfo(int? threadId = null)
+        => RunOnSession("exception_info", () => GetExceptionInfoCore(threadId));
+
+    private ExceptionDetail? GetExceptionInfoCore(int? threadId)
     {
         EnsureStopped();
         try
@@ -1503,8 +1605,9 @@ public class DebugSession : IDisposable
         if (_cleanedUp) return;
         _cleanedUp = true;
 
-        lock (_modules)
-            _modules.Clear();
+        // (S1) _modules is consumer-owned and unreachable once _host is null
+        // (every entry point fails fast through EnsureActive), so it needs no
+        // Clear() and no lock here.
 
         _host?.Stop();
         try
@@ -1537,24 +1640,25 @@ public class DebugSession : IDisposable
     /// <summary>
     /// Track modules as SharpDbg reports them (LoadModule callbacks). Only
     /// 'new' is emitted by SharpDbg; 'removed' is handled for completeness.
-    /// Runs on the DAP reader thread; mutations are lock-protected because
-    /// MCP tool threads read the list concurrently.
+    /// Runs on the DAP reader thread: enqueue only (R3). _modules is now
+    /// consumer-owned, so no lock is needed.
     /// </summary>
     private void OnModuleChanged(ModuleEvent e)
+        => EnqueueBackground("evt:module", () => ApplyModuleChangeCore(e));
+
+    private void ApplyModuleChangeCore(ModuleEvent e)
     {
         var m = e.Module;
         if (m is null || m.Id is not string id) return;
 
         if (e.Reason == ModuleEvent.ReasonValue.Removed)
         {
-            lock (_modules)
-                _modules.Remove(id);
+            _modules.Remove(id);
             _logger.LogInformation("← ModuleEvent: removed {Name}", m.Name);
             return;
         }
 
-        lock (_modules)
-            _modules[id] = new LoadedModule(id, m.Name, m.Path);
+        _modules[id] = new LoadedModule(id, m.Name, m.Path);
         _logger.LogInformation("← ModuleEvent: {Name} ({Path})", m.Name, m.Path);
     }
 
@@ -1564,10 +1668,7 @@ public class DebugSession : IDisposable
     /// SharpDbg has not received any LoadModule callbacks yet.
     /// </summary>
     public IReadOnlyList<LoadedModule> GetModules()
-    {
-        lock (_modules)
-            return _modules.Values.ToList();
-    }
+        => RunOnSessionState("modules_list", () => _modules.Values.ToList());
 
     /// <summary>
     /// SharpDbg notifies when a previously pending breakpoint binds (module
@@ -1637,10 +1738,12 @@ public class DebugSession : IDisposable
         {
             if (TryResolveCapture(e) is { } capture)
             {
-                // Offload capture to thread pool — don't block the DAP reader.
-                // DO NOT touch _pendingStopTcs — the caller keeps waiting and
-                // the next stop (or exit) resolves it.
-                _ = Task.Run(() => RunCaptureAndContinueAsync(
+                // Capture as ONE background op on the consumer (R2/R3): the
+                // reader never blocks, and the whole capture — expressions,
+                // variable expansion, resume — is atomic against every other
+                // session op. DO NOT touch _pendingStopTcs — the caller keeps
+                // waiting and the next stop (or exit) resolves it.
+                EnqueueBackground("capture", () => RunCaptureAndContinueCore(
                     e.ThreadId, generation, capture.Scope, capture.Depth, capture.BreakpointId, capture.Expressions));
                 _logger.LogInformation("← OnStopped: auto-continue (capture), TCS not touched, thread={ThreadId}", e.ThreadId);
                 return;
@@ -1744,87 +1847,80 @@ public class DebugSession : IDisposable
 
     private readonly record struct CaptureResolution(string Scope, int Depth, int BreakpointId, string[] Expressions);
 
-    private void RunCaptureAndContinueAsync(
+    /// <summary>
+    /// Runs as a single background op on the session consumer (S1): the whole
+    /// capture — captureExpressions, state snapshot, auto-continue — is atomic
+    /// against every other session op, which is what the old _captureGate
+    /// approximated. The generation guard re-checks the stop this op serves
+    /// before resuming: a newer stop owns the resume decision (R4).
+    /// </summary>
+    private void RunCaptureAndContinueCore(
         int? threadId, long stopGeneration, string scope, int depth, int breakpointId, string[] expressions)
     {
-        _ = Task.Run(async () =>
+        try
         {
-            // Serialize capture tasks: two captures in flight would interleave
-            // DAP round-trips (and the adapter's variable evals even resume the
-            // debuggee mid-capture), racing the state machine. The generation
-            // guard below re-checks AFTER the gate so a superseded stop skips
-            // cleanly instead of double-resuming.
-            await _captureGate.WaitAsync().ConfigureAwait(false);
-            try
+            // captureExpressions: evaluated at hit time while the frame is
+            // still alive — before CaptureState, before the auto-continue
+            // resume. Each failure is recorded per-expression and never
+            // fails the capture (mirrors the conditional-breakpoint
+            // skip-on-error semantics).
+            var expressionResults = new List<CapturedExpression>();
+            if (expressions.Length > 0)
             {
-                // captureExpressions: evaluated at hit time while the frame is
-                // still alive — before CaptureState, before the auto-continue
-                // resume. Each failure is recorded per-expression and never
-                // fails the capture (mirrors the conditional-breakpoint
-                // skip-on-error semantics).
-                var expressionResults = new List<CapturedExpression>();
-                if (expressions.Length > 0)
+                var frame = GetStackTraceCore(_activeThreadId ?? 1, 0, 1).FirstOrDefault();
+                foreach (var expr in expressions)
                 {
-                    var frame = GetStackTrace(_activeThreadId ?? 1, 0, 1).FirstOrDefault();
-                    foreach (var expr in expressions)
+                    if (frame is null)
                     {
-                        if (frame is null)
-                        {
-                            expressionResults.Add(new CapturedExpression(expr, null, true));
-                            continue;
-                        }
-                        try
-                        {
-                            var r = await EvaluateAsync(expr, frame.Id).ConfigureAwait(false);
-                            expressionResults.Add(new CapturedExpression(
-                                expr, r.IsError ? null : r.Result, r.IsError));
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex,
-                                "captureExpressions: evaluation failed for '{Expression}'", expr);
-                            expressionResults.Add(new CapturedExpression(expr, null, true));
-                        }
+                        expressionResults.Add(new CapturedExpression(expr, null, true));
+                        continue;
+                    }
+                    try
+                    {
+                        var r = EvaluateCore(expr, frame.Id);
+                        expressionResults.Add(new CapturedExpression(
+                            expr, r.IsError ? null : r.Result, r.IsError));
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "captureExpressions: evaluation failed for '{Expression}'", expr);
+                        expressionResults.Add(new CapturedExpression(expr, null, true));
                     }
                 }
-
-                CaptureState(scope, depth, breakpointId, expressionResults);
-
-                var host = _host;
-                if (host is null || _stateMachine.Current is SessionState.Exited or SessionState.Detached)
-                {
-                    _logger.LogWarning("Capture recorded but the session is no longer active — skipping auto-continue.");
-                    return;
-                }
-
-                // A newer stop superseded this one while we were capturing —
-                // do NOT resume: that stop's own capture task owns the resume
-                // decision. Resuming here would race (and corrupt) the state
-                // machine, and the newest stop is frozen awaiting its task.
-                if (Interlocked.Read(ref _stopGeneration) != stopGeneration)
-                {
-                    _logger.LogInformation(
-                        "Capture auto-continue skipped: a newer stop superseded this one (gen {Served} -> {Current}).",
-                        stopGeneration, Interlocked.Read(ref _stopGeneration));
-                    return;
-                }
-
-                // Declare Running BEFORE sending the resume command (same
-                // pattern as ContinueAndWaitAsync): a stop that arrives while
-                // the request is in flight transitions Running->Stopped on the
-                // reader thread and is never overwritten by this task.
-                _stateMachine.TransitionTo(SessionState.Running);
-                host.SendRequestSync(new ContinueRequest { ThreadId = threadId ?? 0 });
             }
-            catch (Exception ex)
+
+            CaptureStateCore(scope, depth, breakpointId, expressionResults);
+
+            if (_host is null || _stateMachine.Current is SessionState.Exited or SessionState.Detached)
             {
-                CaptureFailed(ex, stopGeneration);
+                _logger.LogWarning("Capture recorded but the session is no longer active — skipping auto-continue.");
+                return;
             }
-            finally
+
+            // A newer stop superseded this one while we were capturing —
+            // do NOT resume: that stop's own capture op owns the resume
+            // decision. Resuming here would race (and corrupt) the state
+            // machine, and the newest stop is frozen awaiting its capture.
+            if (Interlocked.Read(ref _stopGeneration) != stopGeneration)
             {
-                _captureGate.Release();
+                _logger.LogInformation(
+                    "Capture auto-continue skipped: a newer stop superseded this one (gen {Served} -> {Current}).",
+                    stopGeneration, Interlocked.Read(ref _stopGeneration));
+                return;
             }
-        });
+
+            // Declare Running BEFORE sending the resume command (same
+            // pattern as ContinueAndWaitAsync): a stop that arrives while the
+            // request is in flight transitions Running->Stopped on the reader
+            // thread and is never overwritten by this op.
+            _stateMachine.TransitionTo(SessionState.Running);
+            SendDap(new ContinueRequest { ThreadId = threadId ?? 0 });
+        }
+        catch (Exception ex)
+        {
+            CaptureFailed(ex, stopGeneration);
+        }
     }
 
     /// <summary>
