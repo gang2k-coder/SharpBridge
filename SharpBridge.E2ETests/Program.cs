@@ -81,7 +81,12 @@ try
     {
         Command = "dotnet",
         Arguments = [serverDll],
-        WorkingDirectory = serverProj
+        WorkingDirectory = serverProj,
+        // E2E_SERVER_LOG=1 forwards the server's stderr into this process's
+        // stderr so a failing test can be diagnosed from the server logs.
+        StandardErrorLines = Environment.GetEnvironmentVariable("E2E_SERVER_LOG") is { Length: > 0 }
+            ? line => Console.Error.WriteLine($"[server] {line}")
+            : null,
     });
     await using var client = await McpClient.CreateAsync(transport, new McpClientOptions
     {
@@ -650,7 +655,8 @@ try
         $"Expected stop at line 51 (first hit in iteration 0), got {cont6a.RootElement.GetProperty("source").GetProperty("line").GetInt32()}");
     var cont6b = JsonDocument.Parse(GetText(
         await client.CallToolAsync("debug_continue", new Dictionary<string, object?> { ["timeout"] = 10 })));
-    Assert(cont6b.RootElement.GetProperty("status").GetString() == "stopped", "Continue #2 should stop");
+    Assert(cont6b.RootElement.GetProperty("status").GetString() == "stopped",
+        $"Continue #2 should stop (got status='{cont6b.RootElement.GetProperty("status").GetString()}')");
     Assert(cont6b.RootElement.GetProperty("source").GetProperty("line").GetInt32() == 53,
         $"Expected stop at line 53 (second bp in iteration 0), got {cont6b.RootElement.GetProperty("source").GetProperty("line").GetInt32()}");
 

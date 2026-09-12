@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
@@ -28,11 +27,13 @@ namespace SharpBridge.Services;
 ///   and must only enqueue (rule R3); the stop-generation bump stays on that
 ///   thread (rule R4).
 ///
-///   Migration status (S1): every tool-facing inspection/breakpoint entry
-///   point and the capture path run as ops on the consumer. Still pending:
-///   execution control + the session gate (S2) and the DAP event handlers
-///   (S3). SendDap warns once per off-consumer call site — that list is the
-///   remaining work.
+///   Migration status (S3 — complete): every tool entry point, the capture
+///   path and all DAP event handlers run on the consumer; SendDap enforces
+///   that DAP requests originate there. The reader thread only enqueues (plus
+///   the R4 stop-generation bump). The remaining cross-thread fields are the
+///   stop-ledger publish flag (HasUnobservedStop / ObserveStopState, acked by
+///   tool threads), _stopGeneration (R4) and ProcessId/_moduleSymbols, which
+///   are written by SharpDbg's log callback thread.
 ///
 ///   For async operations (continue/step/launch-stopAtEntry), we pre-register
 ///   a StoppedEvent handler whose TCS is swapped before each operation.
@@ -88,13 +89,16 @@ public class DebugSession : IDisposable
     private readonly ManualResetEventSlim _consumerStopped = new(false);
 
     /// <summary>
-    /// Until the S1-S3 migration completes, off-consumer DAP calls are logged
-    /// once per call site instead of throwing. Flip to true when the migration
-    /// lands; the test suites are the exit criterion.
+    /// Hard guard (S3, migration complete): every DAP request must originate on
+    /// the session consumer thread. This used to be a soft warning per call
+    /// site (the S1-S3 worklist); a violation is now a bug.
     /// </summary>
-    private const bool EnforceConsumerThreadForDap = false;
-
-    private readonly ConcurrentDictionary<string, bool> _offConsumerWarned = new();
+    private void GuardDapCaller(string caller)
+    {
+        if (Environment.CurrentManagedThreadId != _consumerThreadId)
+            throw new InvalidOperationException(
+                $"DAP request from '{caller}' must run on the session consumer thread.");
+    }
 
     private sealed record SessionOp(string Name, Func<object?> Body, TaskCompletionSource<object?>? Completion);
 
@@ -231,26 +235,6 @@ public class DebugSession : IDisposable
             _logger.LogDebug("Background op '{Name}' dropped: the session is closed.", name);
     }
 
-    /// <summary>
-    /// Single funnel for every DAP request (except the constructor handshake).
-    /// In S0 this is a SOFT guard: calls that do not originate from the consumer
-    /// thread are logged once per call site — they are the S1-S3 worklist.
-    /// </summary>
-    private void GuardDapCaller(string caller)
-    {
-        if (Environment.CurrentManagedThreadId == _consumerThreadId)
-            return;
-
-        if (EnforceConsumerThreadForDap)
-            throw new InvalidOperationException(
-                $"DAP request from '{caller}' must run on the session consumer thread.");
-
-        if (_offConsumerWarned.TryAdd(caller, true))
-            _logger.LogWarning(
-                "DAP request from '{Caller}' is not on the session consumer thread — migration pending (S1-S3).",
-                caller);
-    }
-
     private TResponse SendDap<TArgs, TResponse>(
         DebugRequestWithResponse<TArgs, TResponse> request, [CallerMemberName] string? caller = null)
         where TArgs : class, new()
@@ -278,15 +262,10 @@ public class DebugSession : IDisposable
             throw SessionNotActive();
     }
 
-    /// <summary>
-    /// Upper bound for buffered SharpDbg output lines. Prevents unbounded
-    /// memory growth on long-running sessions with chatty debuggees.
-    /// </summary>
-    public const int MaxOutputLogLines = 5000;
-
     // ===================================================================
     // StoppedEvent TCS — swapped before each async operation
     // ===================================================================
+    // Consumer-owned since S3 (OnStopped runs there too), so plain swaps.
     private TaskCompletionSource<StoppedEvent> _pendingStopTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     // ===================================================================
@@ -319,7 +298,6 @@ public class DebugSession : IDisposable
     private StopEvent? _lastStop;
     private StopEvent LastStop => _lastStop
         ?? throw new InvalidOperationException("No stop event. Debugger may not be stopped.");
-    private readonly List<string> _outputLog = new();
     private readonly Dictionary<string, List<BreakpointEntry>> _breakpointsByFile = new();
     private readonly List<BreakpointEntry> _functionBreakpoints = [];
     private int _nextBreakpointId = 1;
@@ -402,7 +380,6 @@ public class DebugSession : IDisposable
         _host.RegisterEventType<BreakpointEvent>(OnBreakpointChanged);
         _host.RegisterEventType<ExitedEvent>(OnExited);
         _host.RegisterEventType<TerminatedEvent>(OnTerminated);
-        _host.RegisterEventType<OutputEvent>(OnOutput);
         _host.RegisterEventType<ContinuedEvent>(e =>
             _logger.LogInformation($"← ContinuedEvent: thread={e.ThreadId}"));
         _host.RegisterEventType<InitializedEvent>(e =>
@@ -512,7 +489,7 @@ public class DebugSession : IDisposable
         _stateMachine.TransitionTo(SessionState.Attaching);
         // Swap in a fresh stop TCS BEFORE configurationDone —
         // the StoppedEvent may fire as soon as the process starts.
-        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+        _pendingStopTcs = stopTcs;
 
         // Declare Running BEFORE ConfigurationDone: a stop (e.g. a breakpoint
         // hit right after resume) can arrive while the command is in flight,
@@ -607,7 +584,7 @@ public class DebugSession : IDisposable
         // Swap in a fresh stop TCS BEFORE ConfigurationDone: any stop that
         // arrives after the runtime resume resolves THIS TCS and surfaces
         // through the normal ledger path instead of being lost.
-        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+        _pendingStopTcs = stopTcs;
 
         // Declare Running BEFORE the resume command (same pattern as
         // ContinueAndWaitAsync): a stop arriving while the command is in
@@ -661,11 +638,9 @@ public class DebugSession : IDisposable
 
     private readonly Dictionary<(string File, int Line), BreakpointEntry> _bpConfigs = [];
 
-    // Guards _bpConfigs: written by tool threads (breakpoint_set, inside the
-    // session gate) and read by the DAP reader thread (OnStopped capture
-    // resolution), which must never wait on the session gate (deadlock: a
-    // waiting tool holds it). A short dedicated lock keeps both sides safe.
-    private readonly object _bpConfigsLock = new();
+    // (S3) _bpConfigs is consumer-owned now: breakpoint_set/remove and the
+    // BreakpointEvent / StoppedEvent handlers all run on the session consumer,
+    // so its former lock is gone.
 
     private readonly Dictionary<int, BreakpointEntry> _bpsByAdapterId = [];
 
@@ -720,11 +695,8 @@ public class DebugSession : IDisposable
 
         // Drop stale capture configs for this file — the set below replaces
         // all breakpoints in it, so old configs must not survive.
-        lock (_bpConfigsLock)
-        {
-            foreach (var staleKey in _bpConfigs.Keys.Where(k => k.File == normalizedFile).ToList())
-                _bpConfigs.Remove(staleKey);
-        }
+        foreach (var staleKey in _bpConfigs.Keys.Where(k => k.File == normalizedFile).ToList())
+            _bpConfigs.Remove(staleKey);
 
         var entries = new List<BreakpointEntry>();
         var sourceBreakpoints = new List<SourceBreakpoint>();
@@ -755,13 +727,10 @@ public class DebugSession : IDisposable
             // normalized to match the hit location SharpDbg reports in the
             // stopped event.
             var configKey = (normalizedFile, line);
-            lock (_bpConfigsLock)
-            {
-                if (action == "capture")
-                    _bpConfigs[configKey] = entry;
-                else
-                    _bpConfigs.Remove(configKey);
-            }
+            if (action == "capture")
+                _bpConfigs[configKey] = entry;
+            else
+                _bpConfigs.Remove(configKey);
 
             var sbp = new SourceBreakpoint { Line = line };
             if (col.HasValue) sbp.Column = col.Value;
@@ -794,11 +763,8 @@ public class DebugSession : IDisposable
                     // Re-key the capture config so hit-location lookups still
                     // match when the adapter adjusts the line (e.g. moved to
                     // the next executable statement).
-                    lock (_bpConfigsLock)
-                    {
-                        if (_bpConfigs.Remove(oldKey))
-                            _bpConfigs[(normalizedFile, entries[i].Line)] = entries[i];
-                    }
+                    if (_bpConfigs.Remove(oldKey))
+                        _bpConfigs[(normalizedFile, entries[i].Line)] = entries[i];
                 }
             }
         }
@@ -932,8 +898,7 @@ public class DebugSession : IDisposable
                 entries.Remove(entry);
                 // Drop any capture config for this breakpoint so a stale
                 // auto-continue doesn't fire if the line is re-set as "break".
-                lock (_bpConfigsLock)
-                    _bpConfigs.Remove((NormalizePath(file), entry.Line));
+                _bpConfigs.Remove((NormalizePath(file), entry.Line));
                 // Re-send with the ORIGINAL path the breakpoints were set
                 // with: SharpDbg keys breakpoint sets per source path, so a
                 // normalized (lower-cased) path would be treated as a DIFFERENT
@@ -1192,7 +1157,7 @@ public class DebugSession : IDisposable
     {
         // Swap in a fresh stop TCS BEFORE any decision: any stop that arrives
         // after this point resolves THIS TCS, so none can be missed.
-        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+        _pendingStopTcs = stopTcs;
 
         // The debuggee may have stopped while no tool call was waiting (e.g.
         // after a timed-out continue). Deliver the stop instead of resuming
@@ -1295,7 +1260,7 @@ public class DebugSession : IDisposable
     /// </summary>
     private StopEvent? WaitCore(TaskCompletionSource<StoppedEvent> stopTcs)
     {
-        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+        _pendingStopTcs = stopTcs;
 
         // Waiting is also valid when a stop already occurred while no tool
         // call was waiting — the client asked to wait for a stop, and one is
@@ -1358,7 +1323,7 @@ public class DebugSession : IDisposable
         if (_stateMachine.Current != SessionState.Stopped)
             throw new InvalidOperationException($"Cannot step: debugger state is {_stateMachine.Current}.");
 
-        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+        _pendingStopTcs = stopTcs;
 
         // The debuggee may have stopped while no tool call was waiting —
         // deliver the stop instead of stepping past it.
@@ -1494,7 +1459,7 @@ public class DebugSession : IDisposable
         if (_stateMachine.Current != SessionState.Running)
             throw new InvalidOperationException($"Cannot pause: debugger state is {_stateMachine.Current}.");
 
-        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+        _pendingStopTcs = stopTcs;
 
         // The debuggee may have stopped on its own while no tool call was
         // waiting — pausing is then unnecessary; deliver the stop instead.
@@ -1822,10 +1787,13 @@ public class DebugSession : IDisposable
     /// SharpDbg notifies when a previously pending breakpoint binds (module
     /// loaded): sync Verified/Message and the adjusted line, and re-key any
     /// capture config so hit-location lookups still match. Runs on the DAP
-    /// reader thread; the mutations are plain reference writes read by MCP
-    /// threads — the same model as _lastStop.
+    /// reader thread: enqueue only (R3) — the mutations happen on the consumer,
+    /// ordered with the stop handling that reads them (single FIFO queue).
     /// </summary>
     private void OnBreakpointChanged(BreakpointEvent e)
+        => EnqueueBackground("evt:breakpoint", () => ApplyBreakpointChangeCore(e));
+
+    private void ApplyBreakpointChangeCore(BreakpointEvent e)
     {
         var bp = e.Breakpoint;
         if (bp.Id is not { } adapterId
@@ -1861,39 +1829,48 @@ public class DebugSession : IDisposable
 
     private void OnStopped(StoppedEvent e)
     {
+        // Bump the stop generation FIRST, on the reader thread (R4): a capture
+        // that is already executing on the consumer compares against it to
+        // detect that a newer stop superseded the one it serves.
+        var generation = Interlocked.Increment(ref _stopGeneration);
+
+        // Everything else belongs to the consumer (R3): the reader thread also
+        // dispatches DAP responses and must never block or issue DAP I/O.
+        EnqueueBackground("evt:stopped", () => HandleStoppedCore(e, generation));
+    }
+
+    /// <summary>
+    /// Runs on the session consumer: records the stop, decides whether it is a
+    /// capture stop (auto-capture + resume happen INLINE so the whole sequence
+    /// is atomic with this decision), or delivers it to a waiting caller via
+    /// the ledger + pending TCS.
+    /// </summary>
+    private void HandleStoppedCore(StoppedEvent e, long generation)
+    {
         _logger.LogInformation("→ OnStopped: reason={Reason}, thread={ThreadId}, state={State}",
             e.Reason, e.ThreadId, _stateMachine.Current);
-
-        // Bump the stop generation FIRST: capture tasks compare against it to
-        // detect that a newer stop superseded the one they serve.
-        var generation = Interlocked.Increment(ref _stopGeneration);
 
         _activeThreadId = e.ThreadId;
         _stateMachine.TransitionTo(SessionState.Stopped);
 
         // Record the stop before any branching: capture snapshots, waiters and
         // step/pause re-checks all rely on _lastStop being set for every stop.
-        // Assignments happen on the reader thread while the process is frozen
-        // (no Continue has been sent), so there is no concurrent writer.
         _lastDapStop = e;
         _lastStop = BuildStopEvent(e);
 
         // Capture-action breakpoints auto-capture and continue without waking
-        // the caller. Resolution must NOT issue DAP requests here — OnStopped
-        // runs on the DAP dispatcher thread where SendRequestSync throws by
-        // design. SharpDbg delivers the hit location in the event itself.
+        // the caller. Resolution needs no DAP requests — SharpDbg delivers the
+        // hit location in the event itself. The capture runs INLINE because we
+        // are already on the consumer: it is atomic with this stop decision.
         if (e.Reason == StoppedEvent.ReasonValue.Breakpoint && _bpConfigs.Count > 0)
         {
             if (TryResolveCapture(e) is { } capture)
             {
-                // Capture as ONE background op on the consumer (R2/R3): the
-                // reader never blocks, and the whole capture — expressions,
-                // variable expansion, resume — is atomic against every other
-                // session op. DO NOT touch _pendingStopTcs — the caller keeps
-                // waiting and the next stop (or exit) resolves it.
-                EnqueueBackground("capture", () => RunCaptureAndContinueCore(
-                    e.ThreadId, generation, capture.Scope, capture.Depth, capture.BreakpointId, capture.Expressions));
+                // DO NOT touch _pendingStopTcs — the caller keeps waiting and
+                // the next stop (or exit) resolves it.
                 _logger.LogInformation("← OnStopped: auto-continue (capture), TCS not touched, thread={ThreadId}", e.ThreadId);
+                RunCaptureAndContinueCore(
+                    e.ThreadId, generation, capture.Scope, capture.Depth, capture.BreakpointId, capture.Expressions);
                 return;
             }
 
@@ -1916,7 +1893,8 @@ public class DebugSession : IDisposable
         Interlocked.Increment(ref _stopSequence);
 
         var newTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var old = Interlocked.Exchange(ref _pendingStopTcs, newTcs);
+        var old = _pendingStopTcs;
+        _pendingStopTcs = newTcs;
         old.TrySetResult(e);
         _logger.LogInformation("← OnStopped: TCS resolved (reason={Reason}, thread={ThreadId}), new TCS created",
             e.Reason, e.ThreadId);
@@ -1925,22 +1903,20 @@ public class DebugSession : IDisposable
     /// <summary>
     /// Resolve whether a breakpoint stop is a capture-action breakpoint, using
     /// only the hit location SharpDbg embeds in the stopped event. Pure
-    /// in-memory lookup — safe on the dispatcher thread (no DAP requests).
-    /// Returns null when the event carries no location or no config matches.
+    /// in-memory lookup on the consumer thread (S3: _bpConfigs is consumer-
+    /// owned, so no lock is needed). Returns null when the event carries no
+    /// location or no config matches.
     /// </summary>
     private CaptureResolution? TryResolveCapture(StoppedEvent e)
     {
         if (!TryGetHitLocation(e, out var file, out var line))
             return null;
 
-        lock (_bpConfigsLock)
-        {
-            return _bpConfigs.TryGetValue((NormalizePath(file), line), out var cfg)
-                && cfg.Action == "capture"
-                ? new CaptureResolution(
-                    cfg.CaptureScope ?? "all", cfg.CaptureDepth, cfg.Id, cfg.CaptureExpressions ?? [])
-                : null;
-        }
+        return _bpConfigs.TryGetValue((NormalizePath(file), line), out var cfg)
+            && cfg.Action == "capture"
+            ? new CaptureResolution(
+                cfg.CaptureScope ?? "all", cfg.CaptureDepth, cfg.Id, cfg.CaptureExpressions ?? [])
+            : null;
     }
 
     /// <summary>
@@ -2111,13 +2087,22 @@ public class DebugSession : IDisposable
         // debug_continue resumes normally instead of re-delivering the stop.
         Interlocked.Increment(ref _stopSequence);
         var newTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var old = Interlocked.Exchange(ref _pendingStopTcs, newTcs);
+        var old = _pendingStopTcs;
+        _pendingStopTcs = newTcs;
         old.TrySetResult(_lastDapStop ?? new StoppedEvent(reason: StoppedEvent.ReasonValue.Breakpoint));
         _logger.LogInformation("Capture failure delivered as a stop (reason=breakpoint, state={State})",
             _stateMachine.Current);
     }
 
+    /// <summary>
+    /// Process exit runs on the consumer (R3): the reader thread only
+    /// enqueues. Cleanup then runs there too, which keeps it ordered behind
+    /// every op that was already queued.
+    /// </summary>
     private void OnExited(ExitedEvent e)
+        => EnqueueBackground("evt:exited", () => HandleExitedCore(e));
+
+    private void HandleExitedCore(ExitedEvent e)
     {
         _stateMachine.TransitionTo(SessionState.Exited);
         _lastStop = new StopEvent("exited", null, null, "exited", null, 0, 0)
@@ -2130,6 +2115,9 @@ public class DebugSession : IDisposable
     }
 
     private void OnTerminated(TerminatedEvent e)
+        => EnqueueBackground("evt:terminated", HandleTerminatedCore);
+
+    private void HandleTerminatedCore()
     {
         _stateMachine.TransitionTo(SessionState.Exited);
         CompletePendingStopTcs();
@@ -2140,22 +2128,12 @@ public class DebugSession : IDisposable
     private void CompletePendingStopTcs()
     {
         var newTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var old = Interlocked.Exchange(ref _pendingStopTcs, newTcs);
+        var old = _pendingStopTcs;
+        _pendingStopTcs = newTcs;
         old.TrySetResult(
             new StoppedEvent(reason: StoppedEvent.ReasonValue.Breakpoint));
         _logger.LogInformation("CompletePendingStopTcs: TCS resolved (synthetic Breakpoint), state={State}",
             _stateMachine.Current);
-    }
-
-    private void OnOutput(OutputEvent e)
-    {
-        _outputLog.Add(e.Output ?? "");
-
-        // Bound the buffered log so chatty debuggees cannot grow memory
-        // without limit on long-running sessions. Trim in bulk (doubling
-        // threshold) so bursts of output stay amortized O(1) per line.
-        if (_outputLog.Count >= MaxOutputLogLines * 2)
-            _outputLog.RemoveRange(0, _outputLog.Count - MaxOutputLogLines);
     }
 
     // ===================================================================

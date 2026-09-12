@@ -124,6 +124,86 @@ if (mode == "launch")
         try { session.Disconnect(true); } catch { }
     }
 }
+else if (mode == "inc")
+{
+    // ============ SCENARIO C: incremental breakpoints + two continues ============
+    // Mirrors E2E test 17 (BreakpointTools accumulates a file's breakpoints and
+    // re-sends them): bp 51, then bp 51+53, then continue -> stop at 51,
+    // continue -> stop at 53. HARNESS_REPEATS=N loops the scenario.
+    var testDebuggeeSrc = Path.Combine(repoRoot, "TestDebuggee/Program.cs");
+    var repeats = int.TryParse(Environment.GetEnvironmentVariable("HARNESS_REPEATS"), out var rep) ? rep : 1;
+
+    static (int, int?, string?, string?, string, string?, int, string[]?)[ ] Acc(
+        DebugSession s, string file,
+        params (int Line, int? Column, string? Condition, string? HitCondition, string Action, string? CaptureScope, int CaptureDepth, string[]? CaptureExpressions)[] add)
+    {
+        var list = s.GetAllBreakpoints()
+            .Where(bp => bp.FunctionName is null && bp.FilePath == file)
+            .Select(bp => (bp.Line, bp.Column, bp.Condition, bp.HitCondition, bp.Action, bp.CaptureScope, bp.CaptureDepth, bp.CaptureExpressions))
+            .ToList();
+        list.AddRange(add);
+        return list.ToArray();
+    }
+
+    for (int run = 0; run < repeats; run++)
+    {
+        var psiC = new ProcessStartInfo("dotnet", [testDebuggeeDll])
+        {
+            RedirectStandardOutput = true, RedirectStandardInput = true,
+            RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
+        };
+        psiC.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
+        using var debuggeeC = Process.Start(psiC)!;
+
+        // HARNESS_TOOL_LAYER=1 drives the REAL MCP tool classes (BreakpointTools /
+        // ExecutionTools) instead of the session API — mirrors the E2E path
+        // (accumulating breakpoint_set + debug_continue) without MCP stdio.
+        if (Environment.GetEnvironmentVariable("HARNESS_TOOL_LAYER") is { Length: > 0 })
+        {
+            using var manager = new SharpBridge.Services.DebugSessionManager(loggerFactory.CreateLogger<DebugSession>());
+            var attachRes = await manager.CreateAndAttachByPidAsync(debuggeeC.Id);
+            var bps = new SharpBridge.Tools.BreakpointTools(manager);
+            var exec = new SharpBridge.Tools.ExecutionTools(manager);
+            await debuggeeC.StandardInput.WriteLineAsync();
+
+            bps.BreakpointSet(testDebuggeeSrc, 51, processId: debuggeeC.Id);
+            bps.BreakpointSet(testDebuggeeSrc, 53, processId: debuggeeC.Id);
+            var j1 = System.Text.Json.JsonDocument.Parse(await exec.DebugContinue(10, debuggeeC.Id));
+            var j2 = System.Text.Json.JsonDocument.Parse(await exec.DebugContinue(10, debuggeeC.Id));
+            var s1 = j1.RootElement.GetProperty("status").GetString();
+            var s2 = j2.RootElement.GetProperty("status").GetString();
+            var ok = s1 == "stopped" && s2 == "stopped";
+            Console.WriteLine($"run{run}: tool c1={s1} c2={s2} {(ok ? "OK" : "MISMATCH")}");
+            try { manager.DisconnectSession(debuggeeC.Id, true); } catch { }
+            if (!debuggeeC.HasExited) { try { debuggeeC.Kill(); } catch { } }
+            continue;
+        }
+
+        using var sessionC = new DebugSession(loggerFactory.CreateLogger<DebugSession>());
+        try
+        {
+            await sessionC.AttachAsync(debuggeeC.Id);
+            await debuggeeC.StandardInput.WriteLineAsync();
+
+            sessionC.SetBreakpoints(testDebuggeeSrc, Acc(sessionC, testDebuggeeSrc, (51, null, null, null, "break", "all", 0, null)));
+            sessionC.SetBreakpoints(testDebuggeeSrc, Acc(sessionC, testDebuggeeSrc, (53, null, null, null, "break", "all", 0, null)));
+
+            var c1 = await sessionC.ContinueAndWaitAsync(10);
+            var c2 = await sessionC.ContinueAndWaitAsync(10);
+            var ok = c1.Status == "stopped" && c1.Line == 51 && c2.Status == "stopped" && c2.Line == 53;
+            Console.WriteLine($"run{run}: c1={c1.Status}@{c1.Line} c2={c2.Status}@{c2.Line} {(ok ? "OK" : "MISMATCH")}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"run{run}: EXCEPTION {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            try { sessionC.Disconnect(true); } catch { }
+            if (!debuggeeC.HasExited) { try { debuggeeC.Kill(); } catch { } }
+        }
+    }
+}
 else
 {
     // ============ SCENARIO B: ATTACH + capture race (ReproDebuggee) ============
