@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
@@ -30,10 +31,11 @@ namespace SharpBridge.Services;
 ///   Migration status (S3 — complete): every tool entry point, the capture
 ///   path and all DAP event handlers run on the consumer; SendDap enforces
 ///   that DAP requests originate there. The reader thread only enqueues (plus
-///   the R4 stop-generation bump). The remaining cross-thread fields are the
-///   stop-ledger publish flag (HasUnobservedStop / ObserveStopState, acked by
-///   tool threads), _stopGeneration (R4) and ProcessId/_moduleSymbols, which
-///   are written by SharpDbg's log callback thread.
+///   the R4 stop-generation bump). Remaining cross-thread state, by design:
+///   the stop-ledger publish/ack pair (HasUnobservedStop / ObserveStopState),
+///   _stopGeneration (R4), and the two fields SharpDbg's log callback thread
+///   writes — ProcessId (volatile-backed) and _moduleSymbols
+///   (ConcurrentDictionary). There are no locks left in this file.
 ///
 ///   For async operations (continue/step/launch-stopAtEntry), we pre-register
 ///   a StoppedEvent handler whose TCS is swapped before each operation.
@@ -319,7 +321,19 @@ public class DebugSession : IDisposable
     // ===================================================================
     // Session identity
     // ===================================================================
-    public int? ProcessId { get; private set; }
+    // Written by two threads: the attach op (consumer) and SharpDbg's log
+    // callback thread (launch PID discovery). Backed by an int so every write
+    // and the cross-thread reads (manager, tools) are atomic and visible.
+    private int _processId = -1;
+    public int? ProcessId
+    {
+        get
+        {
+            var pid = Volatile.Read(ref _processId);
+            return pid < 0 ? null : pid;
+        }
+        private set => Volatile.Write(ref _processId, value ?? -1);
+    }
     public string? ProcessName { get; private set; }
 
     // ===================================================================
@@ -654,19 +668,15 @@ public class DebugSession : IDisposable
     private readonly Dictionary<string, LoadedModule> _modules = [];
 
     /// <summary>Module file name → whether SharpDbg loaded PDB symbols for it (parsed from
-    /// SharpDbg's log lines). Used to attribute breakpoint bind failures.</summary>
-    private readonly Dictionary<string, bool> _moduleSymbols = [];
+    /// SharpDbg's log lines). Used to attribute breakpoint bind failures.
+    /// Written by SharpDbg's log callback thread while tool threads read it via
+    /// <see cref="HasAnySymbols"/>, so it must be a concurrent dictionary — a plain
+    /// Dictionary throws (or reads torn state) when enumerated during a write.</summary>
+    private readonly ConcurrentDictionary<string, bool> _moduleSymbols = new();
 
     /// <summary>True when at least one loaded module has PDB symbols — distinguishes
     /// "no PDB anywhere" from "PDB exists but this path/line did not resolve".</summary>
-    public bool HasAnySymbols
-    {
-        get
-        {
-            lock (_moduleSymbols)
-                return _moduleSymbols.Values.Any(v => v);
-        }
-    }
+    public bool HasAnySymbols => _moduleSymbols.Values.Any(v => v);
 
     public IReadOnlyList<BreakpointEntry> SetBreakpoints(
         string filePath,
