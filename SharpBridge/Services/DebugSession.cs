@@ -1,5 +1,8 @@
+using System.Collections.Concurrent;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
+using System.Threading.Channels;
 using Microsoft.Diagnostics.NETCore.Client;
 using Microsoft.Extensions.Logging;
 using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol;
@@ -15,10 +18,20 @@ namespace SharpBridge.Services;
 /// Wraps the DAP debug adapter (SharpDbg) via DebugProtocolHost.
 /// One instance per debugged process.
 ///
-/// Architecture:
-///   DebugProtocolHost.Run() runs its internal DAP message reader on a
-///   background thread. SendRequestSync is thread-safe and can be called
-///   from any thread. We call it directly from the MCP thread (Thread ③).
+/// Architecture (session actor — S0 of the refactor, see
+/// docs/superpowers/specs/2026-09-12-session-actor-refactor-spec-zh.md):
+///   All DAP requests and session-state mutations are executed by ONE
+///   dedicated consumer thread that reads a Channel&lt;SessionOp&gt; in FIFO
+///   order. Producers (MCP tool threads, tests) enqueue an op and wait for
+///   its completion — the wait happens OUTSIDE the queue, never on the
+///   consumer (rule R1). DAP event handlers run on the host's reader thread
+///   and must only enqueue (rule R3); the stop-generation bump stays on that
+///   thread (rule R4).
+///
+///   Migration status: S0 ships the plumbing plus one migrated op (GetThreads).
+///   Every DAP request goes through SendDap, which warns once per call site
+///   when it is not on the consumer thread — that warning list is the
+///   remaining S1-S3 worklist.
 ///
 ///   For async operations (continue/step/launch-stopAtEntry), we pre-register
 ///   a StoppedEvent handler whose TCS is swapped before each operation.
@@ -53,6 +66,167 @@ public class DebugSession : IDisposable
     /// tool calls never wait on this gate.
     /// </summary>
     private readonly SemaphoreSlim _captureGate = new(1, 1);
+
+    // ===================================================================
+    // Session actor (S0) — one consumer thread owns all DAP I/O and state
+    // ===================================================================
+    //
+    // Rules that keep the model sound (see the design spec above):
+    //   R1  ops never wait for events or for other ops — waits stay in the caller
+    //   R2  capture runs as ONE op and only calls *Core methods (any enqueue
+    //       from inside an op would self-deadlock on the head of the queue)
+    //   R3  DAP event handlers only enqueue: they run on the reader thread,
+    //       which also dispatches DAP responses — blocking it deadlocks
+    //       everything, so the channel must stay unbounded
+    //   R4  the stop-generation bump stays on the reader thread (it must be
+    //       visible to a capture op that is already executing)
+    //   R5  every enqueued op completes exactly once — result or exception
+    //   R6  cancellation is explicit: pre-cancelled ops are never enqueued
+    private readonly Channel<SessionOp> _ops = Channel.CreateUnbounded<SessionOp>(
+        new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+
+    private System.Threading.Thread? _consumer;
+    private int _consumerThreadId = -1;
+
+    /// <summary>
+    /// Until the S1-S3 migration completes, off-consumer DAP calls are logged
+    /// once per call site instead of throwing. Flip to true when the migration
+    /// lands; the test suites are the exit criterion.
+    /// </summary>
+    private const bool EnforceConsumerThreadForDap = false;
+
+    private readonly ConcurrentDictionary<string, bool> _offConsumerWarned = new();
+
+    private sealed record SessionOp(string Name, Func<object?> Body, TaskCompletionSource<object?>? Completion);
+
+    private void StartConsumer()
+    {
+        _consumer = new System.Threading.Thread(ConsumerLoop)
+        {
+            IsBackground = true,
+            Name = "sharpbridge-session-consumer"
+        };
+        _consumer.Start();
+    }
+
+    private void ConsumerLoop()
+    {
+        _consumerThreadId = Environment.CurrentManagedThreadId;
+        _logger.LogDebug("Session consumer thread started (id={ThreadId})", _consumerThreadId);
+
+        while (true)
+        {
+            // Fast path: drain everything currently queued without touching
+            // any async machinery. Then block until more work arrives or the
+            // channel is completed and drained (WaitToReadAsync returns false).
+            while (_ops.Reader.TryRead(out var op))
+                RunOp(op);
+
+            if (!_ops.Reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
+                break;
+        }
+
+        _logger.LogDebug("Session consumer thread exiting (id={ThreadId})", _consumerThreadId);
+    }
+
+    private void RunOp(SessionOp op)
+    {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            var result = op.Body();
+            op.Completion?.TrySetResult(result);
+        }
+        catch (Exception ex)
+        {
+            // Exceptions travel back to the producer through the TCS (R5) so
+            // Filters.cs can surface the real message to the agent.
+            op.Completion?.TrySetException(ex);
+        }
+        finally
+        {
+            var ms = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            if (ms > 1000)
+                _logger.LogWarning("Session op '{Name}' took {ElapsedMs:F0} ms", op.Name, ms);
+        }
+    }
+
+    /// <summary>
+    /// Producer entry point: runs <paramref name="body"/> on the session
+    /// consumer thread and returns its result. Callable from any thread
+    /// EXCEPT the consumer itself — enqueueing from inside an op would
+    /// self-deadlock (R2).
+    /// </summary>
+    public async Task<T> RunOnSessionAsync<T>(string name, Func<T> body, CancellationToken ct = default)
+    {
+        if (Environment.CurrentManagedThreadId == _consumerThreadId)
+            throw new InvalidOperationException(
+                $"Session op '{name}' cannot be enqueued from the session consumer thread (self-deadlock).");
+
+        ct.ThrowIfCancellationRequested();
+        EnsureActive();
+
+        var completion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_ops.Writer.TryWrite(new SessionOp(name, () => body(), completion)))
+            throw SessionNotActive();
+
+        return (T)(await completion.Task.WaitAsync(ct).ConfigureAwait(false))!;
+    }
+
+    /// <summary>
+    /// Blocking variant for methods whose signatures must stay synchronous.
+    /// Blocking the caller is equivalent to today's SendRequestSync behaviour:
+    /// the caller already blocked on the very same DAP round trip.
+    /// </summary>
+    public T RunOnSession<T>(string name, Func<T> body)
+        => RunOnSessionAsync(name, body).GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Single funnel for every DAP request (except the constructor handshake).
+    /// In S0 this is a SOFT guard: calls that do not originate from the consumer
+    /// thread are logged once per call site — they are the S1-S3 worklist.
+    /// </summary>
+    private void GuardDapCaller(string caller)
+    {
+        if (Environment.CurrentManagedThreadId == _consumerThreadId)
+            return;
+
+        if (EnforceConsumerThreadForDap)
+            throw new InvalidOperationException(
+                $"DAP request from '{caller}' must run on the session consumer thread.");
+
+        if (_offConsumerWarned.TryAdd(caller, true))
+            _logger.LogWarning(
+                "DAP request from '{Caller}' is not on the session consumer thread — migration pending (S1-S3).",
+                caller);
+    }
+
+    private TResponse SendDap<TArgs, TResponse>(
+        DebugRequestWithResponse<TArgs, TResponse> request, [CallerMemberName] string? caller = null)
+        where TArgs : class, new()
+        where TResponse : ResponseBody
+    {
+        GuardDapCaller(caller ?? "?");
+        EnsureActive();
+        return _host!.SendRequestSync(request);
+    }
+
+    private void SendDap<TArgs>(DebugRequest<TArgs> request, [CallerMemberName] string? caller = null)
+        where TArgs : class, new()
+    {
+        GuardDapCaller(caller ?? "?");
+        EnsureActive();
+        _host!.SendRequestSync(request);
+    }
+
+    private static InvalidOperationException SessionNotActive() =>
+        new("The debug session is no longer active (process exited or disconnected). Start a new session.");
+
+    private void EnsureActive()
+    {
+        if (_cleanedUp || _host is null)
+            throw SessionNotActive();
+    }
 
     /// <summary>
     /// Upper bound for buffered SharpDbg output lines. Prevents unbounded
@@ -202,7 +376,9 @@ public class DebugSession : IDisposable
         // Start the DAP message reader on a background thread
         _host.Run();
 
-        // DAP handshake — call SendRequestSync directly (thread-safe)
+        // DAP handshake — privileged construction window: the consumer thread
+        // does not exist yet and no other thread can reach this instance, so
+        // this one call goes to the host directly instead of through SendDap.
         var initResponse = _host.SendRequestSync(new InitializeRequest
         {
             ClientID = "sharpbridge-mcp",
@@ -223,6 +399,10 @@ public class DebugSession : IDisposable
 
         _adapterId = "sharpdbg";
         _logger.LogInformation($"DAP initialized. Adapter: {_adapterId}");
+
+        // From here on every DAP request and state mutation belongs to the
+        // session consumer (S0).
+        StartConsumer();
     }
 
     // ===================================================================
@@ -256,7 +436,7 @@ public class DebugSession : IDisposable
         if (cwd is not null) launchArgs["cwd"] = cwd;
         if (env is { Count: > 0 }) launchArgs["env"] = JToken.FromObject(env);
 
-        _host!.SendRequestSync(new LaunchRequest
+        SendDap(new LaunchRequest
         {
             ConfigurationProperties = launchArgs
         });
@@ -273,7 +453,7 @@ public class DebugSession : IDisposable
         _stateMachine.TransitionTo(SessionState.Running);
         try
         {
-            _host.SendRequestSync(new ConfigurationDoneRequest());
+            SendDap(new ConfigurationDoneRequest());
         }
         catch (Exception ex)
         {
@@ -339,7 +519,7 @@ public class DebugSession : IDisposable
         // Attach is lazy: stores PID, actual attach happens at ConfigurationDone.
         // Breakpoints set between AttachRequest and ConfigurationDone will be
         // applied during the attach.
-        _host!.SendRequestSync(new AttachRequest
+        SendDap(new AttachRequest
         {
             ConfigurationProperties = new Dictionary<string, JToken>
             {
@@ -374,7 +554,7 @@ public class DebugSession : IDisposable
         _stateMachine.TransitionTo(SessionState.Running);
         try
         {
-            _host!.SendRequestSync(new ConfigurationDoneRequest());
+            SendDap(new ConfigurationDoneRequest());
             if (ProcessId.HasValue)
             {
                 try { await DiagnosticClientHelper.DiagnosticClientResumeRuntime(ProcessId.Value); }
@@ -528,7 +708,7 @@ public class DebugSession : IDisposable
 
         _breakpointsByFile[normalizedFile] = entries;
 
-        var response = _host!.SendRequestSync(new SetBreakpointsRequest
+        var response = SendDap(new SetBreakpointsRequest
         {
             Source = new Source { Path = canonicalPath },
             Breakpoints = sourceBreakpoints
@@ -602,7 +782,7 @@ public class DebugSession : IDisposable
 
         if (_host is not null)
         {
-            var response = _host.SendRequestSync(new SetFunctionBreakpointsRequest
+            var response = SendDap(new SetFunctionBreakpointsRequest
             {
                 Breakpoints = fnBreakpoints
             });
@@ -687,7 +867,7 @@ public class DebugSession : IDisposable
                 if (entries.Count == 0)
                 {
                     _breakpointsByFile.Remove(file);
-                    _host!.SendRequestSync(new SetBreakpointsRequest
+                    SendDap(new SetBreakpointsRequest
                     {
                         Source = new Source { Path = originalPath },
                         Breakpoints = new List<SourceBreakpoint>()
@@ -712,7 +892,7 @@ public class DebugSession : IDisposable
             var remaining = _functionBreakpoints
                 .Select(e => new FunctionBreakpoint { Name = e.FunctionName!, Condition = e.Condition, HitCondition = e.HitCondition })
                 .ToList();
-            _host!.SendRequestSync(new SetFunctionBreakpointsRequest { Breakpoints = remaining });
+            SendDap(new SetFunctionBreakpointsRequest { Breakpoints = remaining });
             return true;
         }
 
@@ -781,7 +961,7 @@ public class DebugSession : IDisposable
 
     public void SetExceptionBreakpoints(string[] filters)
     {
-        _host!.SendRequestSync(new SetExceptionBreakpointsRequest
+        SendDap(new SetExceptionBreakpointsRequest
         {
             Filters = filters.ToList()
         });
@@ -945,7 +1125,7 @@ public class DebugSession : IDisposable
         {
             if (previousState == SessionState.Attaching)
             {
-                _host!.SendRequestSync(new ConfigurationDoneRequest());
+                SendDap(new ConfigurationDoneRequest());
                 if (ProcessId.HasValue)
                 {
                     try { await DiagnosticClientHelper.DiagnosticClientResumeRuntime(ProcessId.Value); }
@@ -954,7 +1134,7 @@ public class DebugSession : IDisposable
             }
             else
             {
-                _host!.SendRequestSync(new ContinueRequest { ThreadId = _lastStop?.ThreadId ?? 0 });
+                SendDap(new ContinueRequest { ThreadId = _lastStop?.ThreadId ?? 0 });
             }
         }
         catch (Exception ex)
@@ -1053,9 +1233,9 @@ public class DebugSession : IDisposable
 
         switch (type)
         {
-            case "in": _host!.SendRequestSync(new StepInRequest(tid)); break;
-            case "out": _host!.SendRequestSync(new StepOutRequest(tid)); break;
-            default: _host!.SendRequestSync(new NextRequest(tid)); break;
+            case "in": SendDap(new StepInRequest(tid)); break;
+            case "out": SendDap(new StepOutRequest(tid)); break;
+            default: SendDap(new NextRequest(tid)); break;
         }
 
         StoppedEvent stopEvent;
@@ -1101,7 +1281,7 @@ public class DebugSession : IDisposable
         if (stopTcs.Task.IsCompleted)
             return LastStop;
 
-        _host!.SendRequestSync(new PauseRequest());
+        SendDap(new PauseRequest());
 
         StoppedEvent stopEvent;
         try
@@ -1125,10 +1305,17 @@ public class DebugSession : IDisposable
     // Inspection
     // ===================================================================
 
+    /// <summary>
+    /// Migrated to the session consumer (S0 reference implementation): the
+    /// public method enqueues and blocks, the Core method runs on the consumer.
+    /// </summary>
     public List<ThreadInfo> GetThreads()
+        => RunOnSession("threads_list", GetThreadsCore);
+
+    private List<ThreadInfo> GetThreadsCore()
     {
         EnsureStopped();
-        var response = _host!.SendRequestSync(new ThreadsRequest());
+        var response = SendDap(new ThreadsRequest());
         return response.Threads.Select(t => new ThreadInfo(
             t.Id, t.Name, t.Id == _activeThreadId)).ToList();
     }
@@ -1136,7 +1323,7 @@ public class DebugSession : IDisposable
     public List<StackFrameInfo> GetStackTrace(int threadId, int startFrame = 0, int? levels = null)
     {
         EnsureStopped();
-        var response = _host!.SendRequestSync(new StackTraceRequest
+        var response = SendDap(new StackTraceRequest
         {
             ThreadId = threadId,
             StartFrame = startFrame,
@@ -1235,7 +1422,7 @@ public class DebugSession : IDisposable
     public List<VariableInfo> ExpandVariables(int variablesReference)
     {
         EnsureStopped();
-        var response = _host!.SendRequestSync(new VariablesRequest
+        var response = SendDap(new VariablesRequest
         {
             VariablesReference = variablesReference
         });
@@ -1247,14 +1434,14 @@ public class DebugSession : IDisposable
 
     private List<ScopeInfo> GetScopes(int frameId)
     {
-        var response = _host!.SendRequestSync(new ScopesRequest { FrameId = frameId });
+        var response = SendDap(new ScopesRequest { FrameId = frameId });
         return response.Scopes.Select(s => new ScopeInfo(s.Name, s.VariablesReference, s.Expensive)).ToList();
     }
 
     public async Task<EvalResult> EvaluateAsync(string expression, int? frameId = null)
     {
         EnsureStopped();
-        var response = _host!.SendRequestSync(new EvaluateRequest
+        var response = SendDap(new EvaluateRequest
         {
             Expression = expression,
             FrameId = frameId,
@@ -1270,7 +1457,7 @@ public class DebugSession : IDisposable
         EnsureStopped();
         try
         {
-            var response = _host!.SendRequestSync(new ExceptionInfoRequest
+            var response = SendDap(new ExceptionInfoRequest
             {
                 ThreadId = threadId ?? LastStop.ThreadId ?? 1
             });
@@ -1303,7 +1490,7 @@ public class DebugSession : IDisposable
 
         try
         {
-            _host!.SendRequestSync(new DisconnectRequest { TerminateDebuggee = terminateDebuggee });
+            SendDap(new DisconnectRequest { TerminateDebuggee = terminateDebuggee });
         }
         catch { }
         Cleanup();
@@ -1332,6 +1519,12 @@ public class DebugSession : IDisposable
         }
         _adapter?.Dispose();
         _host = null;
+
+        // Stop the session consumer. Ops still queued are drained and fail fast
+        // with "session no longer active" (EnsureActive sees _host == null);
+        // ops enqueued after this point are rejected by TryWrite (R5). Never
+        // block here waiting for the consumer to exit (Q4).
+        _ops.Writer.TryComplete();
 
         if (ProcessId.HasValue)
             _onDisposed?.Invoke(ProcessId.Value);
