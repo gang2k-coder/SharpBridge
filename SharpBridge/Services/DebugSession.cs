@@ -49,12 +49,10 @@ public class DebugSession : IDisposable
     private DebugProtocolHost? _host;
     private IDisposable? _adapter;
 
-    // ===================================================================
-    // Per-session gate — serializes all tool calls that touch the DAP
-    // connection so concurrent MCP calls cannot interleave requests or
-    // race the state machine.
-    // ===================================================================
-    private readonly SemaphoreSlim _sessionGate = new(1, 1);
+    // (S2) The former _sessionGate is gone: every DAP request and every
+    // state mutation runs as an op on the session consumer, which serializes
+    // them structurally. Waiting producers no longer block other tools — a
+    // waiting debug_continue leaves the consumer free for pause/inspection.
 
     // (S1) The former _captureGate is gone: capture runs as a single op on the
     // session consumer, so two captures can never interleave DAP round-trips —
@@ -204,6 +202,11 @@ public class DebugSession : IDisposable
         return body();
     }
 
+    /// <summary>Void variant of <see cref="RunOnSessionAsync{T}"/>: the op's
+    /// body needs no result and only its exceptions matter.</summary>
+    public async Task RunOnSessionAsync(string name, Action body, CancellationToken ct = default)
+        => await RunOnSessionAsync(name, () => { body(); return true; }, ct).ConfigureAwait(false);
+
     /// <summary>
     /// Blocking variant for methods whose signatures must stay synchronous.
     /// Blocking the caller is equivalent to today's SendRequestSync behaviour:
@@ -280,27 +283,6 @@ public class DebugSession : IDisposable
     /// memory growth on long-running sessions with chatty debuggees.
     /// </summary>
     public const int MaxOutputLogLines = 5000;
-
-    /// <summary>
-    /// Runs <paramref name="action"/> under the per-session gate so that at
-    /// most one tool call touches the DAP connection at a time. Also guards
-    /// against calling into a cleaned-up session (host already disposed).
-    /// </summary>
-    public async Task<T> WithSessionLockAsync<T>(Func<ValueTask<T>> action)
-    {
-        await _sessionGate.WaitAsync();
-        try
-        {
-            if (_host is null)
-                throw new InvalidOperationException(
-                    "The debug session is no longer active (process exited or disconnected). Start a new session.");
-            return await action().ConfigureAwait(false);
-        }
-        finally
-        {
-            _sessionGate.Release();
-        }
-    }
 
     // ===================================================================
     // StoppedEvent TCS — swapped before each async operation
@@ -473,9 +455,39 @@ public class DebugSession : IDisposable
         Dictionary<string, string>? env = null,
         CancellationToken ct = default)
     {
-        // if (CurrentState != State.NotStarted)
-        //     throw new InvalidOperationException("Session not in correct state for launch.");
+        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await RunOnSessionAsync("launch", () => LaunchCore(program, args, cwd, stopAtEntry, env, stopTcs), ct)
+            .ConfigureAwait(false);
 
+        if (!stopAtEntry) return;
+
+        // SharpDbg 0.1.17+ implements stopAtEntry (an entry breakpoint at Main
+        // delivers an Entry StoppedEvent after ConfigurationDone). The wait is
+        // bounded and stays OUTSIDE the queue (R1) — the consumer must stay
+        // free for other work. Return the HONEST state: if a stop arrived the
+        // consumer marks Stopped; otherwise the process is running (older
+        // adapters without stopAtEntry). Never fabricate a stopped state.
+        try
+        {
+            await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+            _logger.LogInformation("Launch: stopped at entry.");
+            ObserveStopState();
+            await RunOnSessionAsync("launch_entry_stop", MarkEntryStoppedCore, ct).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogInformation("Launch: no entry StoppedEvent — returning with the process running.");
+        }
+    }
+
+    private void LaunchCore(
+        string program,
+        string[]? args,
+        string? cwd,
+        bool stopAtEntry,
+        Dictionary<string, string>? env,
+        TaskCompletionSource<StoppedEvent> stopTcs)
+    {
         ProcessName = Path.GetFileNameWithoutExtension(program);
 
         // New process lifecycle — drop any stop ledger state from a previous
@@ -500,7 +512,6 @@ public class DebugSession : IDisposable
         _stateMachine.TransitionTo(SessionState.Attaching);
         // Swap in a fresh stop TCS BEFORE configurationDone —
         // the StoppedEvent may fire as soon as the process starts.
-        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
 
         // Declare Running BEFORE ConfigurationDone: a stop (e.g. a breakpoint
@@ -520,43 +531,31 @@ public class DebugSession : IDisposable
             _logger.LogError(ex, "ConfigurationDone failed (state={State})", _stateMachine.Current);
             throw new InvalidOperationException($"ConfigurationDone failed: {ex.GetType().Name}: {ex.Message}", ex);
         }
+    }
 
-
-        if (stopAtEntry)
+    /// <summary>
+    /// Consumer-side completion of the launch entry-stop handshake. The 2s
+    /// wait ran on the caller (R1), so the state is re-checked HERE, atomically
+    /// with the transition: the process may have exited, or a real stop may
+    /// have arrived, while the caller was waiting.
+    /// </summary>
+    private void MarkEntryStoppedCore()
+    {
+        // The wait may have been resolved by the process exiting
+        // (fast-exiting debuggees) — do not force Stopped in that case.
+        if (_stateMachine.Current == SessionState.Exited)
         {
-            // SharpDbg 0.1.17+ implements stopAtEntry (an entry breakpoint at
-            // Main delivers an Entry StoppedEvent after ConfigurationDone).
-            // Wait briefly for it, then return the HONEST state: if a stop
-            // arrived → Stopped (OnStopped already transitioned); otherwise the
-            // process is running (older adapters without stopAtEntry).
-            // Never fabricate a stopped state.
-            try
-            {
-                await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
-                _logger.LogInformation("Launch: stopped at entry.");
-                ObserveStopState();
-                // The wait may have been resolved by the process exiting
-                // (fast-exiting debuggees) — do not force Stopped in that case.
-                if (_stateMachine.Current == SessionState.Exited)
-                {
-                    _logger.LogInformation("Launch: process exited before the entry stop — leaving state as Exited.");
-                    return;
-                }
-                _stateMachine.TransitionTo(SessionState.Stopped);
-                return;
-            }
-            catch (TimeoutException)
-            {
-                _logger.LogInformation("Launch: no entry StoppedEvent — returning with the process running.");
-            }
+            _logger.LogInformation("Launch: process exited before the entry stop — leaving state as Exited.");
+            return;
         }
+        _stateMachine.TransitionTo(SessionState.Stopped);
     }
 
     public async Task AttachAsync(int processId, CancellationToken ct = default)
-    {
-        // if (CurrentState != State.NotStarted)
-        //     throw new InvalidOperationException("Session not in correct state for attach.");
+        => await RunOnSessionAsync("attach", () => AttachCore(processId), ct).ConfigureAwait(false);
 
+    private void AttachCore(int processId)
+    {
         // New process lifecycle — drop any stop ledger state from a previous
         // process so its stops cannot surface in this session.
         ResetStopLedger();
@@ -595,13 +594,19 @@ public class DebugSession : IDisposable
     /// </summary>
     public async Task AttachAutoContinueAsync(CancellationToken ct = default)
     {
+        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await RunOnSessionAsync("attach_auto_continue", () => AttachAutoContinueCore(stopTcs), ct)
+            .ConfigureAwait(false);
+    }
+
+    private void AttachAutoContinueCore(TaskCompletionSource<StoppedEvent> stopTcs)
+    {
         if (_stateMachine.Current != SessionState.Attaching)
             throw new InvalidOperationException($"Cannot auto-continue: debugger state is {_stateMachine.Current}.");
 
         // Swap in a fresh stop TCS BEFORE ConfigurationDone: any stop that
         // arrives after the runtime resume resolves THIS TCS and surfaces
         // through the normal ledger path instead of being lost.
-        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
 
         // Declare Running BEFORE the resume command (same pattern as
@@ -613,7 +618,7 @@ public class DebugSession : IDisposable
             SendDap(new ConfigurationDoneRequest());
             if (ProcessId.HasValue)
             {
-                try { await DiagnosticClientHelper.DiagnosticClientResumeRuntime(ProcessId.Value); }
+                try { DiagnosticClientHelper.DiagnosticClientResumeRuntime(ProcessId.Value).GetAwaiter().GetResult(); }
                 catch (ServerNotAvailableException) { }
             }
         }
@@ -1167,23 +1172,26 @@ public class DebugSession : IDisposable
                 "or specify a timeout value (e.g. timeout=30).");
         }
 
-        // Right after debug_launch with stopAtEntry=false, the debuggee is
-        // already running and launch returns honestly with state Running.
-        // "Continue" then means "wait for the next stop" — resuming a running
-        // process is superfluous and SharpDbg would reject the request.
-        // Delegate to the wait path, which swaps the TCS and waits.
-        // (With stopAtEntry=true the session is Stopped at the entry stop,
-        // so this branch is skipped.)
-        if (_stateMachine.Current == SessionState.Running)
-            return await WaitAndWaitAsync(timeoutSeconds, ct).ConfigureAwait(false);
-
-        if (_stateMachine.Current != SessionState.Stopped && _stateMachine.Current != SessionState.Attaching)
-            throw new InvalidOperationException($"Cannot continue: debugger state is {_stateMachine.Current}.");
-
-        // Swap in a fresh stop TCS BEFORE sending the command: any stop that
-        // arrives after this point resolves THIS TCS, so no stop can be missed
-        // between the command and the wait (same pattern as StepAsync).
+        // Swap the TCS and take the resume/wait decision in ONE op — the old
+        // two-method split (read state here, re-check in WaitAndWaitAsync)
+        // was a TOCTOU that OnStopped could invalidate in between. The wait
+        // stays outside the queue (R1).
         var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var delivered = await RunOnSessionAsync("continue", () => ContinueCore(stopTcs), ct).ConfigureAwait(false);
+        if (delivered is not null) return delivered;
+
+        return await WaitForStopInTimespanAsync(timeoutSeconds, ct, stopTcs).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Runs on the session consumer. Returns a stop to deliver immediately
+    /// (missed stop / stop that arrived while the resume was in flight), or
+    /// null when the caller should wait on <paramref name="stopTcs"/>.
+    /// </summary>
+    private StopEvent? ContinueCore(TaskCompletionSource<StoppedEvent> stopTcs)
+    {
+        // Swap in a fresh stop TCS BEFORE any decision: any stop that arrives
+        // after this point resolves THIS TCS, so none can be missed.
         Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
 
         // The debuggee may have stopped while no tool call was waiting (e.g.
@@ -1202,6 +1210,17 @@ public class DebugSession : IDisposable
             };
         }
 
+        // Right after debug_launch with stopAtEntry=false, the debuggee is
+        // already running and launch returns honestly with state Running.
+        // "Continue" then means "wait for the next stop" — resuming a running
+        // process is superfluous and SharpDbg would reject the request. This
+        // decision is now atomic with the TCS swap above.
+        if (_stateMachine.Current == SessionState.Running)
+            return null;
+
+        if (_stateMachine.Current != SessionState.Stopped && _stateMachine.Current != SessionState.Attaching)
+            throw new InvalidOperationException($"Cannot continue: debugger state is {_stateMachine.Current}.");
+
         // Declare Running BEFORE sending the resume command: a stop can
         // arrive while the command is in flight (e.g. a breakpoint hit right
         // after resume), and OnStopped must never see the session as Attaching.
@@ -1214,7 +1233,7 @@ public class DebugSession : IDisposable
                 SendDap(new ConfigurationDoneRequest());
                 if (ProcessId.HasValue)
                 {
-                    try { await DiagnosticClientHelper.DiagnosticClientResumeRuntime(ProcessId.Value); }
+                    try { DiagnosticClientHelper.DiagnosticClientResumeRuntime(ProcessId.Value).GetAwaiter().GetResult(); }
                     catch (ServerNotAvailableException) { }
                 }
             }
@@ -1249,7 +1268,7 @@ public class DebugSession : IDisposable
             return LastStop;
         }
 
-        return await WaitForStopInTimespanAsync(timeoutSeconds, ct, stopTcs);
+        return null;
     }
 
     /// <summary>
@@ -1262,15 +1281,25 @@ public class DebugSession : IDisposable
     {
         if (timeoutSeconds < 0)
             throw new ArgumentException("timeoutSeconds must be >= 0 (0 = no timeout).", nameof(timeoutSeconds));
+
+        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var delivered = await RunOnSessionAsync("wait", () => WaitCore(stopTcs), ct).ConfigureAwait(false);
+        if (delivered is not null) return delivered;
+
+        return await WaitForStopInTimespanAsync(timeoutSeconds, ct, stopTcs).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Runs on the session consumer: installs the TCS and validates that the
+    /// session is in a waitable state, atomically with respect to other ops.
+    /// </summary>
+    private StopEvent? WaitCore(TaskCompletionSource<StoppedEvent> stopTcs)
+    {
+        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
+
         // Waiting is also valid when a stop already occurred while no tool
         // call was waiting — the client asked to wait for a stop, and one is
         // already there. Otherwise the debuggee must be running.
-        if (_stateMachine.Current != SessionState.Running && !HasUnobservedStop)
-            throw new InvalidOperationException($"Cannot wait: debugger state is {_stateMachine.Current}.");
-
-        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
-        Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
-
         if (HasUnobservedStop && _lastStop is { } missedStop)
         {
             ObserveStopState();
@@ -1283,21 +1312,52 @@ public class DebugSession : IDisposable
             };
         }
 
+        if (_stateMachine.Current != SessionState.Running)
+            throw new InvalidOperationException($"Cannot wait: debugger state is {_stateMachine.Current}.");
+
         // A stop may have arrived between the state guard and the swap —
         // report it instead of waiting for the next stop.
         if (stopTcs.Task.IsCompleted)
             return LastStop;
 
-        return await WaitForStopInTimespanAsync(timeoutSeconds, ct, stopTcs);
+        return null;
     }
 
     public async Task<StopEvent> StepAsync(
         string type, int? threadId = null, CancellationToken ct = default)
     {
+        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var delivered = await RunOnSessionAsync("step", () => StepCore(type, threadId, stopTcs), ct)
+            .ConfigureAwait(false);
+        if (delivered is not null) return delivered;
+
+        StoppedEvent stopEvent;
+        try
+        {
+            stopEvent = await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            // The step command was sent and the process resumed — a stop that
+            // arrives later is caught by the stop ledger (gap delivery).
+            throw new TimeoutException(
+                "Step did not stop the process within 2s — the debuggee may be stuck. " +
+                "Use debug_state to check, debug_wait to keep waiting, or debug_pause to interrupt.");
+        }
+        ObserveStopState();
+        if (_stateMachine.Current == SessionState.Exited) return LastStop;
+        return BuildStopEvent(stopEvent);
+    }
+
+    /// <summary>
+    /// Runs on the session consumer: installs the TCS, delivers a missed stop,
+    /// or sends the step request — all atomic with respect to other ops.
+    /// </summary>
+    private StopEvent? StepCore(string type, int? threadId, TaskCompletionSource<StoppedEvent> stopTcs)
+    {
         if (_stateMachine.Current != SessionState.Stopped)
             throw new InvalidOperationException($"Cannot step: debugger state is {_stateMachine.Current}.");
 
-        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
 
         // The debuggee may have stopped while no tool call was waiting —
@@ -1324,30 +1384,116 @@ public class DebugSession : IDisposable
             default: SendDap(new NextRequest(tid)); break;
         }
 
-        StoppedEvent stopEvent;
+        return null;
+    }
+
+    public async Task<StopEvent> PauseAsync(CancellationToken ct = default)
+    {
+        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        StopEvent? delivered;
         try
         {
-            stopEvent = await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
+            delivered = await RunOnSessionAsync("pause", () => PauseCore(stopTcs), ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (IsAlreadyStoppedError(ex))
+        {
+            return await RecoverStoppedTruthAsync(ex, ct).ConfigureAwait(false);
+        }
+        if (delivered is not null) return delivered;
+
+        try
+        {
+            return await WaitForPauseStopAsync(stopTcs, ct).ConfigureAwait(false);
         }
         catch (TimeoutException)
         {
-            // The step command was sent and the process resumed — a stop that
-            // arrives later is caught by the stop ledger (gap delivery).
-            throw new TimeoutException(
-                "Step did not stop the process within 2s — the debuggee may be stuck. " +
-                "Use debug_state to check, debug_wait to keep waiting, or debug_pause to interrupt.");
+            // A pause that produces no event may mean the debuggee was already
+            // stopped: SharpDbg treats Pause on a stopped process as a no-op
+            // and emits no StoppedEvent (seen in capture auto-continue loops).
+            // Retry once — a rejection proves it is stopped (recover the
+            // truth), a success stops the process for real.
+            var retryTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+            try
+            {
+                delivered = await RunOnSessionAsync("pause_retry", () => PauseCore(retryTcs), ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException || IsAlreadyStoppedError(ex))
+            {
+                // Rejected because it is already stopped, or the state machine
+                // no longer claims Running — both mean the client must get a
+                // truthful stop instead of a wedged session.
+                return await RecoverStoppedTruthAsync(ex, ct).ConfigureAwait(false);
+            }
+            if (delivered is not null) return delivered;
+
+            try
+            {
+                return await WaitForPauseStopAsync(retryTcs, ct).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                // The process keeps running — a stop that arrives later is
+                // caught by the stop ledger (gap delivery).
+                throw new TimeoutException(
+                    "Pause did not stop the process within 2s — the debuggee may not respond to pause. " +
+                    "Use debug_state to check, or debug_wait to keep waiting.");
+            }
         }
+    }
+
+    private async Task<StopEvent> WaitForPauseStopAsync(
+        TaskCompletionSource<StoppedEvent> stopTcs, CancellationToken ct)
+    {
+        var stopEvent = await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
         ObserveStopState();
         if (_stateMachine.Current == SessionState.Exited) return LastStop;
         return BuildStopEvent(stopEvent);
     }
 
-    public async Task<StopEvent> PauseAsync(CancellationToken ct = default)
+    /// <summary>SharpDbg's "the process is not running" rejection text.</summary>
+    private static bool IsAlreadyStoppedError(Exception ex)
+        => ex.Message.Contains("not running", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The adapter says the process is already stopped while our state machine
+    /// says Running — the state machine is the one that is wrong (a stop was
+    /// consumed without a StoppedEvent reaching us, e.g. during a capture
+    /// auto-continue loop). Re-establish the truth so the client can inspect and
+    /// resume instead of being wedged on a session that cannot be paused and
+    /// never reports a stop.
+    /// </summary>
+    private async Task<StopEvent> RecoverStoppedTruthAsync(Exception cause, CancellationToken ct)
+    {
+        var state = await RunOnSessionAsync("recover_stopped", () =>
+        {
+            if (_stateMachine.Current == SessionState.Running)
+                _stateMachine.TransitionTo(SessionState.Stopped);
+            return _stateMachine.Current;
+        }, ct).ConfigureAwait(false);
+
+        if (state is SessionState.Exited or SessionState.Detached)
+            return _lastStop ?? new StopEvent("exited", null, null, "exited", null, 0, 0);
+
+        _logger.LogWarning(cause,
+            "Pause was rejected because the debuggee is already stopped; re-established the Stopped " +
+            "state so the client is not wedged on a Running session with nothing to deliver.");
+
+        return new StopEvent("stopped", null, null, "pause", null, 0, 0)
+        {
+            Note = "The debuggee is already stopped (the adapter rejected the pause). " +
+                   "Use stacktrace_get / variables_get to inspect, then debug_continue to resume."
+        };
+    }
+
+    /// <summary>
+    /// Runs on the session consumer: installs the TCS, delivers a stop that
+    /// happened on its own, or sends the pause request.
+    /// </summary>
+    private StopEvent? PauseCore(TaskCompletionSource<StoppedEvent> stopTcs)
     {
         if (_stateMachine.Current != SessionState.Running)
             throw new InvalidOperationException($"Cannot pause: debugger state is {_stateMachine.Current}.");
 
-        var stopTcs = new TaskCompletionSource<StoppedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _pendingStopTcs, stopTcs);
 
         // The debuggee may have stopped on its own while no tool call was
@@ -1368,23 +1514,7 @@ public class DebugSession : IDisposable
             return LastStop;
 
         SendDap(new PauseRequest());
-
-        StoppedEvent stopEvent;
-        try
-        {
-            stopEvent = await stopTcs.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
-        }
-        catch (TimeoutException)
-        {
-            // The process keeps running — a stop that arrives later is caught
-            // by the stop ledger (gap delivery).
-            throw new TimeoutException(
-                "Pause did not stop the process within 2s — the debuggee may not respond to pause. " +
-                "Use debug_state to check, or debug_wait to keep waiting.");
-        }
-        ObserveStopState();
-        if (_stateMachine.Current == SessionState.Exited) return LastStop;
-        return BuildStopEvent(stopEvent);
+        return null;
     }
 
     // ===================================================================
@@ -1577,6 +1707,24 @@ public class DebugSession : IDisposable
     // ===================================================================
 
     public void Disconnect(bool terminateDebuggee = true)
+    {
+        // Already closed (process exited or a previous disconnect) — nothing
+        // to do, matching the old no-op behaviour.
+        if (_cleanedUp) return;
+
+        try
+        {
+            // On the consumer (since S2) so the DisconnectRequest cannot
+            // interleave with another op; Cleanup then runs there too.
+            RunOnSession("disconnect", () => DisconnectCore(terminateDebuggee));
+        }
+        catch (InvalidOperationException) when (_cleanedUp)
+        {
+            // The session closed underneath us — nothing left to disconnect.
+        }
+    }
+
+    private void DisconnectCore(bool terminateDebuggee)
     {
         if (_stateMachine.Current == SessionState.Detached) return;
 

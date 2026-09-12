@@ -110,27 +110,13 @@ public static class CallToolFilters
                 };
             }
 
-            // Serialize the whole tool invocation under the session gate so
-            // concurrent MCP calls cannot interleave DAP requests or race the
-            // state machine. The gate also fails fast with a clear error when
-            // the session was cleaned up underneath a caller.
-            try
-            {
-                return await session.WithSessionLockAsync<CallToolResult>(
-                    () => next(context, cancellationToken));
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                return new CallToolResult
-                {
-                    Content = [new TextContentBlock { Text = ex.Message }],
-                    IsError = true
-                };
-            }
+            // (S2) No session gate here any more: DAP requests and state
+            // mutations are serialized by the session consumer (every session
+            // method enqueues an op), and a tool that waits for a stop no
+            // longer blocks other tool calls on the same session. The
+            // [AllowedState] check above stays as a cheap pre-check; the
+            // authoritative checks live inside the ops themselves.
+            return await next(context, cancellationToken);
     }
 
     private static DebugSession ResolveSession(

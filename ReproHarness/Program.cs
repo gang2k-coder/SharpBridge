@@ -4,8 +4,8 @@ using SharpBridge.Services;
 using SharpBridge.State;
 
 // ===================================================================
-// Repro harness — mimics the REAL MCP tool layer (state filter + session
-// gate) on top of the raw service calls the integration tests use.
+// Repro harness — mimics the REAL MCP tool layer (state filter) on top of
+// the raw service calls the integration tests use.
 //
 // attach mode: two capture breakpoints (lines 11+12 of ReproDebuggee).
 // The debugger ping-pongs the debuggee between the two lines on every
@@ -17,7 +17,13 @@ var testDebuggeeDll = Path.Combine(repoRoot, "TestDebuggee/bin/Debug/net10.0/Tes
 var reproDebuggeeDll = Path.Combine(repoRoot, "ReproDebuggee/bin/Debug/net10.0/ReproDebuggee.dll");
 var reproDebuggeeSrc = Path.Combine(repoRoot, "ReproDebuggee/Program.cs");
 
-using var loggerFactory = LoggerFactory.Create(b => b.AddConsole().SetMinimumLevel(LogLevel.Warning));
+// HARNESS_LOG=debug surfaces the full DAP/SharpDbg message trace (very
+// verbose) — needed to diagnose a wedged run at the event level.
+var harnessLogLevel = string.Equals(
+    Environment.GetEnvironmentVariable("HARNESS_LOG"), "debug", StringComparison.OrdinalIgnoreCase)
+    ? LogLevel.Debug
+    : LogLevel.Warning;
+using var loggerFactory = LoggerFactory.Create(b => b.AddConsole().SetMinimumLevel(harnessLogLevel));
 
 // AllowedState for debug_continue (from ExecutionTools)
 SessionState[] continueAllowed = [SessionState.Attaching, SessionState.Stopped, SessionState.Running];
@@ -27,9 +33,34 @@ SessionState[] bpAllowed = [SessionState.Attaching, SessionState.Stopped, Sessio
 var mode = args.Length > 0 ? args[0] : "attach";
 Console.WriteLine($"\n=== MODE: {mode} ===");
 
+// HARNESS_ROUNDS / HARNESS_TIMEOUT shrink a run so many samples fit in a
+// comparison sweep (defaults match the historical 6 rounds x 8s).
+var harnessRounds = int.TryParse(Environment.GetEnvironmentVariable("HARNESS_ROUNDS"), out var hr) ? hr : 6;
+var harnessTimeout = int.TryParse(Environment.GetEnvironmentVariable("HARNESS_TIMEOUT"), out var ht) ? ht : 8;
+
+// Independent ground truth for "is the debuggee actually running?".
+// ReproDebuggee spins a tight loop, so a 200ms CPU-time delta separates a
+// running debuggee (~full CPU) from one stopped by the debugger (~0).
+static string DebuggeeActivity(Process proc)
+{
+    try
+    {
+        var t1 = proc.TotalProcessorTime;
+        Thread.Sleep(200);
+        proc.Refresh();
+        var t2 = proc.TotalProcessorTime;
+        var states = proc.Threads.Cast<ProcessThread>()
+            .Select(t => $"{t.ThreadState}/{t.WaitReason}")
+            .Distinct();
+        return $"cpuDelta={(t2 - t1).TotalMilliseconds:F1}ms threads=[{string.Join(", ", states)}]";
+    }
+    catch (Exception ex) { return "n/a (" + ex.Message + ")"; }
+}
+
 async Task<StopEvent?> AgentContinue(DebugSession session, string label, int timeout = 10)
 {
-    // Mimic SessionStateFilter: state check + session gate
+    // Mimic SessionStateFilter: state pre-check (the session gate is gone
+    // since S2 — the session consumer serializes the real work).
     if (!continueAllowed.Contains(session.CurrentState))
     {
         Console.WriteLine($"[agent:{label}] debug_continue REJECTED by state filter: " +
@@ -38,8 +69,7 @@ async Task<StopEvent?> AgentContinue(DebugSession session, string label, int tim
     }
 
     Console.WriteLine($"[agent:{label}] debug_continue -> state={session.CurrentState}, timeout={timeout}s ...");
-    var stop = await session.WithSessionLockAsync(async () =>
-        await session.ContinueAndWaitAsync(timeout).ConfigureAwait(false));
+    var stop = await session.ContinueAndWaitAsync(timeout).ConfigureAwait(false);
     Console.WriteLine($"[agent:{label}] debug_continue returned: status={stop.Status}, reason={stop.Reason}, " +
                       $"line={stop.Line}, state={session.CurrentState}");
     if (stop.Note is not null)
@@ -129,9 +159,9 @@ else
         await debuggee.StandardInput.WriteLineAsync();
 
         bool frozen = false;
-        for (int round = 0; round < 6 && !frozen; round++)
+        for (int round = 0; round < harnessRounds && !frozen; round++)
         {
-            var stop = await AgentContinue(session, $"r{round}", 8);
+            var stop = await AgentContinue(session, $"r{round}", harnessTimeout);
             if (stop is { Status: "exited" })
             {
                 Console.WriteLine("   debuggee exited — no freeze observed this run.");
@@ -143,6 +173,14 @@ else
             // with "The process is not running..." — that is the corruption.
             if (session.CurrentState == SessionState.Running)
             {
+                // HARNESS_PAUSE_DELAY_MS lets a run delay the probe: used to test
+                // whether a Pause issued immediately after an auto-continue
+                // resume lands in the adapter's resume window.
+                if (int.TryParse(Environment.GetEnvironmentVariable("HARNESS_PAUSE_DELAY_MS"), out var pauseDelay)
+                    && pauseDelay > 0)
+                {
+                    await Task.Delay(pauseDelay);
+                }
                 try
                 {
                     var p = await session.PauseAsync();
@@ -151,12 +189,40 @@ else
                 catch (Exception ex)
                 {
                     Console.WriteLine($"   >>> pause probe FAILED: {ex.Message}");
+                    Console.WriteLine($"   >>> debuggee activity: {DebuggeeActivity(debuggee)}");
                     if (ex.Message.Contains("not running"))
                     {
-                        Console.WriteLine("   >>> CORRUPTION CONFIRMED: state=Running but debuggee is actually STOPPED.");
-                        Console.WriteLine("   >>> What the agent sees next (the dead end):");
-                        await AgentContinue(session, "dead-end");
-                        frozen = true;
+                        // Distinguish a permanent state-machine wedge from the
+                        // inherent in-flight window (the debuggee stopped at the
+                        // adapter, but its StoppedEvent has not been processed
+                        // yet — no client-side state machine can know earlier).
+                        // A real corruption keeps claiming Running with nothing
+                        // pending; a transient race is resolved by the arriving
+                        // stop (or its capture auto-continue) within ms.
+                        var recovered = false;
+                        var deadline = DateTime.UtcNow.AddMilliseconds(1500);
+                        while (DateTime.UtcNow < deadline)
+                        {
+                            if (session.CurrentState != SessionState.Running || session.HasUnobservedStop)
+                            {
+                                recovered = true;
+                                break;
+                            }
+                            await Task.Delay(25);
+                        }
+
+                        if (recovered)
+                        {
+                            Console.WriteLine("   >>> (transient) pause raced a stop that arrived right after");
+                            Console.WriteLine($"   >>> state now: {session.CurrentState}, pendingStop={session.HasUnobservedStop}");
+                        }
+                        else
+                        {
+                            Console.WriteLine("   >>> CORRUPTION CONFIRMED: state=Running but debuggee is actually STOPPED.");
+                            Console.WriteLine("   >>> What the agent sees next (the dead end):");
+                            await AgentContinue(session, "dead-end");
+                            frozen = true;
+                        }
                     }
                 }
             }
